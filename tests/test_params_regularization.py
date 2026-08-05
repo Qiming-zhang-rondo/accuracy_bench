@@ -108,7 +108,8 @@ def test_model_type_added():
                 f"--model_type 默认应为 auto, got {kwargs.get('default')}"
             choices = kwargs.get("choices", [])
             for expected in ("auto", "dense", "moe", "glm_mla", "glm_moe_dsa",
-                             "qwen3", "qwen3_moe", "qwen3_5_moe", "qwen3_vl"):
+                             "qwen3", "qwen3_moe", "qwen3_5_moe", "qwen3_vl",
+                             "qwen3_6", "qwen3_6_moe", "kimi_k3"):
                 assert expected in choices, \
                     f"--model_type choices 应含 {expected}, got {choices}"
     assert found, "--model_type 参数未找到"

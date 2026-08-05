@@ -18,6 +18,13 @@ from dataclasses import dataclass, field
 import statistics as stat
 
 from .metrics import compute_all_metrics, cos_sim
+from .model_structure import (
+    build_replay_attention_mask,
+    get_layer_state_kwarg,
+    get_moe_module,
+    has_indexed_routed_experts,
+    is_kimi_k3_layer,
+)
 from .report_schema import LogitsData
 import logging
 
@@ -277,11 +284,13 @@ class ShardedBlockComparator:
         layers = []
         load_layer_weights_indexed(ref_model, self.ref_model_path, layers, ref_device, self.dtype,
                                    self._ref_weight_map, self._ref_reader,
-                                   is_quant=self._ref_is_quant, quant_desc=self._ref_quant_desc,
+                                   is_quant=self._ref_is_quant, is_ct=self._ref_is_ct,
+                                   quant_desc=self._ref_quant_desc,
                                    verbose=True)
         load_layer_weights_indexed(quant_model, self.quant_model_path, layers, quant_device, self.dtype,
                                    self._quant_weight_map, self._quant_reader,
-                                   is_quant=self._quant_is_quant, quant_desc=self._quant_quant_desc,
+                                   is_quant=self._quant_is_quant, is_ct=self._quant_is_ct,
+                                   quant_desc=self._quant_quant_desc,
                                    verbose=True)
 
         # rotary_emb 初始化
@@ -372,17 +381,21 @@ class ShardedBlockComparator:
         return False
 
     def _save_layer_cache(self, ref_hidden: Tensor, quant_hidden: Tensor,
-                          layer_idx: int, cos_sim_val: float,
-                          layer_cos_sims: dict, layer_inputs: dict):
-        """缓存一层的 ref/quant hidden_states 到磁盘，并记录路径。"""
+                           layer_idx: int, cos_sim_val: float,
+                           layer_cos_sims: dict, layer_inputs: dict,
+                           ref_layer_state: Optional[Tensor] = None,
+                           quant_layer_state: Optional[Tensor] = None):
+        """缓存目标层输入及其可选跨层状态，并记录路径。"""
         ref_input = ref_hidden.detach().clone().cpu()
         quant_input = quant_hidden.detach().clone().cpu()
         from .cache import save_cache as l2_save_cache
         seqlen = ref_input.shape[1]
         p1 = l2_save_cache(self.ref_model_path, self._prompt_text,
-                           seqlen, layer_idx, "ref", self.quant_method, ref_input)
+                           seqlen, layer_idx, "ref", self.quant_method, ref_input,
+                           layer_state=ref_layer_state)
         p2 = l2_save_cache(self.quant_model_path, self._prompt_text,
-                           seqlen, layer_idx, "quant", self.quant_method, quant_input)
+                           seqlen, layer_idx, "quant", self.quant_method, quant_input,
+                           layer_state=quant_layer_state)
         del ref_input, quant_input
 
         if self.l1_target_layers is not None:
@@ -439,17 +452,31 @@ class ShardedBlockComparator:
         )
         return metrics, result
 
-    def _compute_layer_metrics_and_cache(self, ref_hidden: Tensor, quant_hidden: Tensor,
-                                         layer_idx: int,
-                                         layer_cos_sims: dict, layer_inputs: dict):
+    def _compute_layer_metrics_and_cache(
+        self,
+        ref_hidden: Tensor,
+        quant_hidden: Tensor,
+        layer_idx: int,
+        layer_cos_sims: dict,
+        layer_inputs: dict,
+        ref_layer_input: Optional[Tensor] = None,
+        quant_layer_input: Optional[Tensor] = None,
+        ref_layer_state: Optional[Tensor] = None,
+        quant_layer_state: Optional[Tensor] = None,
+    ):
         """单层: compute metrics + append result + 决定是否 cache。"""
         metrics, result = self._compute_layer_metrics(ref_hidden, quant_hidden, layer_idx)
 
         cs = metrics.get('cos_sim', 1.0)
         should_cache = self._should_cache_layer(cs)
         if should_cache:
-            self._save_layer_cache(ref_hidden, quant_hidden, layer_idx, cs,
-                                   layer_cos_sims, layer_inputs)
+            self._save_layer_cache(
+                ref_layer_input if ref_layer_input is not None else ref_hidden,
+                quant_layer_input if quant_layer_input is not None else quant_hidden,
+                layer_idx, cs, layer_cos_sims, layer_inputs,
+                ref_layer_state=ref_layer_state,
+                quant_layer_state=quant_layer_state,
+            )
         return metrics, result
 
     def _compute_logits_topk(
@@ -469,11 +496,13 @@ class ShardedBlockComparator:
         # 加载 norm 和 lm_head 权重
         load_layer_weights_indexed(ref_model, self.ref_model_path, [-1], ref_device, self.dtype,
                                    self._ref_weight_map, self._ref_reader,
-                                   is_quant=self._ref_is_quant, quant_desc=self._ref_quant_desc,
+                                   is_quant=self._ref_is_quant, is_ct=self._ref_is_ct,
+                                   quant_desc=self._ref_quant_desc,
                                    verbose=False)
         load_layer_weights_indexed(quant_model, self.quant_model_path, [-1], quant_device, self.dtype,
                                    self._quant_weight_map, self._quant_reader,
-                                   is_quant=self._quant_is_quant, quant_desc=self._quant_quant_desc,
+                                   is_quant=self._quant_is_quant, is_ct=self._quant_is_ct,
+                                   quant_desc=self._quant_quant_desc,
                                    verbose=False)
 
         # 移到设备
@@ -568,11 +597,13 @@ class ShardedBlockComparator:
 
         load_layer_weights_indexed(ref_model, self.ref_model_path, [-1], 'cpu', self.dtype,
                                    self._ref_weight_map, self._ref_reader,
-                                   is_quant=self._ref_is_quant, quant_desc=self._ref_quant_desc,
+                                   is_quant=self._ref_is_quant, is_ct=self._ref_is_ct,
+                                   quant_desc=self._ref_quant_desc,
                                    verbose=False)
         load_layer_weights_indexed(quant_model, self.quant_model_path, [-1], 'cpu', self.dtype,
                                    self._quant_weight_map, self._quant_reader,
-                                   is_quant=self._quant_is_quant, quant_desc=self._quant_quant_desc,
+                                   is_quant=self._quant_is_quant, is_ct=self._quant_is_ct,
+                                   quant_desc=self._quant_quant_desc,
                                    verbose=False)
 
         for model in [ref_model, quant_model]:
@@ -695,11 +726,13 @@ class ShardedBlockComparator:
                         pass
         load_layer_weights_indexed(ref_model, self.ref_model_path, [-1], 'cpu', self.dtype,
                                    self._ref_weight_map, self._ref_reader,
-                                   is_quant=self._ref_is_quant, quant_desc=self._ref_quant_desc,
+                                   is_quant=self._ref_is_quant, is_ct=self._ref_is_ct,
+                                   quant_desc=self._ref_quant_desc,
                                    verbose=False)
         load_layer_weights_indexed(quant_model, self.quant_model_path, [-1], 'cpu', self.dtype,
                                    self._quant_weight_map, self._quant_reader,
-                                   is_quant=self._quant_is_quant, quant_desc=self._quant_quant_desc,
+                                   is_quant=self._quant_is_quant, is_ct=self._quant_is_ct,
+                                   quant_desc=self._quant_quant_desc,
                                    verbose=False)
         for model in [ref_model, quant_model]:
             norm_mod = get_norm_module(model)
@@ -842,6 +875,15 @@ class ShardedBlockComparator:
 
         # 创建骨架 + 加载 embed + 初始化 rotary_emb
         ref_model, quant_model = self._init_dual_skeleton_and_embed(ref_device, quant_device)
+        from .utils import get_decoder_layers
+        if any(
+            is_kimi_k3_layer(layer) and has_indexed_routed_experts(layer)
+            for layer in get_decoder_layers(ref_model)
+        ):
+            raise RuntimeError(
+                "Kimi K3 uses one module per routed expert; L1 dual mode would "
+                "materialize all experts. Re-run with --compare_mode grouped_dual."
+            )
 
         # weight_map/reader 已在 _init_dual_skeleton_and_embed 中缓存到 self
         ref_reader = self._ref_reader
@@ -881,11 +923,13 @@ class ShardedBlockComparator:
             try:
                 load_layer_weights_indexed(ref_model, self.ref_model_path, layers, ref_device, self.dtype,
                                            ref_weight_map, ref_reader,
-                                           is_quant=ref_is_quant, quant_desc=ref_quant_desc,
+                                           is_quant=ref_is_quant, is_ct=ref_is_ct,
+                                           quant_desc=ref_quant_desc,
                                            verbose=False)
                 load_layer_weights_indexed(quant_model, self.quant_model_path, layers, quant_device, self.dtype,
                                            quant_weight_map, quant_reader,
-                                           is_quant=quant_is_quant, quant_desc=quant_quant_desc,
+                                           is_quant=quant_is_quant, is_ct=quant_is_ct,
+                                           quant_desc=quant_quant_desc,
                                            verbose=False)
 
                 # 移动层到设备
@@ -1060,12 +1104,14 @@ class ShardedBlockComparator:
                 # streaming 模式跳过 routed experts
                 load_layer_weights_indexed(ref_model, self.ref_model_path, layers, ref_device, self.dtype,
                                            ref_weight_map, ref_reader,
-                                           is_quant=ref_is_quant, quant_desc=ref_quant_desc,
+                                           is_quant=ref_is_quant, is_ct=ref_is_ct,
+                                           quant_desc=ref_quant_desc,
                                            skip_routed_experts=True,
                                            verbose=False)
                 load_layer_weights_indexed(quant_model, self.quant_model_path, layers, quant_device, self.dtype,
                                            quant_weight_map, quant_reader,
-                                           is_quant=quant_is_quant, quant_desc=quant_quant_desc,
+                                           is_quant=quant_is_quant, is_ct=quant_is_ct,
+                                           quant_desc=quant_quant_desc,
                                            skip_routed_experts=True,
                                            verbose=False)
 
@@ -1099,7 +1145,8 @@ class ShardedBlockComparator:
                             shard_idx, layer_cos_sims, layer_inputs, all_results,
                             ref_reader, quant_reader,
                             ref_quant_desc, quant_quant_desc,
-                            ref_is_quant, quant_is_quant)
+                            ref_is_quant, quant_is_quant,
+                            ref_is_ct, quant_is_ct)
                     ref_output = ref_hidden
                     quant_output = quant_hidden
 
@@ -1138,16 +1185,16 @@ class ShardedBlockComparator:
                 if i >= len(decoder_layers):
                     continue
                 layer = decoder_layers[i]
-                try:
-                    dev = next(layer.parameters()).device
-                    is_meta = dev.type == 'meta'
-                except StopIteration:
-                    is_meta = False
-                if is_meta:
-                    decoder_layers[i] = layer.to_empty(device='cpu')
-                mlp_mod = getattr(layer, 'mlp', None)
+                _, mlp_mod = get_moe_module(layer)
                 experts_mod = getattr(mlp_mod, 'experts', None) if mlp_mod else None
-                if experts_mod is not None:
+
+                # Replace routed expert storage while it is still on meta.  Doing
+                # this after to_empty would allocate the full Kimi/GLM expert set
+                # on CPU before immediately discarding it.
+                if isinstance(experts_mod, nn.ModuleList):
+                    for expert_idx in range(len(experts_mod)):
+                        experts_mod[expert_idx] = nn.Identity()
+                elif experts_mod is not None:
                     for attr_name in ['gate_up_proj', 'down_proj']:
                         p = getattr(experts_mod, attr_name, None)
                         if p is not None and p.dim() == 3 and p.shape[0] > 1:
@@ -1158,33 +1205,48 @@ class ShardedBlockComparator:
                             placeholder._orig_shape = orig_shape
                             setattr(experts_mod, attr_name, placeholder)
 
+                try:
+                    dev = next(layer.parameters()).device
+                    is_meta = dev.type == 'meta'
+                except StopIteration:
+                    is_meta = False
+                if is_meta:
+                    decoder_layers[i] = layer.to_empty(device='cpu')
+
     def _make_chunked_mlp_forward(self, orig_fwd, layer, devices, chunk_size,
-                                    lidx, sf_rdr, q_desc, is_q):
+                                    lidx, sf_rdr, q_desc, is_q, is_ct):
         """创建 chunked MLP forward 闭包。"""
         _self = self
         def _chunked_mlp_forward(hidden_states, *args, **kwargs):
             return _self._moe_forward_chunked(
                 layer, hidden_states, devices, chunk_size,
                 layer_idx=lidx, sf_reader=sf_rdr,
-                quant_desc_str=q_desc, is_quant=is_q)
+                quant_desc_str=q_desc, is_quant=is_q, is_ct=is_ct)
         return _chunked_mlp_forward
 
     def _patch_moe_forward_for_layer(self, ref_layer, quant_layer, layer_idx,
                                        ref_reader, quant_reader,
                                        ref_quant_desc, quant_quant_desc,
-                                       ref_is_quant, quant_is_quant):
-        """为 MoE 层 patch mlp.forward，返回 (ref_orig, quant_orig) 用于事后恢复。"""
-        ref_orig_mlp_fwd = ref_layer.mlp.forward
-        quant_orig_mlp_fwd = quant_layer.mlp.forward
+                                       ref_is_quant, quant_is_quant,
+                                       ref_is_ct, quant_is_ct):
+        """Patch the routed MoE block and return modules/original forwards."""
+        _, ref_moe = get_moe_module(ref_layer)
+        _, quant_moe = get_moe_module(quant_layer)
+        if ref_moe is None or quant_moe is None:
+            raise RuntimeError(f"Layer {layer_idx} was classified as MoE but has no MoE module")
+        ref_orig_mlp_fwd = ref_moe.forward
+        quant_orig_mlp_fwd = quant_moe.forward
         _ref_qds = {k: v for k, v in ref_quant_desc.items() if isinstance(v, str)} if ref_quant_desc else None
         _quant_qds = {k: v for k, v in quant_quant_desc.items() if isinstance(v, str)} if quant_quant_desc else None
-        ref_layer.mlp.forward = self._make_chunked_mlp_forward(
+        ref_moe.forward = self._make_chunked_mlp_forward(
             ref_orig_mlp_fwd, ref_layer, self.ref_devices,
-            self.expert_chunk_size, layer_idx, ref_reader, _ref_qds, ref_is_quant)
-        quant_layer.mlp.forward = self._make_chunked_mlp_forward(
+            self.expert_chunk_size, layer_idx, ref_reader, _ref_qds,
+            ref_is_quant, ref_is_ct)
+        quant_moe.forward = self._make_chunked_mlp_forward(
             quant_orig_mlp_fwd, quant_layer, self.quant_devices,
-            self.expert_chunk_size, layer_idx, quant_reader, _quant_qds, quant_is_quant)
-        return ref_orig_mlp_fwd, quant_orig_mlp_fwd
+            self.expert_chunk_size, layer_idx, quant_reader, _quant_qds,
+            quant_is_quant, quant_is_ct)
+        return ref_moe, ref_orig_mlp_fwd, quant_moe, quant_orig_mlp_fwd
 
     def _log_norm_debug(self, layer_idx, ref_hidden, quant_hidden, stage):
         """track hidden state explosion — print norm at key layers。"""
@@ -1223,7 +1285,8 @@ class ShardedBlockComparator:
                                        shard_idx, layer_cos_sims, layer_inputs, all_results,
                                        ref_reader, quant_reader,
                                        ref_quant_desc, quant_quant_desc,
-                                       ref_is_quant, quant_is_quant):
+                                       ref_is_quant, quant_is_quant,
+                                       ref_is_ct, quant_is_ct):
         """grouped_dual 模式逐层 forward (含 MoE patch) + 对比 + 缓存。"""
         from .utils import get_decoder_layers
         ref_layers = get_decoder_layers(ref_model)
@@ -1231,6 +1294,10 @@ class ShardedBlockComparator:
         for layer_idx in range(layer_start, layer_end):
             ref_layer = ref_layers[layer_idx]
             quant_layer = quant_layers[layer_idx]
+            ref_layer_input = ref_hidden
+            quant_layer_input = quant_hidden
+            ref_state_input = ref_prev_topk
+            quant_state_input = quant_prev_topk
             is_moe = self._is_moe_layer(ref_layer)
             if layer_idx == 3:
                 self._debug_layer3_expert0 = True
@@ -1238,12 +1305,13 @@ class ShardedBlockComparator:
                 self._debug_layer3_scales = True
             self._log_norm_debug(layer_idx, ref_hidden, quant_hidden, "IN")
 
-            ref_orig_mlp_fwd = None
-            quant_orig_mlp_fwd = None
+            ref_moe = quant_moe = None
+            ref_orig_mlp_fwd = quant_orig_mlp_fwd = None
             if is_moe:
-                ref_orig_mlp_fwd, quant_orig_mlp_fwd = self._patch_moe_forward_for_layer(
+                ref_moe, ref_orig_mlp_fwd, quant_moe, quant_orig_mlp_fwd = self._patch_moe_forward_for_layer(
                     ref_layer, quant_layer, layer_idx, ref_reader, quant_reader,
-                    ref_quant_desc, quant_quant_desc, ref_is_quant, quant_is_quant)
+                    ref_quant_desc, quant_quant_desc, ref_is_quant, quant_is_quant,
+                    ref_is_ct, quant_is_ct)
 
             ref_hidden, quant_hidden, ref_prev_topk, quant_prev_topk = self._forward_single_dual_layer(
                 ref_layer, quant_layer, ref_hidden, quant_hidden,
@@ -1252,32 +1320,28 @@ class ShardedBlockComparator:
 
             self._log_norm_debug(layer_idx, ref_hidden, quant_hidden, "OUT")
             if is_moe:
-                ref_layer.mlp.forward = ref_orig_mlp_fwd
-                quant_layer.mlp.forward = quant_orig_mlp_fwd
+                ref_moe.forward = ref_orig_mlp_fwd
+                quant_moe.forward = quant_orig_mlp_fwd
 
             is_target = (self.l1_target_layers is not None and layer_idx in self.l1_target_layers)
             if not is_target and self.l1_target_layers is not None:
                 continue
             self._log_layer77_debug(layer_idx, ref_layer, quant_layer, ref_hidden, quant_hidden)
             metrics, result = self._compute_layer_metrics_and_cache(
-                ref_hidden, quant_hidden, layer_idx, layer_cos_sims, layer_inputs)
+                ref_hidden, quant_hidden, layer_idx, layer_cos_sims, layer_inputs,
+                ref_layer_input=ref_layer_input,
+                quant_layer_input=quant_layer_input,
+                ref_layer_state=ref_state_input,
+                quant_layer_state=quant_state_input,
+            )
             all_results.append(result)
         return ref_hidden, quant_hidden, ref_prev_topk, quant_prev_topk
 
     @staticmethod
     def _is_moe_layer(layer: nn.Module) -> bool:
         """检测 HF decoder layer 是否是 MoE 层"""
-        mlp = getattr(layer, 'mlp', None)
-        if mlp is None:
-            return False
-        # GLM-5.1 / Qwen3.5: experts.gate_up_proj (3D packed)
-        experts = getattr(mlp, 'experts', None)
-        if experts is not None:
-            return True
-        # Mixtral-style: mlp.experts is ModuleList
-        if hasattr(mlp, 'gate') or hasattr(mlp, 'router'):
-            return True
-        return False
+        _, moe = get_moe_module(layer)
+        return moe is not None
 
     def _register_activation_quant_hooks(self, model, layers: List[int]):
         """在指定层的所有 nn.Linear (除 router/gate 外) 上注册 MXFP8 激活伪量化 hook。"""
@@ -1322,6 +1386,7 @@ class ShardedBlockComparator:
         sf_reader=None,
         quant_desc_str: dict = None,
         is_quant: bool = False,
+        is_ct: bool = False,
     ) -> Tensor:
         """手动拆解 MoE forward，expert chunk 轮询分发到 devices。
 
@@ -1342,7 +1407,9 @@ class ShardedBlockComparator:
         Returns:
             MoE output tensor，在 primary device
         """
-        mlp = layer.mlp
+        _, mlp = get_moe_module(layer)
+        if mlp is None:
+            raise RuntimeError(f"Cannot find routed MoE module on {type(layer).__name__}")
         primary_device = devices[0]
 
         # ---- 1. Router: 手动计算 top-k expert ----
@@ -1362,8 +1429,11 @@ class ShardedBlockComparator:
         experts_mod = mlp.experts
         is_packed = hasattr(experts_mod, 'gate_up_proj') or hasattr(experts_mod, 'down_proj')
         is_module_list = isinstance(experts_mod, nn.ModuleList)
-        use_streaming = (sf_reader is not None and layer_idx is not None
-                         and is_packed and (quant_desc_str is not None or not is_quant))
+        use_streaming = (
+            sf_reader is not None and layer_idx is not None
+            and (is_packed or is_module_list)
+            and (quant_desc_str is not None or not is_quant or is_ct)
+        )
 
         if layer_idx == 3 and self.verbose:
             self._log_moe_l3_format(experts_mod, is_packed, is_module_list, use_streaming,
@@ -1373,16 +1443,32 @@ class ShardedBlockComparator:
             out = mlp(hidden_states)
             return out[0] if isinstance(out, tuple) else out
 
-        # ---- 3. Shared expert ----
+        # ---- 3. Shared expert + optional Kimi LatentMoE projection ----
         shared_output = self._forward_shared_expert(mlp, hidden_states)
+        routed_input = hidden_states
+        routed_down = getattr(mlp, 'routed_expert_down_proj', None)
+        if routed_down is not None:
+            routed_input = routed_down(hidden_states)
 
         # ---- 4. 逐 chunk 处理 routed experts ----
-        num_experts = router_logits.shape[-1]
+        num_experts = (
+            router_logits.shape[-1] if router_logits is not None
+            else getattr(mlp, 'num_experts', None)
+            or len(experts_mod)
+        )
         y = self._run_expert_chunks(
-            mlp, experts_mod, hidden_states, devices, chunk_size, layer_idx,
+            mlp, experts_mod, routed_input, devices, chunk_size, layer_idx,
             topk_scores, topk_indices, num_experts_per_tok, num_experts,
             is_packed, is_module_list, use_streaming,
-            sf_reader, quant_desc_str, is_quant, primary_device)
+            sf_reader, quant_desc_str, is_quant, is_ct, primary_device)
+
+        # Kimi K3 Stable LatentMoE maps routed output back to hidden_size.
+        routed_norm = getattr(mlp, 'routed_expert_norm', None)
+        routed_up = getattr(mlp, 'routed_expert_up_proj', None)
+        if routed_norm is not None:
+            y = routed_norm(y.to(hidden_states.dtype))
+        if routed_up is not None:
+            y = routed_up(y.to(hidden_states.dtype))
 
         # ---- 5. 加上 shared expert + debug ----
         return self._finalize_moe_output(
@@ -1390,13 +1476,24 @@ class ShardedBlockComparator:
             topk_scores, topk_indices, routed_scaling_factor)
 
     def _dequant_streaming_proj(self, sf_reader, expert_prefix, expert_id, proj_name,
-                                  w_type, device):
+                                  w_type, device, is_ct=False):
         """反量化单个 streaming proj 权重 (gate/up/down)。返回 fp tensor 或 None。"""
         from .model_loader import (dequantize_weight_mx, _MX_QUANT_TYPES,
                                     unpack_int4_to_int8, dequantize_weight_dynamic)
         _W4_TYPES = ("W4A8_DYNAMIC", "W4A16", "W4A8", "W4A4_DYNAMIC", "W4A4_LAOS")
         key = f"{expert_prefix}.{expert_id}.{proj_name}.weight"
         w = sf_reader.get_tensor(key)
+        if w is None and is_ct:
+            packed = sf_reader.get_tensor(
+                f"{expert_prefix}.{expert_id}.{proj_name}.weight_packed")
+            scale = sf_reader.get_tensor(
+                f"{expert_prefix}.{expert_id}.{proj_name}.weight_scale")
+            if packed is not None and scale is not None:
+                fp = dequantize_weight_mx(
+                    packed, scale, "W4A4_MXFP4", dtype=self.dtype,
+                ).to(device)
+                del packed, scale
+                return fp
         if w is None:
             return None
         if w_type in _MX_QUANT_TYPES:
@@ -1431,6 +1528,8 @@ class ShardedBlockComparator:
         sf_reader,
         quant_desc_str: dict,
         is_quant: bool,
+        is_ct: bool,
+        mlp: nn.Module,
     ) -> Optional[Tensor]:
         """Streaming expert forward: 从 safetensors 读取权重，反量化后传 NPU 计算。
 
@@ -1446,9 +1545,11 @@ class ShardedBlockComparator:
         from .utils import parse_base_name
         _W4_TYPES = ("W4A8_DYNAMIC", "W4A16", "W4A8", "W4A4_DYNAMIC", "W4A4_LAOS")
 
-        gate_key = f"{expert_prefix}.{expert_id}.gate_proj.weight"
-        up_key = f"{expert_prefix}.{expert_id}.up_proj.weight"
-        down_key = f"{expert_prefix}.{expert_id}.down_proj.weight"
+        gate_name, up_name, down_name = self._resolve_expert_proj_names(
+            sf_reader, expert_prefix, expert_id)
+        gate_key = f"{expert_prefix}.{expert_id}.{gate_name}.weight"
+        up_key = f"{expert_prefix}.{expert_id}.{up_name}.weight"
+        down_key = f"{expert_prefix}.{expert_id}.{down_name}.weight"
 
         if is_quant and quant_desc_str is not None:
             g_type = quant_desc_str.get(gate_key,
@@ -1461,14 +1562,17 @@ class ShardedBlockComparator:
             g_type = u_type = d_type = "FLOAT"
 
         # ---- gate/up/down proj: 读+反量化(CPU)→传NPU ----
-        gate_fp = self._dequant_streaming_proj(sf_reader, expert_prefix, expert_id, "gate_proj", g_type, device)
+        gate_fp = self._dequant_streaming_proj(
+            sf_reader, expert_prefix, expert_id, gate_name, g_type, device, is_ct=is_ct)
         if gate_fp is None:
             return None
-        up_fp = self._dequant_streaming_proj(sf_reader, expert_prefix, expert_id, "up_proj", u_type, device)
+        up_fp = self._dequant_streaming_proj(
+            sf_reader, expert_prefix, expert_id, up_name, u_type, device, is_ct=is_ct)
         if up_fp is None:
             del gate_fp
             return None
-        down_fp = self._dequant_streaming_proj(sf_reader, expert_prefix, expert_id, "down_proj", d_type, device)
+        down_fp = self._dequant_streaming_proj(
+            sf_reader, expert_prefix, expert_id, down_name, d_type, device, is_ct=is_ct)
         if down_fp is None:
             del gate_fp, up_fp
             return None
@@ -1492,7 +1596,7 @@ class ShardedBlockComparator:
 
         gate_out = torch.nn.functional.linear(x_for_gate, gate_fp)
         up_out = torch.nn.functional.linear(x_for_up, up_fp)
-        act_out = torch.nn.functional.silu(gate_out) * up_out
+        act_out = self._apply_expert_activation(mlp, gate_out, up_out)
 
         if self.activation_quant:
             act_out = _dispatch_act_fake_quant(act_out, self.activation_quant_type)
@@ -1510,19 +1614,58 @@ class ShardedBlockComparator:
         del gate_fp, up_fp, down_fp, gate_out, up_out, act_out
         return expert_out
 
+    @staticmethod
+    def _resolve_expert_proj_names(sf_reader, expert_prefix, expert_id):
+        """Resolve Qwen/GLM gate-up-down names or Kimi w1-w3-w2 names."""
+        weight_map = getattr(sf_reader, 'weight_map', {})
+        for names in (("gate_proj", "up_proj", "down_proj"), ("w1", "w3", "w2")):
+            gate = f"{expert_prefix}.{expert_id}.{names[0]}"
+            if (
+                f"{gate}.weight" in weight_map
+                or f"{gate}.weight_packed" in weight_map
+            ):
+                return names
+        return "gate_proj", "up_proj", "down_proj"
+
+    @staticmethod
+    def _apply_expert_activation(mlp, gate_out, up_out):
+        """Apply the expert GLU activation, including Kimi K3 SiTU."""
+        config = getattr(mlp, 'config', None)
+        hidden_act = getattr(config, 'hidden_act', 'silu')
+        if hidden_act == 'situ':
+            beta = float(getattr(config, 'activation_situ_beta', 1.0) or 1.0)
+            linear_beta = getattr(config, 'activation_situ_linear_beta', None)
+            gate = gate_out.float()
+            up = up_out.float()
+            gate = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
+            if linear_beta is not None:
+                up = float(linear_beta) * torch.tanh(up / float(linear_beta))
+            return (gate * up).to(gate_out.dtype)
+        return torch.nn.functional.silu(gate_out) * up_out
+
     # ---- MoE chunked forward 辅助方法 (Extract Method 降圈复杂度) ----
 
     def _resolve_gate_output(self, gate, hidden_states):
-        """解析 gate 输出，兼容 tuple (Qwen3.6) 和单 tensor 返回。"""
+        """解析 GLM/Qwen3.6/Kimi K3 router 的不同返回约定。"""
         precomputed_scores = None
         precomputed_indices = None
         gate_out = gate(hidden_states)
         if isinstance(gate_out, tuple):
-            router_logits = gate_out[0]
+            # Kimi K3 returns (topk_indices, topk_weights), without logits.
+            if (
+                len(gate_out) == 2
+                and isinstance(gate_out[0], torch.Tensor)
+                and not gate_out[0].dtype.is_floating_point
+            ):
+                router_logits = None
+                precomputed_indices = gate_out[0]
+                precomputed_scores = gate_out[1]
+            else:
+                router_logits = gate_out[0]
             if len(gate_out) >= 3:
                 precomputed_scores = gate_out[1]
                 precomputed_indices = gate_out[2]
-            elif len(gate_out) == 2:
+            elif len(gate_out) == 2 and router_logits is not None:
                 precomputed_indices = gate_out[1]
         else:
             router_logits = gate_out
@@ -1616,6 +1759,10 @@ class ShardedBlockComparator:
                                    num_experts_per_tok):
         """MoE router scoring 总入口: sigmoid 或 softmax(fallback)。"""
         routed_scaling_factor = getattr(mlp, 'routed_scaling_factor', None)
+        if router_logits is None:
+            if precomputed_scores is None or precomputed_indices is None:
+                raise RuntimeError("Router returned no logits and no precomputed top-k")
+            return precomputed_scores, precomputed_indices, routed_scaling_factor
         use_sigmoid_routing = (
             routed_scaling_factor is not None
             or getattr(mlp, 'norm_topk_prob', None) is not None
@@ -1690,17 +1837,42 @@ class ShardedBlockComparator:
                 torch.npu.empty_cache()
         return expert_out
 
+    @staticmethod
+    def _resolve_expert_prefix(sf_reader, layer_idx: int, moe_attr: str) -> str:
+        """Resolve the checkpoint prefix for routed experts from its weight map."""
+        marker = f".layers.{layer_idx}.{moe_attr}.experts."
+        for key in getattr(sf_reader, 'weight_map', {}):
+            if marker in key:
+                return key.split(marker, 1)[0] + marker[:-1]
+        return f"model.layers.{layer_idx}.{moe_attr}.experts"
+
     def _run_expert_chunks(self, mlp, experts_mod, hidden_states, devices, chunk_size,
                             layer_idx, topk_scores, topk_indices, num_experts_per_tok,
                             num_experts, is_packed, is_module_list, use_streaming,
-                            sf_reader, quant_desc_str, is_quant, primary_device):
+                            sf_reader, quant_desc_str, is_quant, is_ct, primary_device):
         """逐 chunk 处理 routed experts，返回累积输出 y。"""
         orig_shape = hidden_states.shape
         h_flat = hidden_states.view(-1, orig_shape[-1])
         scores_flat = topk_scores.view(-1, num_experts_per_tok)
         indices_flat = topk_indices.view(-1, num_experts_per_tok)
         y = torch.zeros_like(h_flat, dtype=torch.float32)
-        expert_prefix = f"model.layers.{layer_idx}.mlp.experts"
+        # Infer the owning layer attribute from the checkpoint.  This supports
+        # both Qwen/GLM ``mlp.experts`` and Kimi ``block_sparse_moe.experts``.
+        if sf_reader is not None:
+            candidate_attrs = ('block_sparse_moe', 'mlp', 'moe')
+            expert_prefix = None
+            for attr in candidate_attrs:
+                prefix = self._resolve_expert_prefix(sf_reader, layer_idx, attr)
+                if any(
+                    key.startswith(prefix + '.')
+                    for key in getattr(sf_reader, 'weight_map', {})
+                ):
+                    expert_prefix = prefix
+                    break
+            if expert_prefix is None:
+                expert_prefix = self._resolve_expert_prefix(sf_reader, layer_idx, 'mlp')
+        else:
+            expert_prefix = f"model.layers.{layer_idx}.mlp.experts"
 
         for chunk_start in range(0, num_experts, chunk_size):
             chunk_end = min(chunk_start + chunk_size, num_experts)
@@ -1711,7 +1883,7 @@ class ShardedBlockComparator:
                 expert_out = self._forward_single_routed_expert(
                     eid, h_flat, scores_flat, indices_flat, chunk_device,
                     experts_mod, is_packed, is_module_list, use_streaming,
-                    expert_prefix, sf_reader, quant_desc_str, is_quant,
+                    expert_prefix, sf_reader, quant_desc_str, is_quant, is_ct, mlp,
                     y, primary_device, layer_idx)
                 if expert_out is not None:
                     del expert_out
@@ -1721,7 +1893,7 @@ class ShardedBlockComparator:
     def _forward_single_routed_expert(self, eid, h_flat, scores_flat, indices_flat,
                                        chunk_device, experts_mod, is_packed,
                                        is_module_list, use_streaming, expert_prefix,
-                                       sf_reader, quant_desc_str, is_quant,
+                                       sf_reader, quant_desc_str, is_quant, is_ct, mlp,
                                        y, primary_device, layer_idx):
         """处理单个 routed expert: 取 token mask → forward → 累积到 y。"""
         eid_mask = (indices_flat == eid)
@@ -1736,7 +1908,7 @@ class ShardedBlockComparator:
         if use_streaming:
             expert_out = self._streaming_expert_forward(
                 eid, x_chunk, chunk_device, expert_prefix,
-                sf_reader, quant_desc_str, is_quant)
+                sf_reader, quant_desc_str, is_quant, is_ct, mlp)
         elif is_packed:
             expert_out = self._forward_single_expert_packed(experts_mod, eid, x_chunk, chunk_device)
         elif is_module_list:
@@ -1801,6 +1973,19 @@ class ShardedBlockComparator:
             quant_pe = None
         return ref_position_ids, quant_position_ids, ref_pe, quant_pe
 
+    @staticmethod
+    def _build_cross_layer_state_kwargs(layer, state, hidden_states):
+        """Move/init decoder cross-layer state and return it as forward kwargs."""
+        state_name = get_layer_state_kwarg(layer)
+        if state_name is None:
+            return {}
+        if state_name == "block_residual" and state is None:
+            batch, seq_len, hidden_size = hidden_states.shape
+            state = hidden_states.new_zeros(batch * seq_len, 0, hidden_size)
+        if state is not None:
+            state = state.to(hidden_states.device)
+        return {state_name: state}
+
     def _forward_single_dual_layer(self, ref_layer, quant_layer, ref_hidden, quant_hidden,
                                      ref_pos_ids, quant_pos_ids, ref_pe, quant_pe,
                                      ref_prev_topk, quant_prev_topk):
@@ -1809,7 +1994,11 @@ class ShardedBlockComparator:
         if ref_pe is not None:
             ref_fwd_kwargs['position_embeddings'] = ref_pe
         ref_fwd_kwargs['position_ids'] = ref_pos_ids
-        ref_fwd_kwargs['prev_topk_indices'] = ref_prev_topk
+        ref_attention_mask = build_replay_attention_mask(ref_layer, ref_hidden)
+        if ref_attention_mask is not None:
+            ref_fwd_kwargs['attention_mask'] = ref_attention_mask
+        ref_fwd_kwargs.update(self._build_cross_layer_state_kwargs(
+            ref_layer, ref_prev_topk, ref_hidden))
         ref_out = ref_layer(ref_hidden, **ref_fwd_kwargs)
         ref_hidden = ref_out[0] if isinstance(ref_out, tuple) else ref_out
         if isinstance(ref_out, tuple) and len(ref_out) > 1 and ref_out[1] is not None:
@@ -1819,7 +2008,11 @@ class ShardedBlockComparator:
         if quant_pe is not None:
             quant_fwd_kwargs['position_embeddings'] = quant_pe
         quant_fwd_kwargs['position_ids'] = quant_pos_ids
-        quant_fwd_kwargs['prev_topk_indices'] = quant_prev_topk
+        quant_attention_mask = build_replay_attention_mask(quant_layer, quant_hidden)
+        if quant_attention_mask is not None:
+            quant_fwd_kwargs['attention_mask'] = quant_attention_mask
+        quant_fwd_kwargs.update(self._build_cross_layer_state_kwargs(
+            quant_layer, quant_prev_topk, quant_hidden))
         quant_out = quant_layer(quant_hidden, **quant_fwd_kwargs)
         quant_hidden = quant_out[0] if isinstance(quant_out, tuple) else quant_out
         if isinstance(quant_out, tuple) and len(quant_out) > 1 and quant_out[1] is not None:
@@ -1865,6 +2058,10 @@ class ShardedBlockComparator:
                                          ref_hidden, quant_hidden, ref_layers, quant_layers)
             ref_layer = ref_layers[layer_idx]
             quant_layer = quant_layers[layer_idx]
+            ref_layer_input = ref_hidden
+            quant_layer_input = quant_hidden
+            ref_state_input = ref_prev_topk
+            quant_state_input = quant_prev_topk
             ref_hidden, quant_hidden, ref_prev_topk, quant_prev_topk = self._forward_single_dual_layer(
                 ref_layer, quant_layer, ref_hidden, quant_hidden,
                 ref_pos_ids, quant_pos_ids, ref_pe, quant_pe,
@@ -1874,7 +2071,12 @@ class ShardedBlockComparator:
             if not is_target and self.l1_target_layers is not None:
                 continue
             metrics, result = self._compute_layer_metrics_and_cache(
-                ref_hidden, quant_hidden, layer_idx, layer_cos_sims, layer_inputs)
+                ref_hidden, quant_hidden, layer_idx, layer_cos_sims, layer_inputs,
+                ref_layer_input=ref_layer_input,
+                quant_layer_input=quant_layer_input,
+                ref_layer_state=ref_state_input,
+                quant_layer_state=quant_state_input,
+            )
             all_results.append(result)
         return ref_hidden, quant_hidden, ref_prev_topk, quant_prev_topk
 
@@ -1911,7 +2113,9 @@ class ShardedBlockComparator:
                     ref_model, quant_model, ref_hidden_states, quant_hidden_states)
             else:
                 report.topk_result = self._compute_logits_topk(
-                    ref_model, quant_model, ref_hidden_states, quant_hidden_states)
+                    ref_model, quant_model, ref_hidden_states, quant_hidden_states,
+                    self.actual_ref_device, self.actual_quant_device,
+                )
             if self.verbose:
                 logger.info(report.topk_result)
         except Exception as e:

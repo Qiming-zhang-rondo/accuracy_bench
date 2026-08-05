@@ -2,7 +2,7 @@
 
 > 量化精度对齐工具 — 开源精简版
 > 分支: `accuracy_checker_v2_clean`
-> 最后更新: 2026-07-07
+> 最后更新: 2026-08-05
 
 ---
 
@@ -47,7 +47,7 @@ acc_bench/
 │   ├── layer1_block_compare.py    #          L1: ShardedBlockComparator
 │   ├── layer2_module_compare.py   #          V1 L2: rotation-aligned weight 对比
 │   ├── model_loader.py            #          HF 模型加载 (3D expert, indexed)
-│   ├── (adapters/)                #          [定界恢复时引入] 模型家族适配器
+│   ├── model_structure.py         #          统一结构/能力探测
 │   ├── hooks.py                   #          HookManager / ActivationCollector
 │   ├── metrics.py                 #          V1 指标 (cos_sim / snr / procrustes)
 │   ├── utils.py                   #          auto_device / rotation 工具
@@ -104,6 +104,12 @@ acc_bench/
 | `moe` | `layer.moe` / `block_sparse_moe` 存在 | `self_attn` \| `moe.gate` \| `moe.shared_expert(s)` \| `moe.experts` |
 | `glm_moe_dsa` | `layer.mlp` 有 `gate` + `experts` (GLM-5) | `self_attn` \| `mlp.gate` \| `mlp.shared_experts` \| `mlp.experts` |
 | `glm_mla` | `self_attn` 有 `q_a_proj`/`kv_a_proj_with_mqa` (dense MLP 层) | `self_attn` \| `mlp` |
+| `qwen3_5_moe` / Qwen3.6 alias | `mlp.gate+experts`，attention 为 `self_attn` 或 `linear_attn` | attention \| `mlp.gate` \| `mlp.shared_expert` \| `mlp.experts` |
+| `kimi_k3` | AttnRes / KDA / Stable LatentMoE 结构标记 | KDA/MLA \| `block_sparse_moe.*` \| AttnRes projections |
+
+核心流程不再维护按模型名复制的 Adapter 类。`model_structure.py` 只解析主流程真正使用的能力：文本容器、decoder layers、特殊模块、MoE 容器和跨层状态。模型名 alias 仅保留在 CLI/子图展示层。
+
+Kimi K3 官方 checkpoint 的每个 MoE 层包含 896 个独立 expert module。L1 `grouped_dual` 会在 meta 阶段移除 expert module 权重并从 safetensors 流式读取；普通 `dual` 会 fail-fast。L2 当前仍要求完整目标层，因此对这类 MoE 层 fail-fast，直到流式 expert replay 支持完成；packed 内部实现不受该结构检查限制。
 
 加 `--mla_fine` 对 MLA attention 细粒度拆分：
 `q_a_proj` / `q_b_proj` / `kv_a_proj_with_mqa` / `kv_b_proj` / `o_proj` / `indexer` (wq_b / wk / weights_proj / k_norm)
@@ -272,6 +278,6 @@ python3 run_accuracy_check.py --all \
 | `accuracy_checker/v2_metrics.py` | rel_l2 / cos_sim / recovery_ratio |
 | `accuracy_checker/layer1_block_compare.py` | L1 ShardedBlockComparator |
 | `accuracy_checker/model_loader.py` | HF 模型加载 (3D expert, indexed) |
-| `accuracy_checker/adapters/` | 模型家族适配器 (自动检测) |
+| `accuracy_checker/model_structure.py` | 模型容器、文本层、MoE 与跨层状态的统一结构探测 |
 | `accuracy_checker/utils.py` | rotation / device 工具 |
 | `accuracy_checker/cache.py` | L2 cache 目录管理 |

@@ -60,10 +60,12 @@ python3 run_accuracy_check.py --l2 --target_layers 11 20 33 \
 
 ## 支持范围
 
-- **模型**: GLM-5.1 (MLA + DSA + MoE, QuaRot) / Qwen3 / Qwen3MoE / Qwen3VL / Qwen3.5 MoE
-  > GLM-5.2 (head_dim=192, indexer_types) 需按 `reference_glm_version_identification` 自行校验 adapter 兼容性
+- **模型**: GLM-5.1 (MLA + DSA + MoE, QuaRot) / Qwen3 / Qwen3MoE / Qwen3VL / Qwen3.5 MoE / **Qwen3.6** / **Kimi K3**
+  > Kimi K3 已支持 text backbone 的 KDA/MLA、Stable LatentMoE、AttnRes、SiTU 和嵌套 MXFP4 配置；官方模型代码依赖 `fla-core`，Ascend 环境仍需提供可在 NPU 上运行的 KDA kernel/backend。
+  > Kimi K3 官方 896-expert `ModuleList` 必须用 `--compare_mode grouped_dual` 跑 L1；MoE 层 L2 暂不物化全部专家，会明确拒绝并提示使用流式 replay/内部 packed 模型。该边界待内网 NPU 回归后继续收敛。
+  > GLM-5.2 (head_dim=192, indexer_types) 需按 `reference_glm_version_identification` 自行校验结构和子图兼容性
 - **量化格式**: W8A8 / W4A8 / W4A4 / MXFP8 / MXFP4 / compressed-tensors (自动识别)
-- **覆盖**: 5 模型族 × 6 量化格式 × 多个已验证 bad case (GLM-5.1 W4A8 GT HIT layer 77 o_proj)
+- **覆盖**: 多模型族 × 6 量化格式 × 多个已验证 bad case (GLM-5.1 W4A8 GT HIT layer 77 o_proj；Kimi K3/Qwen3.6 待内网 NPU 回归)
 
 ## 使用约束
 
@@ -71,7 +73,7 @@ python3 run_accuracy_check.py --l2 --target_layers 11 20 33 \
 2. **L2 前必须先跑 L1** (`--l1 --cache_top_k N` 或 `--l1 --l1_target_layers ...`)
 3. **`--rotation_matrix`**: ref 与 quant 量化方案不同 (BF16 ref vs W8A8 quant) → 必传; 同方案 (W8A8 vs W8A8) → 不传 (RotBErr 兜底)
    > 前提: R 独立可逆且 ref/quant 用同一 R; 若 R 已融合进权重则必须显式传
-4. **MoE 强烈推荐 `grouped_dual`**: 8 卡并行 expert chunk, L1 从 70min → 7min (10x)
+4. **MoE 强烈推荐 `grouped_dual`**: 8 卡并行 expert chunk, L1 从 70min → 7min (10x)；Kimi K3 为必选
 5. **`dtype`** 仅 `bfloat16`/`float16`; NPU 推荐 `bfloat16` (Cube 原生), `float16` 注意激活溢出; ref 与 quant 必须一致; 模型自动 `eval()`
 6. **L1 对 MoE router/DSA 层有已知 false-positive** (router softmax 附近 cos_sim 常偏低, 不一定是量化真正出错), 建议配 `v2_metrics` 的 `router_flip_risk` 信号交叉筛
 
@@ -86,7 +88,7 @@ run_accuracy_check.py (7 modes: screening/boundary/l1/l2/full/report/inference)
 ├── L1: ShardedBlockComparator (layer1_block_compare.py)
 │   ├── model_loader.py — 分片加载 / 3D expert / 反量化
 │   ├── *_fake_quant.py — MXFP8/MXFP4/INT4 激活伪量化
-│   └── adapters/ — GLM5MoE / Qwen3 / Qwen3MoE / Qwen3VL / Qwen3.5MoE
+│   └── model_structure.py — 统一结构/能力探测（含多模态 wrapper、Kimi K3）
 ├── 定界: inference_check.py — NPU 加速反量化 → generate → 重复检测
 ├── L2: subgraph_locate.py — 反事实子图诊断
 │   ├── operator_patcher.py / weight_patcher.py — output/weight patch
@@ -108,7 +110,7 @@ run_accuracy_check.py (7 modes: screening/boundary/l1/l2/full/report/inference)
 
 ## Contributing
 
-- 新模型 adapter: 继承 `accuracy_checker/adapters/base.py:BaseModelAdapter`, 在 `adapters/__init__.py` 注册 (参考 `GLM5MoEAdapter` / `Qwen3Adapter`)
+- 新模型接入: 优先扩展 `model_structure.py` 的稳定结构能力和 `subgraph_locate.py` 的子图能力；不要按模型名复制一套 Adapter
 - 坏算子经验库共建: 欢迎提 issue 沉淀 "坏层 → 坏算子 → 修复建议" 案例
 
 ## 更新日志

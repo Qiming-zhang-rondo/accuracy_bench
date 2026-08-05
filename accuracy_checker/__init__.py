@@ -23,6 +23,7 @@ from .utils import (
     parse_dtype,
     clear_device_cache,
 )
+from .model_structure import ModelComponents, get_model_components, get_text_config
 
 # ---- 报告 schema (standalone) ----
 from .report_schema import (
@@ -81,6 +82,7 @@ __all__ = [
     "to_cpu_fp32",
     "get_decoder_layers", "get_embed_module", "get_norm_module", "get_lm_head_module",
     "get_num_layers",
+    "ModelComponents", "get_model_components", "get_text_config",
     "auto_device", "parse_dtype", "clear_device_cache",
     # 报告 schema
     "ReportData", "OverviewData", "L1LayerData", "L2LayerData", "SubgraphData",

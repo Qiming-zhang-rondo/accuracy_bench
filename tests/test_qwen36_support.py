@@ -242,26 +242,15 @@ def test_multimodal_config_fallback_logic():
 
 
 # =========================================================================
-# 5. 集成: Qwen3.6 adapter 检测
+# 5. 集成: Qwen3.6 model_type alias
 # =========================================================================
-def test_qwen36_adapter_detection():
-    """Qwen3.6 (model_type=qwen3_5_moe) 应自动选择 Qwen35MoEAdapter."""
-    import os, sys
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+def test_qwen36_model_type_alias():
+    """官方 model_type 与显式 qwen3_6 alias 应复用同一结构能力。"""
+    from accuracy_checker.subgraph_locate import _SUBGRAPH_NAME_DISPATCH
 
-    # 检查 adapter registry
-    try:
-        from accuracy_checker.adapters import MODEL_FAMILY_ADAPTERS
-        from accuracy_checker.adapters.qwen35 import Qwen35MoEAdapter
-        # Qwen3.6 的 model_type 是 qwen3_5_moe
-        assert 'qwen3_5_moe' in MODEL_FAMILY_ADAPTERS, \
-            f"qwen3_5_moe 应在 MODEL_FAMILY_ADAPTERS 中, 实际 {list(MODEL_FAMILY_ADAPTERS.keys())}"
-        assert MODEL_FAMILY_ADAPTERS['qwen3_5_moe'] is Qwen35MoEAdapter, \
-            "qwen3_5_moe 应映射到 Qwen35MoEAdapter"
-    except ImportError as e:
-        # 某些环境可能没有完整 adapters 模块, 跳过
-        import warnings
-        warnings.warn(f"adapters 模块不可用, 跳过 adapter 检测测试: {e}")
+    official = _SUBGRAPH_NAME_DISPATCH['qwen3_5_moe']
+    assert _SUBGRAPH_NAME_DISPATCH['qwen3_6'] is official
+    assert _SUBGRAPH_NAME_DISPATCH['qwen3_6_moe'] is official
 
 
 # =========================================================================
@@ -490,7 +479,7 @@ if __name__ == '__main__':
         test_moe_router_tuple_unpacking,
         test_check_orthogonal_runs_on_cpu,
         test_multimodal_config_fallback_logic,
-        test_qwen36_adapter_detection,
+        test_qwen36_model_type_alias,
         test_get_decoder_layers_for_conditional_generation,
         test_detect_model_type_qwen36,
         test_get_subgraph_names_qwen36,

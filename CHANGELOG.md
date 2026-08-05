@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-08-05 — Qwen3.6 / Kimi K3 + 结构探测统一
+
+- 删除未完整接入主流程的两套 Adapter 抽象，统一由 `model_structure.py` 解析模型容器、文本层和跨层状态
+- Qwen3.6: 保持官方 `qwen3_5_moe` 自动识别，新增 `qwen3_6` / `qwen3_6_moe` CLI alias
+- Kimi K3: 支持 `language_model.model.layers`、KDA/MLA、`block_sparse_moe`、Stable LatentMoE、SiTU、top-16 router、AttnRes
+- compressed-tensors: 支持从嵌套 `text_config` 识别量化配置及 MXFP4 `weight_packed` 反量化
+- L1→L2 cache 修正为保存目标层输入，并可携带 AttnRes 跨层状态；cache format 升级到 v3
+- eager replay 为 Kimi MLA / Qwen3.6 full attention 构建 causal mask；仅在层签名支持时传递跨层状态
+- Kimi K3 官方 ModuleList experts: L1 强制 `grouped_dual` 流式读取；MoE 层 L2 在流式 replay 合入前 fail-fast，避免整层 OOM
+
 ## 2026-07-16 — grouped_dual 修复 + CLI 简化 + top-1 默认
 
 - **grouped_dual bug 修复**: `expert_chunk_size=None` 导致 `range()` 报错; 修复为不传时自动设 `256//卡数`

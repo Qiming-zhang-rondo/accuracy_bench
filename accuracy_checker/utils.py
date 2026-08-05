@@ -4,6 +4,8 @@
 
 import torch
 import torch.nn as nn
+
+from .model_structure import get_model_components
 from torch import Tensor
 from typing import List, Optional, Tuple
 import logging
@@ -34,58 +36,30 @@ def flatten_for_compare(a: Tensor, b: Tensor, use_cpu: bool = True) -> Tuple[Ten
 # ============================================================================
 
 def get_decoder_layers(model: nn.Module) -> nn.ModuleList:
-    """兼容不同模型结构，获取decoder layers"""
-    if hasattr(model, 'model') and hasattr(model.model, 'language_model') and hasattr(model.model.language_model, 'layers'):
-        return model.model.language_model.layers
-    if hasattr(model, 'model') and hasattr(model.model, 'layers'):
-        return model.model.layers
-    if hasattr(model, 'layers'):
-        return model.layers
+    """兼容 CausalLM、多模态 wrapper 和 Kimi K3，获取 decoder layers。"""
     if isinstance(model, nn.ModuleList):
         return model
-    raise ValueError(f"Cannot find decoder layers in {type(model)}")
+    return get_model_components(model).layers
 
 
 def get_embed_module(model: nn.Module) -> Optional[nn.Module]:
     """获取embedding模块"""
-    if hasattr(model, 'model') and hasattr(model.model, 'language_model') and hasattr(model.model.language_model, 'embed_tokens'):
-        return model.model.language_model.embed_tokens
-    if hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
-        return model.model.embed_tokens
-    if hasattr(model, 'embed_tokens'):
-        return model.embed_tokens
-    return None
+    return get_model_components(model).embed
 
 
 def get_norm_module(model: nn.Module) -> Optional[nn.Module]:
     """获取final layer norm模块"""
-    if hasattr(model, 'model') and hasattr(model.model, 'language_model') and hasattr(model.model.language_model, 'norm'):
-        return model.model.language_model.norm
-    if hasattr(model, 'model') and hasattr(model.model, 'norm'):
-        return model.model.norm
-    if hasattr(model, 'norm'):
-        return model.norm
-    return None
+    return get_model_components(model).final_norm
 
 
 def get_lm_head_module(model: nn.Module) -> Optional[nn.Module]:
     """获取lm_head模块"""
-    if hasattr(model, 'lm_head'):
-        return model.lm_head
-    if hasattr(model, 'model') and hasattr(model.model, 'lm_head'):
-        return model.model.lm_head
-    return None
+    return get_model_components(model).lm_head
 
 
 def get_rotary_emb_module(model: nn.Module) -> Optional[nn.Module]:
     """获取rotary embedding模块"""
-    if hasattr(model, 'model') and hasattr(model.model, 'language_model') and hasattr(model.model.language_model, 'rotary_emb'):
-        return model.model.language_model.rotary_emb
-    if hasattr(model, 'model') and hasattr(model.model, 'rotary_emb'):
-        return model.model.rotary_emb
-    if hasattr(model, 'rotary_emb'):
-        return model.rotary_emb
-    return None
+    return get_model_components(model).rotary_emb
 
 
 def get_num_layers(model: nn.Module) -> int:
@@ -135,9 +109,10 @@ def normalize_quant_desc_keys(quant_desc: dict, model) -> dict:
     if not quant_desc:
         return quant_desc
 
-    has_language_model = (
-        hasattr(model, 'model') and
-        hasattr(model.model, 'language_model')
+    module_names = tuple(name for name, _ in model.named_modules())
+    has_nested_language_model = any(
+        name.endswith("language_model") or ".language_model." in name
+        for name in module_names
     )
 
     new_desc = {}
@@ -146,11 +121,11 @@ def normalize_quant_desc_keys(quant_desc: dict, model) -> dict:
             new_desc[key] = value
             continue
 
-        if has_language_model and key.startswith("model.language_model."):
+        if has_nested_language_model and key.startswith("model.language_model."):
             new_key = "model.model." + key[len("model."):]
             new_desc[new_key] = value
             new_desc[key] = value
-        elif not has_language_model and key.startswith("model.layers."):
+        elif not has_nested_language_model and key.startswith("model.layers."):
             new_key = "model.model." + key[len("model."):]
             new_desc[new_key] = value
             new_desc[key] = value

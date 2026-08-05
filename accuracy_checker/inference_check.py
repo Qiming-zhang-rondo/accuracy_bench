@@ -49,7 +49,7 @@ from .model_loader import (
     _MX_QUANT_TYPES,
 )
 from .utils import parse_base_name, normalize_quant_desc_keys, load_rotation_matrix
-from .adapters import get_model_adapter
+from .model_structure import get_model_components
 
 
 # ============================================================================
@@ -132,58 +132,36 @@ def decode_output(tokenizer, new_tokens) -> Dict[str, Any]:
         "thinking_truncated": is_truncated,
     }
 
-def _detect_model_layers_and_modules(model, adapter=None):
-    """Detect model layers, embed, final_norm, lm_head from adapter or auto-detection.
+def _detect_model_layers_and_modules(model):
+    """Detect model layers, embed, final_norm and lm_head structurally.
 
     Returns:
         (layers, embed, final_norm, lm_head)
     """
-    if adapter:
-        return (adapter.get_layers(), adapter.get_embed_layer(),
-                adapter.get_final_norm(), adapter.get_lm_head())
-
-    # Auto-detection without adapter
-    layers = None
-    embed = None
-    final_norm = None
-
-    if hasattr(model, 'model'):
-        inner = model.model
-        if hasattr(inner, 'language_model'):
-            inner = inner.language_model
-        if hasattr(inner, 'layers'):
-            layers = inner.layers
-            embed = getattr(inner, 'embed_tokens', None)
-            final_norm = getattr(inner, 'norm', None)
-
-    lm_head = getattr(model, 'lm_head', None)
-    if layers is None:
-        raise RuntimeError("无法探测模型层结构，请提供 adapter")
-
-    return layers, embed, final_norm, lm_head
+    components = get_model_components(model)
+    return (components.layers, components.embed,
+            components.final_norm, components.lm_head)
 
 
-def _get_inner_model_for_rotary(model, adapter=None):
+def _get_inner_model_for_rotary(model):
     """Get the inner model containing rotary_emb."""
-    if adapter:
-        return adapter._get_inner_model() if hasattr(adapter, '_get_inner_model') else None
-    inner = model.model
-    if hasattr(inner, 'language_model'):
-        inner = inner.language_model
-    return inner
+    return get_model_components(model).text_model
 
 
-def distribute_model(model, device_list: List[str], adapter=None) -> List[nn.Module]:
+def distribute_model(model, device_list: List[str]) -> List[nn.Module]:
     """
     将模型分布到多卡，注册跨卡 hidden_states 迁移 hook。
 
-    使用 adapter 获取层列表和特殊模块路径；
-    无 adapter 时用通用路径 (model.model.layers)。
+    使用统一结构探测获取文本层和特殊模块路径。
 
     Returns:
         layers 列表
     """
-    layers, embed, final_norm, lm_head = _detect_model_layers_and_modules(model, adapter)
+    components = get_model_components(model)
+    layers, embed, final_norm, lm_head = (
+        components.layers, components.embed,
+        components.final_norm, components.lm_head,
+    )
 
     n_layers = len(layers)
     n_devices = len(device_list)
@@ -193,9 +171,8 @@ def distribute_model(model, device_list: List[str], adapter=None) -> List[nn.Mod
     if embed is not None:
         embed.to(device_list[0])
 
-    inner = _get_inner_model_for_rotary(model, adapter)
-    if inner and hasattr(inner, 'rotary_emb'):
-        inner.rotary_emb.to(device_list[0])
+    if components.rotary_emb is not None:
+        components.rotary_emb.to(device_list[0])
 
     # layers → 均分
     for i, layer in enumerate(layers):
@@ -211,8 +188,8 @@ def distribute_model(model, device_list: List[str], adapter=None) -> List[nn.Mod
             _register_lm_head_device_hook(lm_head, device_list[0])
 
     # visual → 第一张卡
-    if hasattr(model.model, 'visual'):
-        model.model.visual.to(device_list[0])
+    if components.visual is not None:
+        components.visual.to(device_list[0])
 
     logger.info(f"  分布完成: {n_layers} 层, 每设备约 {layers_per_device} 层")
 
@@ -1224,7 +1201,7 @@ DEFAULT_CONVERSATIONS = [
 ]
 
 
-def _remove_layer_hooks(model, adapter=None):
+def _remove_layer_hooks(model):
     """移除 decoder layer 上的 pre-forward hooks (手动 forward 不需要)。
 
     distribute_model 注册的 hooks 会自动迁移 hidden_states 跨设备,
@@ -1232,11 +1209,9 @@ def _remove_layer_hooks(model, adapter=None):
     手动 forward 显式管理设备迁移, 不需要 hooks。
     保留 lm_head 的 post-forward hook (logits 迁移到 device[0])。
     """
-    if adapter:
-        layers = adapter.get_layers()
-    elif hasattr(model, 'model') and hasattr(model.model, 'layers'):
-        layers = model.model.layers
-    else:
+    try:
+        layers = get_model_components(model).layers
+    except ValueError:
         return
 
     count = 0
@@ -1252,6 +1227,8 @@ def _remove_layer_hooks(model, adapter=None):
 
 
 def _manual_move_position_embeddings(position_embeddings, target_dev: str):
+    if position_embeddings is None:
+        return None
     """将 position_embeddings (tuple 或单一 tensor) 移动到目标设备"""
     if isinstance(position_embeddings, tuple):
         return tuple(t.to(target_dev) for t in position_embeddings)
@@ -1291,7 +1268,7 @@ def _manual_forward_layers(layers, hidden_states, position_ids, position_embeddi
     return hidden_states
 
 
-def _manual_generate(model, tokenizer, input_ids, device_list, adapter,
+def _manual_generate(model, tokenizer, input_ids, device_list,
                       max_new_tokens, thinking="chat"):
     """手动逐层 forward with KV cache, 绕过 model.generate() 和 pre-forward hooks。
 
@@ -1299,12 +1276,14 @@ def _manual_generate(model, tokenizer, input_ids, device_list, adapter,
     使用 DynamicCache 进行 KV cache, 每层更新自己的 cache entry。
     不传 attention_mask (GLM 层 forward 内部处理 causal attention)。
     """
-    inner = model.model
-    layers = inner.layers
-    embed = inner.embed_tokens
-    rotary_emb = inner.rotary_emb
-    norm = inner.norm
-    lm_head = model.lm_head
+    components = get_model_components(model)
+    layers = components.layers
+    embed = components.embed
+    rotary_emb = components.rotary_emb
+    norm = components.final_norm
+    lm_head = components.lm_head
+    if any(component is None for component in (embed, norm, lm_head)):
+        raise RuntimeError("手动生成要求 embedding/norm/lm_head 均可探测")
 
     n_layers = len(layers)
     n_devices = len(device_list)
@@ -1340,7 +1319,10 @@ def _manual_generate(model, tokenizer, input_ids, device_list, adapter,
         ).unsqueeze(0)
 
         # Rotary embeddings (computed once on embed_device, moved per-layer)
-        position_embeddings = rotary_emb(hidden_states, position_ids=position_ids)
+        position_embeddings = (
+            rotary_emb(hidden_states, position_ids=position_ids)
+            if rotary_emb is not None else None
+        )
 
         # 逐层 forward (手动移动 hidden_states 跨设备)
         hidden_states = _manual_forward_layers(
@@ -1470,7 +1452,7 @@ def _hf_detect_streaming_mode(model: nn.Module, model_path: str,
 
 
 def _hf_create_skeleton(model_path: str, torch_dtype: torch.dtype,
-                        verbose: bool) -> Tuple[nn.Module, Any, bool, bool]:
+                        verbose: bool) -> Tuple[nn.Module, bool, bool]:
     """[2/6] 创建模型骨架，处理 streaming expert placeholders"""
     if verbose:
         logger.info("\n[2/6] 创建模型骨架...")
@@ -1480,11 +1462,12 @@ def _hf_create_skeleton(model_path: str, torch_dtype: torch.dtype,
     if verbose:
         logger.info(f"  骨架: {total_params/1e9:.2f}B 参数")
 
-    # 获取 adapter
-    adapter = get_model_adapter(model, model_path)
+    components = get_model_components(model)
     if verbose:
-        adapter_name = type(adapter).__name__ if adapter else "None (通用探测)"
-        logger.info(f"  Adapter: {adapter_name}")
+        logger.info(
+            f"  结构探测: {type(components.text_model).__name__}, "
+            f"{len(components.layers)} layers"
+        )
 
     is_quant = is_quantized_model(model_path)
     has_3d_experts, use_streaming = _hf_detect_streaming_mode(model, model_path, is_quant)
@@ -1496,7 +1479,7 @@ def _hf_create_skeleton(model_path: str, torch_dtype: torch.dtype,
         if verbose:
             logger.info(f"  替换 {len(expert_shapes)} 个 3D expert 参数为 placeholder")
 
-    return model, adapter, is_quant, use_streaming
+    return model, is_quant, use_streaming
 
 
 def _hf_load_quant_weights(model: nn.Module, model_path: str, torch_dtype: torch.dtype,
@@ -1795,13 +1778,13 @@ def hf_inference_check(
     tokenizer = _hf_load_tokenizer(model_path, verbose)
 
     # ---- Step 2: 创建骨架 ----
-    model, adapter, is_quant, use_streaming = _hf_create_skeleton(
+    model, is_quant, use_streaming = _hf_create_skeleton(
         model_path, torch_dtype, verbose)
 
     # ---- Step 3: 多卡分布骨架 (先于反量化!) ----
     if verbose:
         logger.info(f"\n[3/6] 分布模型骨架到 {len(device_list)} 个设备...")
-    distribute_model(model, device_list, adapter=adapter)
+    distribute_model(model, device_list)
 
     # ---- Step 4: 加载权重 + 反量化 ----
     _hf_load_weights(model, model_path, torch_dtype, device_list,
@@ -1824,7 +1807,7 @@ def hf_inference_check(
     _hf_log_summary(results)
 
     if noquit:
-        _interactive_loop(model, tokenizer, first_device, device_list, adapter,
+        _interactive_loop(model, tokenizer, first_device, device_list,
                           thinking, max_new_tokens, verbose)
 
     return results
@@ -1885,7 +1868,7 @@ def _interactive_generate_one(model, tokenizer, first_device,
     _interactive_log_decoded(decoded, gen_time, len(new_tokens))
 
 
-def _interactive_loop(model, tokenizer, first_device, device_list, adapter,
+def _interactive_loop(model, tokenizer, first_device, device_list,
                       thinking, max_new_tokens, verbose):
     """交互式推理循环，模型已加载在 NPU 上，反复接收输入"""
     logger.info("\n" + "=" * 70)

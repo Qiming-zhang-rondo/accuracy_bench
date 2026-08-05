@@ -40,7 +40,13 @@ from accuracy_checker.replay_provider import ReplayProvider
 from accuracy_checker.v2_metrics import rel_l2, recovery_ratio
 from accuracy_checker.operator_patcher import ReplacementHook, _resolve_path
 from accuracy_checker.utils import load_rotation_matrix, unrotate_hidden, rotate_hidden
-from accuracy_checker.cache import get_cache_dir, model_hash, prompt_hash
+from accuracy_checker.cache import (
+    CACHE_FORMAT_VERSION,
+    get_cache_dir,
+    model_hash,
+    prompt_hash,
+)
+from accuracy_checker.model_structure import get_text_config, is_kimi_k3_layer
 
 
 # 多旋转矩阵支持 (GLM-5 DSA QuaRot)
@@ -410,7 +416,10 @@ def _try_cache_match(
     import glob
 
     # Strategy 1: exact model + prompt
-    pattern = f"{mh}_{ph}_s*_L{target_layer}_{side}_*_{quant_method}.pt"
+    pattern = (
+        f"{mh}_{ph}_s*_L{target_layer}_{side}_"
+        f"{CACHE_FORMAT_VERSION}_*_{quant_method}.pt"
+    )
     matches = glob.glob(base + pattern)
     if matches:
         if len(matches) > 1:
@@ -419,7 +428,10 @@ def _try_cache_match(
         return torch.load(matches[0], weights_only=True, map_location=device)
 
     # Strategy 2: model_hash + layer + side + method (prompt hash may differ)
-    pattern = f"{mh}_*_s*_L{target_layer}_{side}_*_{quant_method}.pt"
+    pattern = (
+        f"{mh}_*_s*_L{target_layer}_{side}_"
+        f"{CACHE_FORMAT_VERSION}_*_{quant_method}.pt"
+    )
     matches = glob.glob(base + pattern)
     if matches:
         if len(matches) > 1:
@@ -429,7 +441,10 @@ def _try_cache_match(
         return torch.load(matches[0], weights_only=True, map_location=device)
 
     # Strategy 3: layer + side + method only (loosest)
-    pattern = f"*_s*_L{target_layer}_{side}_*_{quant_method}.pt"
+    pattern = (
+        f"*_s*_L{target_layer}_{side}_"
+        f"{CACHE_FORMAT_VERSION}_*_{quant_method}.pt"
+    )
     matches = glob.glob(base + pattern)
     if len(matches) == 1:
         logger.info(f"  [CACHE] Matched by layer/side/method only: {os.path.basename(matches[0])}")
@@ -477,6 +492,13 @@ def _load_l1_cache(
             return result
 
     return None
+
+
+def _unpack_l1_cache_entry(entry):
+    """Return ``(hidden_states, layer_state)`` for v3 tensor/dict caches."""
+    if isinstance(entry, dict):
+        return entry.get("hidden_states"), entry.get("layer_state")
+    return entry, None
 
 
 # V1 L1 报告解析
@@ -560,10 +582,10 @@ def _compute_topk_flip_rate(
     if ref_output.shape != quant_output.shape:
         return float('nan')
 
-    # 根据 shape 判断是否需要 topk，而非 dtype
-    # shape[-1] != topk → 输入是 scores，需要执行 topk
-    # shape[-1] == topk → 输入已经是 indices，直接使用
-    if ref_output.shape[-1] != topk:
+    # Integer outputs are already selected indices (Kimi K3 returns top-16).
+    # Floating outputs are logits/scores unless they already have top-k width.
+    outputs_are_indices = not ref_output.dtype.is_floating_point
+    if not outputs_are_indices and ref_output.shape[-1] != topk:
         k = min(topk, ref_output.shape[-1])
         ref_idx = ref_output.float().topk(k, dim=-1).indices
         quant_idx = quant_output.float().topk(k, dim=-1).indices
@@ -667,6 +689,9 @@ def detect_model_type(layer: torch.nn.Module) -> str:
 
     通用 MoE (如 Qwen3MoE) 挂在 layer.moe / layer.block_sparse_moe 下.
     """
+    if is_kimi_k3_layer(layer):
+        return 'kimi_k3'
+
     mlp = getattr(layer, 'mlp', None)
     has_mlp_gate_experts = (
         mlp is not None and hasattr(mlp, 'gate') and hasattr(mlp, 'experts')
@@ -801,6 +826,46 @@ def _get_qwen3_5_moe_subgraph_names(layer: torch.nn.Module, mla_fine: bool) -> L
     return names
 
 
+def _get_kimi_k3_subgraph_names(layer: torch.nn.Module, mla_fine: bool) -> List[str]:
+    """Subgraphs for Kimi K3 KDA/MLA + Stable LatentMoE + AttnRes."""
+    names = ['self_attn']
+    attn = getattr(layer, 'self_attn', None)
+    if mla_fine and attn is not None:
+        if hasattr(attn, 'q_a_proj') or hasattr(attn, 'kv_a_proj_with_mqa'):
+            names.extend(_get_mla_subgraph_names(attn))
+            if hasattr(attn, 'g_proj'):
+                names.append('self_attn.g_proj')
+        else:
+            for child in (
+                'q_proj', 'k_proj', 'v_proj',
+                'q_conv1d', 'k_conv1d', 'v_conv1d',
+                'f_a_proj', 'f_b_proj', 'b_proj',
+                'g_proj', 'g_a_proj', 'g_b_proj', 'o_norm', 'o_proj',
+            ):
+                if hasattr(attn, child):
+                    names.append(f'self_attn.{child}')
+
+    moe = getattr(layer, 'block_sparse_moe', None)
+    if moe is not None:
+        names.append('block_sparse_moe')
+        for child in (
+            'gate', 'routed_expert_down_proj', 'routed_expert_norm',
+            'experts', 'routed_expert_up_proj', 'shared_experts',
+        ):
+            if hasattr(moe, child):
+                names.append(f'block_sparse_moe.{child}')
+    elif hasattr(layer, 'mlp'):
+        names.append('mlp')
+
+    for child in (
+        'self_attention_res_proj', 'self_attention_res_norm',
+        'mlp_res_proj', 'mlp_res_norm',
+    ):
+        if hasattr(layer, child):
+            names.append(child)
+    return names
+
+
 def _get_generic_moe_subgraph_names(layer: torch.nn.Module, mla_fine: bool) -> List[str]:
     """子图名 for 通用 MoE (layer.moe / layer.block_sparse_moe)."""
     names = ['self_attn']
@@ -836,6 +901,9 @@ def _get_glm_mla_subgraph_names(layer: torch.nn.Module, mla_fine: bool) -> List[
 _SUBGRAPH_NAME_DISPATCH = {
     'glm_moe_dsa': _get_glm_moe_dsa_subgraph_names,
     'qwen3_5_moe': _get_qwen3_5_moe_subgraph_names,
+    'qwen3_6': _get_qwen3_5_moe_subgraph_names,
+    'qwen3_6_moe': _get_qwen3_5_moe_subgraph_names,
+    'kimi_k3': _get_kimi_k3_subgraph_names,
     'moe': _get_generic_moe_subgraph_names,
     'glm_mla': _get_glm_mla_subgraph_names,
 }
@@ -1070,9 +1138,15 @@ def _compute_flip_rates(subgraph_names, ref_sub, quant_sub):
         if ref_indexer_out is not None and quant_indexer_out is not None:
             indexer_flip_rate = _compute_topk_flip_rate(ref_indexer_out, quant_indexer_out)
 
-    if 'mlp.gate' in subgraph_names:
-        ref_gate_out = ref_sub.get('mlp.gate')
-        quant_gate_out = quant_sub.get('mlp.gate')
+    gate_name = next(
+        (name for name in ('mlp.gate', 'moe.gate',
+                           'block_sparse_moe.gate')
+         if name in subgraph_names),
+        None,
+    )
+    if gate_name is not None:
+        ref_gate_out = ref_sub.get(gate_name)
+        quant_gate_out = quant_sub.get(gate_name)
         if ref_gate_out is not None and quant_gate_out is not None:
             experts_routing_flip = _compute_topk_flip_rate(ref_gate_out, quant_gate_out)
 
@@ -1367,7 +1441,8 @@ def diagnose_layer(
 
     ref_layer = handle.ref_layer
     quant_layer = handle.quant_layer
-    layer_kwargs = handle.layer_kwargs or {}
+    ref_layer_kwargs = handle.ref_layer_kwargs or {}
+    quant_layer_kwargs = handle.quant_layer_kwargs or {}
 
     # Detect model type
     if model_type == 'auto':
@@ -1402,7 +1477,7 @@ def diagnose_layer(
 
     # Capture ref sub-graph outputs (in original space, from ref layer)
     ref_sub = _capture_subgraph_outputs(
-        ref_layer, ref_input, subgraph_names, layer_kwargs,
+        ref_layer, ref_input, subgraph_names, ref_layer_kwargs,
     )
 
     # Rotate ref sub-graph outputs so they match quant's internal (rotated) space.
@@ -1422,7 +1497,7 @@ def diagnose_layer(
     if mla_fine:
         # Capture quant sub-graph outputs (for RotBErr)
         quant_sub = _capture_subgraph_outputs(
-            quant_layer, quant_input, subgraph_names, layer_kwargs,
+            quant_layer, quant_input, subgraph_names, quant_layer_kwargs,
         )
 
         # --- RotBErr: rotation-aligned boundary error ---
@@ -1447,7 +1522,7 @@ def diagnose_layer(
     # In non-mla_fine mode, all sub-graphs are large (self_attn, mlp.*) and patchable.
     results, subgraph_quant_types = _patch_all_subgraphs(
         subgraph_names, quant_layer, quant_input, ref_sub, ref_out, base_l2, R1,
-        layer_kwargs, unpatchable, quant_desc, handle.layer_idx, mla_fine,
+        quant_layer_kwargs, unpatchable, quant_desc, handle.layer_idx, mla_fine,
     )
 
     # --- Chain Delta Recovery (串联子链增量分析) ---
@@ -1462,7 +1537,8 @@ def diagnose_layer(
     # 也会因 indexer mask 不同导致 attention 分布错位 → 负 recovery。
     # 对 GLM-5 DSA，branch patch 无意义，跳过。
     branch_patches = _compute_branch_patches(
-        quant_layer, quant_input, ref_sub, ref_out, base_l2, R1, layer_kwargs, mla_fine,
+        quant_layer, quant_input, ref_sub, ref_out, base_l2, R1,
+        quant_layer_kwargs, mla_fine,
     )
 
     # --- Impact Boundary: highest Recovery = "from this boundary onward, downstream is OK" ---
@@ -1558,7 +1634,7 @@ def diagnose_layers(
         # Extract model config for block rotation
         model_config = {}
         if hasattr(provider.ref_model, 'config'):
-            cfg = provider.ref_model.config
+            cfg = get_text_config(provider.ref_model.config)
             for key in ['qk_nope_head_dim', 'qk_rope_head_dim', 'v_head_dim',
                          'num_key_value_heads', 'kv_lora_rank', 'q_lora_rank',
                          'num_attention_heads', 'head_dim', 'hidden_size']:
@@ -1570,8 +1646,12 @@ def diagnose_layers(
             logger.info(f"\nDiagnosing layer {layer_idx}...")
 
             # 从 V1 L1 cache 加载 hidden_states
-            ref_hidden = _load_l1_cache(ref_model_path, prompt, layer_idx, "ref", quant_method, ref_device)
-            quant_hidden = _load_l1_cache(quant_model_path, prompt, layer_idx, "quant", quant_method, quant_device)
+            ref_cache = _load_l1_cache(
+                ref_model_path, prompt, layer_idx, "ref", quant_method, ref_device)
+            quant_cache = _load_l1_cache(
+                quant_model_path, prompt, layer_idx, "quant", quant_method, quant_device)
+            ref_hidden, ref_layer_state = _unpack_l1_cache_entry(ref_cache)
+            quant_hidden, quant_layer_state = _unpack_l1_cache_entry(quant_cache)
 
             if ref_hidden is None or quant_hidden is None:
                 logger.info(f"  [SKIP] Layer {layer_idx}: no V1 L1 cache found. "
@@ -1580,10 +1660,8 @@ def diagnose_layers(
 
             # Validate hidden_size matches the model config
             # ForConditionalGeneration (如 Qwen3.6): hidden_size 在 text_config 里
-            config = provider.ref_model.config
+            config = get_text_config(provider.ref_model.config)
             expected_hidden = getattr(config, 'hidden_size', None)
-            if expected_hidden is None and hasattr(config, 'text_config'):
-                expected_hidden = getattr(config.text_config, 'hidden_size', None)
             if expected_hidden is None:
                 logger.warning(f"  [SKIP] Layer {layer_idx}: cannot find hidden_size in config")
                 continue
@@ -1603,6 +1681,8 @@ def diagnose_layers(
                 quant_device=quant_device,
                 ref_hidden_override=ref_hidden,
                 quant_hidden_override=quant_hidden,
+                ref_layer_state_override=ref_layer_state,
+                quant_layer_state_override=quant_layer_state,
             )
 
             r = diagnose_layer(handle, model_type=model_type, mla_fine=mla_fine, R=R, rot_mats=rot_mats, quant_desc=quant_desc, model_config=model_config)

@@ -39,7 +39,7 @@ def get_report_dir() -> str:
     return os.path.join(get_cache_dir(), "reports")
 
 
-ADAPTER_VERSION = "2"  # bump when adapter logic changes
+CACHE_FORMAT_VERSION = "3"  # v3 stores the target layer input and optional layer state
 INT4_UNPACK_VERSION = "2"  # bump when _decode_int4_packed changes
 
 
@@ -54,15 +54,23 @@ def prompt_hash(prompt: str) -> str:
 def _cache_key(model_path, prompt, seqlen, target_layer, side, quant_mode):
     mh = model_hash(model_path)
     ph = prompt_hash(prompt)
-    return f"{mh}_{ph}_s{seqlen}_L{target_layer}_{side}_{ADAPTER_VERSION}_{INT4_UNPACK_VERSION}_{quant_mode}.pt"
+    return f"{mh}_{ph}_s{seqlen}_L{target_layer}_{side}_{CACHE_FORMAT_VERSION}_{INT4_UNPACK_VERSION}_{quant_mode}.pt"
 
 
-def save_cache(model_path, prompt, seqlen, target_layer, side, quant_mode, tensor):
+def save_cache(model_path, prompt, seqlen, target_layer, side, quant_mode,
+               tensor, layer_state=None):
     cache_dir = get_cache_dir()
     os.makedirs(cache_dir, exist_ok=True)
     key = _cache_key(model_path, prompt, seqlen, target_layer, side, quant_mode)
     path = os.path.join(cache_dir, key)
-    torch.save(tensor.cpu(), path)
+    if layer_state is None:
+        payload = tensor.cpu()
+    else:
+        payload = {
+            "hidden_states": tensor.cpu(),
+            "layer_state": layer_state.cpu(),
+        }
+    torch.save(payload, path)
     return path
 
 

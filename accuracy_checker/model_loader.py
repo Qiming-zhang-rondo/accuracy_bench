@@ -110,6 +110,8 @@ def is_quantized_model(model_path: str) -> bool:
             with open(config_path) as f:
                 config = json.load(f)
             qconfig = config.get("quantization_config", {})
+            if not qconfig:
+                qconfig = config.get("text_config", {}).get("quantization_config", {})
             if qconfig.get("quant_method") == "compressed-tensors":
                 return True
         except Exception as e:
@@ -125,6 +127,8 @@ def is_compressed_tensors_model(model_path: str) -> bool:
             with open(config_path) as f:
                 config = json.load(f)
             qconfig = config.get("quantization_config", {})
+            if not qconfig:
+                qconfig = config.get("text_config", {}).get("quantization_config", {})
             return qconfig.get("quant_method") == "compressed-tensors"
         except Exception as e:
             logger.debug(f"is_compressed_tensors_model config parse failed: {e}")
@@ -681,6 +685,15 @@ def _load_ct_param(name: str, param, sf_reader: ShardWeightReader,
     tensor = sf_reader.get_tensor(name)
     scale_key = name.replace('.weight', '.weight_scale')
     scale_tensor = sf_reader.get_tensor(scale_key)
+    if tensor is None and name.endswith('.weight'):
+        # compressed-tensors MXFP4 stores the packed nibbles separately.
+        packed_key = name.replace('.weight', '.weight_packed')
+        packed = sf_reader.get_tensor(packed_key)
+        if packed is not None and scale_tensor is not None:
+            param.data = dequantize_weight_mxfp4(
+                packed, scale_tensor, dtype=dtype,
+            )
+            return True
     if tensor is None:
         return False
     if tensor.dtype == torch.int8 and scale_tensor is not None:
@@ -971,6 +984,16 @@ def load_layer_weights_indexed(
             verbose, param,
         )
         if not should_load:
+            skipped_count += 1
+            continue
+
+        # grouped_dual streams routed experts directly from safetensors.
+        # Covers both 3D packed experts and ModuleList experts (Kimi K3).
+        if (
+            skip_routed_experts
+            and '.experts.' in name
+            and 'shared_expert' not in name
+        ):
             skipped_count += 1
             continue
 
@@ -1553,15 +1576,26 @@ def move_layers_to_device(model: nn.Module, layer_indices: List[int], device: st
             # 但不跳过非expert的3D参数 (如 Qwen3.6 linear_attn.conv1d.weight [out, 1, kernel])
             # L2需要完整前向, 3D expert params必须上device
             def _is_routed_expert_param(name: str, p: nn.Parameter) -> bool:
-                # routed expert 参数: 名称含 'experts' 且 3D [num_experts, ...]
-                # 排除 shared_expert (通常是 2D) 和 conv1d (3D 但 [out, 1, kernel] 不是 expert)
-                return p.dim() == 3 and 'experts' in name and 'shared' not in name
+                # Packed experts are 3D; ModuleList experts use ``experts.N`` 2D weights.
+                # Exclude shared experts and unrelated Conv1d parameters.
+                parts = name.split('.')
+                has_indexed_expert = any(
+                    part == 'experts' and i + 1 < len(parts) and parts[i + 1].isdigit()
+                    for i, part in enumerate(parts)
+                )
+                return (
+                    'shared' not in name
+                    and (
+                        (p.dim() == 3 and 'experts' in name)
+                        or has_indexed_expert
+                    )
+                )
 
-            has_3d_expert = any(
+            has_routed_expert = any(
                 _is_routed_expert_param(name, p)
                 for name, p in layer.named_parameters()
             )
-            if has_3d_expert and skip_3d_experts:
+            if has_routed_expert and skip_3d_experts:
                 for name, param in layer.named_parameters():
                     if not _is_routed_expert_param(name, param):
                         param.data = param.to(device)

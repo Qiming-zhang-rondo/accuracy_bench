@@ -117,10 +117,12 @@ def parse_args():
     parser.add_argument("--model_type", type=str, default="auto",
                         choices=["auto", "dense", "moe",
                                  "glm_mla", "glm_moe_dsa",
-                                 "qwen3", "qwen3_moe", "qwen3_5_moe", "qwen3_vl"],
+                                 "qwen3", "qwen3_moe", "qwen3_5_moe", "qwen3_vl",
+                                 "qwen3_6", "qwen3_6_moe", "kimi_k3"],
                         help="L2: 模型类型 (默认 auto 自动检测; 偶尔需手动覆盖; "
                              "qwen3=Qwen3/Qwen2, qwen3_moe=Qwen3 MoE, "
-                             "qwen3_5_moe=Qwen3.5 MoE, qwen3_vl=Qwen3-VL)")
+                             "qwen3_5_moe=Qwen3.5/3.6 official model_type, "
+                             "qwen3_6=Qwen3.6 alias, kimi_k3=Kimi K3)")
 
     # ---- full/boundary 模式专用 ----
     parser.add_argument("--devices", type=str, default=None,

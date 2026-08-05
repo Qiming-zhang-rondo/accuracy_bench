@@ -35,6 +35,13 @@ from accuracy_checker.model_loader import (
     unload_layers_to_meta,
 )
 from accuracy_checker.utils import get_decoder_layers, get_rotary_emb_module
+from accuracy_checker.model_structure import (
+    build_replay_attention_mask,
+    get_layer_state_kwarg,
+    get_text_config,
+    has_indexed_routed_experts,
+    is_kimi_k3_layer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +131,8 @@ class ReplayProvider:
         ref_prefix_layers: Optional[List[int]] = None,
         ref_hidden_override: Optional[torch.Tensor] = None,
         quant_hidden_override: Optional[torch.Tensor] = None,
+        ref_layer_state_override: Optional[torch.Tensor] = None,
+        quant_layer_state_override: Optional[torch.Tensor] = None,
     ) -> "LayerReplayHandle":
         """
         获取目标层的 replay handle。
@@ -143,6 +152,18 @@ class ReplayProvider:
         """
         if quant_device is None:
             quant_device = device
+
+        for side, layer in (
+            ("reference", self.ref_layers[layer_idx]),
+            ("quantized", self.quant_layers[layer_idx]),
+        ):
+            if is_kimi_k3_layer(layer) and has_indexed_routed_experts(layer):
+                raise NotImplementedError(
+                    "Kimi K3 L2 replay cannot materialize the official ModuleList "
+                    f"experts for the {side} layer. Run L1 with "
+                    "--compare_mode grouped_dual; L2 needs a streaming-expert "
+                    "replay implementation or a packed internal model."
+                )
 
         if self.verbose:
             logger.info(f"  [get_layer_handle] Layer {layer_idx}: ref={device}, quant={quant_device}")
@@ -176,16 +197,18 @@ class ReplayProvider:
             # 从外部提供 hidden_states（如 V1 L1 cache）
             ref_hidden = ref_hidden_override
             quant_hidden = quant_hidden_override
-            # Move to device for position_embeddings computation
-            layer_kwargs = self._build_layer_kwargs(ref_hidden.to(device), device)
         elif ref_prefix_layers:
             # 逐层 forward ref prefix 层得到真实 hidden
             if prompt is None:
                 raise ValueError("ref_prefix_layers requires a prompt")
             ref_hidden, _, _ = self._prepare_from_prompt(prompt, device, quant_device)
-            ref_hidden = self._forward_prefix(ref_hidden, ref_prefix_layers, device)
+            ref_hidden, ref_layer_state_override = self._forward_prefix(
+                ref_hidden, ref_prefix_layers, device)
             quant_hidden = ref_hidden.to(quant_device)
-            layer_kwargs = self._build_layer_kwargs(ref_hidden, device)
+            quant_layer_state_override = (
+                ref_layer_state_override.to(quant_device)
+                if ref_layer_state_override is not None else None
+            )
             # prefix forward 后目标层可能被 clear_others 清掉，重新加载
             self._load_layer_weights(
                 self.ref_model, self.ref_model_path, [layer_idx], device,
@@ -200,13 +223,21 @@ class ReplayProvider:
                 clear_others=False,
             )
         else:
-            ref_hidden, quant_hidden, layer_kwargs = self._prepare_inputs(
+            ref_hidden, quant_hidden, _ = self._prepare_inputs(
                 prompt, device, quant_device, layer_idx,
             )
 
         # 获取 ref/quant 的目标层 module
         ref_layer = self.ref_layers[layer_idx]
         quant_layer = self.quant_layers[layer_idx]
+        ref_layer_kwargs = self._build_layer_kwargs(
+            self.ref_model, ref_hidden.to(device), device,
+            ref_layer, ref_layer_state_override,
+        )
+        quant_layer_kwargs = self._build_layer_kwargs(
+            self.quant_model, quant_hidden.to(quant_device), quant_device,
+            quant_layer, quant_layer_state_override,
+        )
 
         return LayerReplayHandle(
             layer_idx=layer_idx,
@@ -216,7 +247,8 @@ class ReplayProvider:
             quant_model=self.quant_model,
             ref_hidden=ref_hidden,
             quant_hidden=quant_hidden,
-            layer_kwargs=layer_kwargs,
+            ref_layer_kwargs=ref_layer_kwargs,
+            quant_layer_kwargs=quant_layer_kwargs,
             ref_device=device,
             quant_device=quant_device,
             ref_layers=self.ref_layers,
@@ -228,21 +260,14 @@ class ReplayProvider:
         hidden: torch.Tensor,
         prefix_layers: List[int],
         device: str,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward prefix layers one-by-one (load→forward→unload) to avoid OOM.
 
         Supports GLM-5 DSA: decoder layer forward returns (hidden, topk_indices),
         topk_indices is passed to the next layer as prev_topk_indices.
         """
-        rotary = get_rotary_emb_module(self.ref_model)
-        batch_size, seq_len = hidden.shape[:2]
-        position_ids = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0).expand(batch_size, -1)
-        position_embeddings = None
-        if rotary is not None:
-            position_embeddings = rotary(hidden, position_ids)
-
         h = hidden
-        topk_indices = None
+        layer_state = None
         for pl in prefix_layers:
             # Load only this single layer
             load_layer_weights_indexed(
@@ -258,30 +283,30 @@ class ReplayProvider:
             layer = self.ref_layers[pl]
             layer.eval()
             with torch.no_grad():
-                out = layer(
-                    h,
-                    position_embeddings=position_embeddings,
-                    prev_topk_indices=topk_indices,
+                kwargs = self._build_layer_kwargs(
+                    self.ref_model, h, device, layer, layer_state,
                 )
+                out = layer(h, **kwargs)
             if isinstance(out, tuple):
                 h = out[0]
-                topk_indices = out[1] if len(out) > 1 else None
+                layer_state = out[1] if len(out) > 1 else None
             else:
                 h = out
-                topk_indices = None
+                layer_state = None
 
             # Unload this layer immediately
             unload_layers_to_meta(self.ref_model, [pl])
             gc.collect()
 
-        return h
+        return h, layer_state
 
     def _build_layer_kwargs(
-        self, hidden: torch.Tensor, device: str,
+        self, model, hidden: torch.Tensor, device: str,
+        layer: nn.Module, layer_state: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
-        """为 decoder layer forward 构建 layer_kwargs（position_embeddings）。"""
+        """构建位置参数和模型特定的跨层状态参数。"""
         from accuracy_checker.utils import get_rotary_emb_module
-        rotary = get_rotary_emb_module(self.ref_model)
+        rotary = get_rotary_emb_module(model)
         batch_size, seq_len = hidden.shape[:2]
         position_ids = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0).expand(batch_size, -1)
         position_embeddings = None
@@ -289,10 +314,23 @@ class ReplayProvider:
             # Qwen3.6 ForConditionalGeneration: rotary_emb 参数可能在 CPU，需要移到 device
             rotary = rotary.to(device)
             position_embeddings = rotary(hidden, position_ids)
-        return {
+        kwargs = {
             "position_embeddings": position_embeddings,
             "position_ids": position_ids,
         }
+        attention_mask = build_replay_attention_mask(layer, hidden)
+        if attention_mask is not None:
+            kwargs["attention_mask"] = attention_mask
+        state_name = get_layer_state_kwarg(layer)
+        if state_name is None:
+            return kwargs
+        if state_name == 'block_residual' and layer_state is None:
+            layer_state = hidden.new_zeros(
+                batch_size * seq_len, 0, hidden.shape[-1])
+        if layer_state is not None:
+            layer_state = layer_state.to(device)
+        kwargs[state_name] = layer_state
+        return kwargs
 
     def _load_embed_tokens(
         self, model, model_path, device, weight_map, reader, is_quant, is_ct,
@@ -349,8 +387,9 @@ class ReplayProvider:
         """用随机 dummy hidden_states，适合测试 patch 机制。"""
         # 获取 hidden_size
         sample_param = next(self.ref_layers[layer_idx].parameters())
-        if hasattr(self.ref_model.config, 'hidden_size'):
-            hidden_size = self.ref_model.config.hidden_size
+        text_config = get_text_config(self.ref_model.config)
+        if hasattr(text_config, 'hidden_size'):
+            hidden_size = text_config.hidden_size
         else:
             hidden_size = sample_param.shape[-1]
 
@@ -441,7 +480,8 @@ class LayerReplayHandle:
     quant_model: nn.Module
     ref_hidden: torch.Tensor
     quant_hidden: torch.Tensor
-    layer_kwargs: Dict[str, Any] = field(default_factory=dict)
+    ref_layer_kwargs: Dict[str, Any] = field(default_factory=dict)
+    quant_layer_kwargs: Dict[str, Any] = field(default_factory=dict)
     ref_device: str = "npu:0"
     quant_device: str = "npu:1"
     ref_layers: Optional[nn.ModuleList] = None
@@ -471,7 +511,7 @@ class LayerReplayHandle:
 
         # 确保 layer_kwargs 中的 tensor 也在 ref device 上
         kwargs = {}
-        for k, v in self.layer_kwargs.items():
+        for k, v in self.ref_layer_kwargs.items():
             if isinstance(v, torch.Tensor):
                 kwargs[k] = v.to(device)
             elif isinstance(v, tuple) and all(isinstance(t, torch.Tensor) for t in v):
@@ -515,7 +555,7 @@ class LayerReplayHandle:
 
         # 确保 layer_kwargs 中的 tensor 也在 quant device 上
         kwargs = {}
-        for k, v in self.layer_kwargs.items():
+        for k, v in self.quant_layer_kwargs.items():
             if isinstance(v, torch.Tensor):
                 kwargs[k] = v.to(device)
             elif isinstance(v, tuple) and all(isinstance(t, torch.Tensor) for t in v):

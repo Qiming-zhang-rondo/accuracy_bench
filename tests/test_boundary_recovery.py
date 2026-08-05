@@ -1,5 +1,5 @@
 """
-工作项2 (定界恢复) UT — 验证 inference_check + adapters 加载链。
+工作项2 (定界恢复) UT — 验证 inference_check + 统一结构探测加载链。
 
 不依赖 NPU / 大模型，用纯函数 + AST + import 检查覆盖核心逻辑。
 运行: cd <your_workspace>/tools/accuracy_bench && python3 -m pytest tests/test_boundary_recovery.py -v
@@ -88,9 +88,9 @@ def test_inference_check_module_imports():
     assert callable(ic.dequantize_model_on_devices)
 
 
-def test_adapters_package_imports():
-    from accuracy_checker.adapters import get_model_adapter
-    assert callable(get_model_adapter)
+def test_model_structure_imports():
+    from accuracy_checker.model_structure import get_model_components
+    assert callable(get_model_components)
 
 
 def test_glm5_inference_check_script_exists():
