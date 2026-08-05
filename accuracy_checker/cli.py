@@ -1,0 +1,80 @@
+"""
+inference_check CLI 入口。
+
+从 inference_check.py 拆出以满足 CI LinesPerFile 约束 (≤2000 行)。
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+
+from .inference_check import hf_inference_check, _run_boundary_cli
+
+
+def main():
+    parser = argparse.ArgumentParser(description="HF 推理检查 — 排除框架影响")
+    parser.add_argument("--mode", default="inference",
+                        choices=["inference", "boundary"],
+                        help="inference=纯推理检查; boundary=框架vs权重定界")
+    parser.add_argument("--boundary", action="store_true",
+                        help="--mode boundary 的简写 (向后兼容)")
+    parser.add_argument("--model_path", required=True, help="模型路径")
+    parser.add_argument("--devices", default="npu:0",
+                        help="逻辑设备列表，如 npu:0,1,2,3")
+    parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16"])
+    parser.add_argument("--max_new_tokens", type=int, default=2048)
+    parser.add_argument("--skip_ppl", action="store_true")
+    parser.add_argument("--thinking", default="chat",
+                        choices=["chat", "none"],
+                        help="thinking 模式: chat=开思维链, none=关闭")
+    parser.add_argument("--prompt_file", default=None,
+                        help="JSON 文件，vLLM 请求格式或对话列表")
+    parser.add_argument("--use_cpu_dequant", action="store_true",
+                        help="回退到旧 CPU 全量反量化流程")
+    parser.add_argument("--noquit", action="store_true",
+                        help="推理完成后不退出，进入交互模式 (模型留在NPU上)")
+    # ---- boundary mode args ----
+    parser.add_argument("--prompt", default=None,
+                        help="[boundary] 单轮 plain text prompt")
+    parser.add_argument("--ref_model_path", default=None,
+                        help="[boundary] 参考 BF16 模型路径; 给了会跑 ref 区分 quant 回归 vs base 本征")
+    parser.add_argument("--framework_name", default=None,
+                        help="[boundary] 部署框架名 (vllm/mindie/...)")
+    parser.add_argument("--framework_bad_output", default=None,
+                        help="[boundary] 部署框架实际生成的坏文本 (推荐提供)")
+    parser.add_argument("--framework_bad_reproduced", default=None,
+                        choices=["true", "false"],
+                        help="[boundary] 调用方直接断言框架是否复现 (true/false)")
+    parser.add_argument("--repeat_4gram_max", type=float, default=None,
+                        help="[boundary] 4-gram 重复比阈值, 超过判为 bad; 缺省 0.5")
+    parser.add_argument("--nonprintable_max", type=float, default=None,
+                        help="[boundary] 非可打印字符比阈值, 缺省 0.3")
+    parser.add_argument("--no_ref", action="store_true",
+                        help="[boundary] 跳过 ref 运行 (默认 run_ref=True)")
+    parser.add_argument("--json_out", action="store_true",
+                        help="[boundary] 以 JSON 打印结构化结果 (供 Agent D 解析)")
+    args = parser.parse_args()
+
+    if args.boundary and args.mode == "inference":
+        args.mode = "boundary"
+
+    if args.mode == "boundary":
+        _run_boundary_cli(args)
+        return
+
+    hf_inference_check(
+        model_path=args.model_path,
+        devices=args.devices,
+        dtype=args.dtype,
+        max_new_tokens=args.max_new_tokens,
+        prompt_file=args.prompt_file,
+        skip_ppl=args.skip_ppl,
+        thinking=args.thinking,
+        use_cpu_dequant=args.use_cpu_dequant,
+        noquit=args.noquit,
+    )
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    main()
