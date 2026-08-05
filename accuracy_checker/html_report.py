@@ -21,9 +21,14 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import os
+import shutil
 import time
 from typing import Any, Dict, List, Optional, Tuple
+
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # 配色阈值 (hardcode, 来自 l2_html_output.md §4)
@@ -416,11 +421,13 @@ a { color:var(--accent); text-decoration:none; }
 .nav a.active { color:var(--accent); border-bottom-color:var(--accent); font-weight:600; }
 /* Sections */
 section { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:28px 32px; margin-bottom:28px;
-  box-shadow:0 1px 2px rgba(0,0,0,.03); }
+  box-shadow:0 1px 2px rgba(0,0,0,.03); scroll-margin-top:72px; }
 section > h2 { margin:0 0 4px 0; font-size:19px; font-weight:600; letter-spacing:-0.01em; border:none; padding:0; }
+section > h2 .section-hint { font-size:13px; color:var(--muted); font-weight:400; margin-left:8px; }
 section > .sec-desc { color:var(--muted); font-size:14px; margin:0 0 24px 0; line-height:1.5; }
 /* Grid + cards */
 .grid { display:grid; gap:12px; }
+.grid > * { min-width:0; }
 .cols-2 { grid-template-columns:1fr 1fr; }
 .cols-3 { grid-template-columns:repeat(3,1fr); }
 @media(max-width:900px){ .cols-2,.cols-3{ grid-template-columns:1fr; } }
@@ -449,11 +456,13 @@ section > .sec-desc { color:var(--muted); font-size:14px; margin:0 0 24px 0; lin
 .conf-bar { height:100%; background:var(--accent); border-radius:6px; transition:width .4s cubic-bezier(.4,0,.2,1); }
 /* Help icon */
 .help { display:inline-block; width:16px; height:16px; border-radius:50%; background:var(--accent-soft); color:var(--accent);
-  text-align:center; line-height:16px; font-size:10px; cursor:help; margin-left:4px; vertical-align:middle; user-select:none;
+  text-align:center; line-height:16px; font-size:10px; cursor:help; margin-left:4px; padding:0; border:0;
+  font-family:inherit; vertical-align:middle; user-select:none;
   transition:all .15s; }
 .help:hover { background:var(--accent); color:#fff; }
 /* Charts */
 .chart { width:100%; overflow:visible; }
+.chart-scroll { width:100%; overflow-x:auto; overscroll-behavior-inline:contain; scrollbar-width:thin; }
 .axis text { font-size:10px; fill:var(--muted); }
 .axis line,.axis path { stroke:var(--border); }
 .gridline { stroke:#F0F0F0; }
@@ -466,13 +475,20 @@ section > .sec-desc { color:var(--muted); font-size:14px; margin:0 0 24px 0; lin
 /* Tables */
 table.grid-tbl { width:100%; border-collapse:collapse; font-size:12px; }
 table.grid-tbl th, table.grid-tbl td { border:1px solid var(--border); padding:7px 10px; }
-table.grid-tbl th { background:var(--code-bg); text-align:left; font-weight:500; color:var(--muted); }
+table.grid-tbl th { background:var(--code-bg); text-align:left; font-weight:500; color:var(--muted); position:sticky; top:0; z-index:1; }
 table.grid-tbl td.repair { outline:2px solid var(--good); outline-offset:-2px; }
 table.grid-tbl td.source { outline:2px solid var(--bad); outline-offset:-2px; }
 table.grid-tbl tr:hover td { background:var(--accent-soft); }
+.table-scroll { overflow:auto; max-height:min(68vh,720px); border:1px solid var(--border); border-radius:8px; }
+.table-scroll table.grid-tbl { min-width:720px; margin:-1px; width:calc(100% + 2px); }
+.toggle-btn { display:inline-flex; align-items:center; gap:6px; padding:7px 14px; font-size:13px; font-weight:600;
+  color:var(--ref); background:var(--card); border:1px solid var(--ref); border-radius:7px; cursor:pointer; margin-bottom:8px; }
+.toggle-btn:hover { background:var(--accent-soft); }
+.l1-metrics { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px 20px; align-items:start; }
 /* L2 layers */
 .l2layer { border-left:3px solid var(--border); padding-left:18px; margin-bottom:28px; }
 .l2layer.fd { border-left-color:var(--accent); }
+.l2layer.jump-target { background:var(--accent-soft); border-radius:0 8px 8px 0; }
 .l2layer h3 { margin:0 0 10px 0; font-size:15px; font-weight:600; }
 .tag { font-size:10px; font-weight:600; padding:2px 7px; border-radius:4px; margin-right:6px; vertical-align:middle; letter-spacing:.02em; }
 .tag.fd { background:#E0E7FF; color:#4338CA; }
@@ -486,10 +502,12 @@ table.grid-tbl tr:hover td { background:var(--accent-soft); }
 .modal h3 { margin-top:0; font-size:16px; font-weight:600; }
 .modal .formula { background:var(--code-bg); border-left:3px solid var(--accent); padding:8px 12px;
   font-family:'SF Mono','Fira Code',ui-monospace,monospace; margin:8px 0; font-size:12px; border-radius:0 4px 4px 0; }
-.modal .close { float:right; cursor:pointer; color:var(--faint); font-size:16px; transition:color .15s; }
+.modal .close { float:right; cursor:pointer; color:var(--faint); font-size:16px; transition:color .15s;
+  border:0; background:transparent; padding:2px 4px; line-height:1; }
 .modal .close:hover { color:var(--ink); }
 /* Alert */
-.alert-invalid { background:#FBEAEA; border:1px solid var(--bad); color:#8B3838; padding:12px 16px; border-radius:8px; font-weight:500; }
+.alert-invalid { background:#FBEAEA; border:1px solid var(--bad); color:#8B3838; padding:12px 16px; border-radius:8px;
+  font-weight:500; margin-bottom:12px; }
 /* Error samples */
 .err-sample { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:10px 14px; margin:8px 0; font-size:12px; }
 .err-sample pre { white-space:pre-wrap; word-break:break-word; margin:6px 0 0 0; background:var(--code-bg); padding:8px; border-radius:4px; font-size:11px; }
@@ -505,6 +523,42 @@ table.grid-tbl tr:hover td { background:var(--accent-soft); }
 svg { font-family: -apple-system,'Inter','PingFang SC',sans-serif; }
 /* Smooth scroll */
 html { scroll-behavior:smooth; }
+@media (max-width:680px) {
+  body { font-size:14px; line-height:1.55; }
+  .wrap { max-width:none; padding:28px 14px 80px; }
+  .topbar { margin-bottom:20px; }
+  .topbar h1 { font-size:24px; line-height:1.22; overflow-wrap:anywhere; }
+  .topbar .ts { display:block; font-size:12px; overflow-wrap:anywhere; }
+  .nav { margin:0 -2px 20px; padding-top:4px; flex-wrap:nowrap; overflow-x:auto; scrollbar-width:none; }
+  .nav::-webkit-scrollbar { display:none; }
+  .nav a { flex:0 0 auto; padding:9px 12px; }
+  section { padding:20px 16px; margin-bottom:18px; border-radius:9px; scroll-margin-top:62px; }
+  section > h2 { font-size:17px; line-height:1.4; }
+  section > h2 .section-hint { display:block; margin:4px 0 0; font-size:12px; }
+  section > .sec-desc { font-size:13px; margin-bottom:18px; }
+  .card { padding:14px 16px; }
+  .card:hover { transform:none; }
+  .card .val { font-size:19px; overflow-wrap:anywhere; }
+  .kv { grid-template-columns:72px minmax(0,1fr); }
+  .l1-metrics { grid-template-columns:1fr 1fr; gap:12px; }
+  .l2layer { padding-left:12px; }
+  #l2, #logits_scatter, #logits_topk, #logits_lines, #logits_hist { min-width:0; overflow-x:auto; }
+  .chart { min-width:680px; }
+  .modal { width:calc(100% - 28px); padding:20px; max-height:80vh; overflow:auto; }
+}
+@media print {
+  :root { --bg:#fff; --card:#fff; }
+  body { background:#fff; color:#000; font-size:11pt; }
+  .wrap, .main-area .wrap { max-width:none !important; padding:0 !important; }
+  .nav, .sidebar, .toggle-btn, .help, .modal-ov { display:none !important; }
+  .main-area { margin-left:0 !important; }
+  .topbar { margin-bottom:18px; }
+  section { box-shadow:none; break-inside:avoid; padding:18px; margin-bottom:14px; }
+  .card { break-inside:avoid; box-shadow:none; }
+  .chart-scroll, .table-scroll { overflow:visible; max-height:none; }
+  .chart { min-width:0 !important; }
+  #l1fulltbl { display:block !important; }
+}
 """
 
 # ---- v2 JS (vanilla, SVG 图表 + 指标解释 modal) ----
@@ -549,10 +603,10 @@ const HELP={
 function modal(key){const h=HELP[key];if(!h)return;const m=el("helpModal");const body=el("helpBody");
   body.innerHTML="<h3>"+esc(h.t)+"</h3><div class='formula'>"+esc(h.f)+"</div>"
     +"<p><b>典型范围:</b> "+esc(h.r)+"</p><p><b>解读:</b> "+esc(h.i)+"</p>";
-  m.classList.add("show");}
-function closeModal(){el("helpModal").classList.remove("show");}
+  m.classList.add("show");m.setAttribute("aria-hidden","false");}
+function closeModal(){const m=el("helpModal");m.classList.remove("show");m.setAttribute("aria-hidden","true");}
 window.__modal=modal;window.__closeModal=closeModal;
-function hIcon(key){return " <span class='help' onclick=\"__modal('"+key+"')\" title='"+esc(key)+"'>?</span>";}
+function hIcon(key){return " <button type='button' class='help' onclick=\"__modal('"+key+"')\" title='"+esc(key)+"' aria-label='查看 "+esc(key)+" 指标说明'>?</button>";}
 // ---- SVG 基础 ----
 function svgBox(w,h){const s=E("svg",{viewBox:"0 0 "+w+" "+h,width:"100%",class:"chart"});return s;}
 function axisX(s,x0,x1,y,w){const g=E("g",{class:"axis"});for(const v of [x0,x1]){}const ln=E("line",{x1:30,y1:y,x2:w,y2:y,stroke:C.border});g.appendChild(ln);return g;}
@@ -647,7 +701,7 @@ function renderL1(){
   }
   let html='<div class="card" style="border-left:3px solid '+C.bad+';background:rgba(194,85,85,0.05);padding:16px 18px">'
     +'<h3 style="margin:0 0 8px 0;color:'+C.bad+'">首个发散层: Layer '+L.layer_idx+'</h3>'
-    +'<div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px 20px;align-items:start">'
+    +'<div class="l1-metrics">'
     +'<div><div style="font-size:11px;color:var(--muted);margin-bottom:2px">cos_sim'+hIcon("cos_sim")+'</div><div style="font-size:18px;font-weight:700;color:'+tier+';display:flex;align-items:center;gap:6px"><span class="legend-chip" style="background:'+tier+'"></span>'+fix(L.cos_sim,4)+'</div></div>'
     +'<div><div style="font-size:11px;color:var(--muted);margin-bottom:2px">rel_l2'+hIcon("rel_l2")+'</div><div style="font-size:16px;font-weight:600">'+fix(L.rel_l2,4)+'</div></div>'
     +'<div><div style="font-size:11px;color:var(--muted);margin-bottom:2px">SNR(dB)'+hIcon("snr")+'</div><div style="font-size:16px;font-weight:600">'+fix(L.snr,2)+'</div></div>'
@@ -667,8 +721,8 @@ function renderL1Table(){
   for(let i=0;i<Ls.length;i++){const v=num(Ls[i].cos_sim);if(v!==null&&v<0.99)badCnt++;}
   const btnId="l1toggle",tblId="l1fulltbl";
   const btnTxt="展开全部 "+Ls.length+" 层详细表 ("+badCnt+" 发散) ▾";
-  let h='<button id="'+btnId+'" style="display:inline-block;padding:6px 14px;font-size:13px;font-weight:600;color:var(--ref);background:transparent;border:1px solid var(--ref);border-radius:6px;cursor:pointer;margin-bottom:8px">'+btnTxt+'</button>';
-  h+='<div id="'+tblId+'" style="display:none;margin-top:8px">';
+  let h='<button type="button" id="'+btnId+'" class="toggle-btn" aria-expanded="false" aria-controls="'+tblId+'">'+btnTxt+'</button>';
+  h+='<div id="'+tblId+'" class="table-scroll" style="display:none;margin-top:8px">';
   h+='<table class="grid-tbl"><thead><tr><th>Layer</th><th>name</th><th>cos_sim'+hIcon("cos_sim")+'</th><th>rel_l2'+hIcon("rel_l2")+'</th><th>SNR(dB)'+hIcon("snr")+'</th><th>标记</th></tr></thead><tbody>';
   Ls.forEach(l=>{let tags=[];if(l.is_first_divergence)tags.push('<span class="tag fd">首次发散</span>');if(l.is_max_error)tags.push('<span class="tag max">最大误差</span>');
     h+='<tr style="cursor:pointer" onclick="__selectL2('+(l.layer_idx==null?0:l.layer_idx)+')"><td>'+l.layer_idx+'</td><td>'+esc(l.layer_name)+'</td>'
@@ -682,6 +736,7 @@ function renderL1Table(){
     btn.onclick=function(){
       const hidden=tbl.style.display==="none";
       tbl.style.display=hidden?"block":"none";
+      btn.setAttribute("aria-expanded",hidden?"true":"false");
       btn.textContent=hidden?"收起 ▴":btnTxt;
     };
   }
@@ -697,7 +752,7 @@ function renderL2(){
   let html="";
   Ls.forEach(L=>{
     const fd=R.overview&&R.overview.first_divergence_layer!=null&&L.layer_idx===R.overview.first_divergence_layer;
-    html+='<div class="l2layer'+(fd?" fd":"")+'"><h3>Layer '+L.layer_idx
+    html+='<div class="l2layer'+(fd?" fd":"")+'" data-layer="'+L.layer_idx+'"><h3>Layer '+L.layer_idx
       +(fd?'<span class="tag fd">首次发散</span>':'')
       +'<span style="font-size:12px;color:'+C.muted+';margin-left:8px">基线误差 '+fix(L.base_l2,4)+hIcon("baseline_l2")
       +' · 输入恢复 '+pct(L.input_recovery)+hIcon("input_recovery")+'</span></h3>';
@@ -743,7 +798,7 @@ function renderL2(){
     html+=svgOuter(s);
     // metrics: rot_b_err with severity colors + reason annotations
     html+='<div class="tip" style="margin-top:6px;word-break:break-all;line-height:1.8">'
-      +'<b style="color:'+C.text+'">rot_b_err</b>'+hIcon("rot_b_err")+rotBErrMetrics(subs)
+      +'<b style="color:'+C.ink+'">rot_b_err</b>'+hIcon("rot_b_err")+rotBErrMetrics(subs)
       +'</div>';
     // interpretation line
     const interp=interpretRotBErr(subs);
@@ -796,7 +851,8 @@ function interpretRotBErr(subs){
   }
   return "解读: "+parts.join("；")+"。";
 }
-function svgOuter(s){const w=document.createElement("div");w.appendChild(s.cloneNode(true));return w.innerHTML;}
+function svgOuter(s){const w=document.createElement("div");w.className="chart-scroll";w.appendChild(s.cloneNode(true));return w.outerHTML;}
+function appendChart(root,s){const w=document.createElement("div");w.className="chart-scroll";w.appendChild(s);root.appendChild(w);}
 
 // ====================================================================
 // LOGITS 可视化
@@ -828,7 +884,7 @@ function renderScatter(){
   const t1=E("text",{x:W/2,y:H-4,"text-anchor":"middle",class:"axis"});t1.textContent="ref logit";s.appendChild(t1);
   const t2=E("text",{x:12,y:H/2,"text-anchor":"middle",class:"axis",transform:"rotate(-90 12 "+(H/2)+")"});t2.textContent="quant logit";s.appendChild(t2);
   root.innerHTML='<div class="card"><h3>Ref vs Quant logits 散点 '+hIcon("token_wise_cos")+'</h3></div>';
-  root.appendChild(s);
+  appendChart(root,s);
   const lg=document.createElement("div");lg.className="tip";lg.innerHTML='<span class="legend-chip" style="background:'+C.quant+'"></span>每个点=词表某位置 (ref_x, quant_y) · 虚线=y=x 完全吻合 · 离线越远=该 token 量化偏离越大';
   root.appendChild(lg);
 }
@@ -854,7 +910,7 @@ function renderLines(){
   s.appendChild(E("line",{x1:m,y1:H-m,x2:W-m,y2:H-m,stroke:C.border}));s.appendChild(E("line",{x1:m,y1:m,x2:m,y2:H-m,stroke:C.border}));
   const tt=E("text",{x:W/2,y:H-2,"text-anchor":"middle",class:"axis"});tt.textContent="生成 position";s.appendChild(tt);
   root.innerHTML='<div class="card"><h3>Token-wise 指标折线 '+hIcon("token_wise_cos")+hIcon("topk_overlap")+hIcon("token_wise_kl")+'</h3></div>';
-  root.appendChild(s);
+  appendChart(root,s);
   const lg=document.createElement("div");lg.className="tip";lg.innerHTML=
     '<span class="legend-chip" style="background:'+C.ref+'"></span>cos(ref,quant logits) '
     +'<span class="legend-chip" style="background:'+C.good+'"></span>top-k overlap '
@@ -872,7 +928,7 @@ function renderLines(){
     for(let g=0;g<=2;g++){const v=maxk*g/2;const y=Y2(v);const t=E("text",{x:m2-6,y:y+3,"text-anchor":"end",class:"axis"});t.textContent=v.toFixed(3);sk.appendChild(t);sk.appendChild(E("line",{x1:m2,x2:kw-m2,y1:y,y2:y,class:"gridline"}));}
     sk.appendChild(E("line",{x1:m2,y1:kh-m2,x2:kw-m2,y2:kh-m2,stroke:C.border}));
     const tk=E("text",{x:kw/2,y:kh-2,"text-anchor":"middle",class:"axis"});tk.textContent="KL(quant‖ref) per position";sk.appendChild(tk);
-    root.appendChild(sk);
+    appendChart(root,sk);
   }
 }
 function avgKL(){const k=R.logits.token_wise_kl||[];const f=k.map(x=>num(x)).filter(x=>x!==null);if(!f.length)return"—";return (f.reduce((a,b)=>a+b,0)/f.length).toFixed(4);}
@@ -915,7 +971,7 @@ function renderTopK(i){
     +'<div class="tip">Position '+(L.token_positions[i]||i)+' — 当前: '+matchBadge+' · 蓝(粗)=ref 概率 · 橙(细)=quant 概率 · 点击折线节点切换</div>';
   root.innerHTML="";
   root.appendChild(card);
-  card.appendChild(s);
+  appendChart(card,s);
 }
 function bw_h(h){return Math.max(8,h-4);}
 function renderHist(){
@@ -936,7 +992,7 @@ function renderHist(){
   for(let i=0;i<n;i+=Math.max(1,Math.floor(n/8))){const x=X(i);const t=E("text",{x:x+bw/2,y:H-m+14,"text-anchor":"middle",class:"axis","font-size":"9"});t.textContent=bins[i]!=null?(+bins[i]).toFixed(1):"";s.appendChild(t);}
   const t1=E("text",{x:W/2,y:H-2,"text-anchor":"middle",class:"axis"});t1.textContent="logit 值";s.appendChild(t1);
   root.innerHTML='<div class="card"><h3>Logits 分布直方图 overlay</h3></div>';
-  root.appendChild(s);
+  appendChart(root,s);
   const lg=document.createElement("div");lg.className="tip";lg.innerHTML='<span class="legend-chip" style="background:'+C.ref+'"></span>ref '+
     '<span class="legend-chip" style="background:'+C.quant+'"></span>quant · 分布形状一致=量化保留整体分布';
   root.appendChild(lg);
@@ -944,7 +1000,9 @@ function renderHist(){
 
 // ---- nav helpers ----
 function goto(id){const e=el(id);if(e){e.scrollIntoView({behavior:"smooth",block:"start"});}}
-window.__selectL2=function(idx){goto("l2");const root=el("l2");if(root){const c=root.querySelector('.l2layer');}}
+window.__selectL2=function(idx){const root=el("l2");if(!root)return;const c=root.querySelector('.l2layer[data-layer="'+idx+'"]');
+  if(!c){goto("l2");return;}c.scrollIntoView({behavior:"smooth",block:"start"});c.classList.add("jump-target");
+  window.setTimeout(()=>c.classList.remove("jump-target"),1400);}
 window.__selPos=function(i){renderTopK(i);}
 // scroll-spy: highlight nav based on visible section
 function initScrollSpy(){
@@ -969,6 +1027,7 @@ function boot(){
     window.__accInitDone=true;
     initScrollSpy();
     el("helpModal").addEventListener("click",function(e){if(e.target===this)closeModal();});
+    document.addEventListener("keydown",function(e){if(e.key==="Escape")closeModal();});
   }
 }
 if(document.readyState!=="loading")boot();else document.addEventListener("DOMContentLoaded",boot);
@@ -1003,6 +1062,7 @@ _SIDEBAR_CSS = """
 .main-area { flex:1; margin-left:240px; }
 .main-area .wrap { max-width:980px; margin:0 auto; padding:48px 32px 140px; }
 @media (max-width:720px){
+  .layout { display:block; }
   .sidebar { width:100%; height:auto; position:sticky; top:0; bottom:auto;
              border-right:none; border-bottom:1px solid var(--border);
              padding:8px 0; max-height:38vh; }
@@ -1148,8 +1208,7 @@ def generate_product_html_report(
         '<a href="#l2" data-target="l2">L2 子图</a>'
         '<a href="#logits" data-target="logits">Logits</a>'
         '</div>'
-        '<section><h2>① 概览 — 一屏结论<span style="font-size:13px;color:var(--muted);font-weight:400;'
-        'margin-left:8px">点击 ❓ 图标看指标解释/公式</span></h2>'
+        '<section><h2>① 概览 — 一屏结论<span class="section-hint">点击 ❓ 图标看指标解释/公式</span></h2>'
         '<p class="sec-desc">模型/量化/设备/定界结论/首次发散层/误差边界/根因算子/可信度。</p>'
         '<div id="overview"></div></section>'
         '<section><h2>② L1 逐层对比</h2>'
@@ -1173,8 +1232,8 @@ def generate_product_html_report(
         '<span><span class="legend-chip" style="background:var(--bad)"></span>发散/坏</span>'
         '<span><span class="legend-chip" style="background:var(--deg)"></span>DYNAMIC 降级量化</span>'
         '<span style="color:var(--muted)">INVALID_RUN 下排名仅供参考</span></div>'
-        '<div id="helpModal" class="modal-ov" onclick="__closeModal()"><div class="modal" '
-        'onclick="event.stopPropagation()"><span class="close" onclick="__closeModal()">✕</span>'
+        '<div id="helpModal" class="modal-ov" role="dialog" aria-modal="true" aria-hidden="true" aria-label="指标说明" onclick="__closeModal()"><div class="modal" '
+        'onclick="event.stopPropagation()"><button type="button" class="close" aria-label="关闭指标说明" onclick="__closeModal()">✕</button>'
         '<div id="helpBody"></div></div></div>'
     )
 
@@ -1260,7 +1319,13 @@ def generate_product_html_report(
             os.remove(link_path)
         os.symlink(rel_target, link_path)
     except OSError as e:
-        logger.debug(f"Failed to create latest.html symlink: {e}")
+        # Windows without Developer Mode commonly rejects symlink creation.
+        # Keep the documented latest.html entry point useful with a plain copy.
+        try:
+            shutil.copyfile(output_path, link_path)
+            logger.debug("latest.html copied because symlink creation failed: %s", e)
+        except OSError as copy_error:
+            logger.debug("Failed to update latest.html: %s", copy_error)
 
     return output_path
 
@@ -1365,6 +1430,7 @@ def generate_index_html(reports_dir: str, output_path: Optional[str] = None) -> 
     .main-area { flex:1; margin-left:240px; }
     .main-area .wrap { max-width:980px; margin:0 auto; padding:48px 32px 140px; }
     @media (max-width:720px){
+      .layout { display:block; }
       .sidebar { width:100%; height:auto; position:sticky; top:0; bottom:auto;
                  border-right:none; border-bottom:1px solid var(--border);
                  padding:8px 0; max-height:38vh; }
@@ -1443,8 +1509,8 @@ def generate_index_html(reports_dir: str, output_path: Optional[str] = None) -> 
         '<span><span class="legend-chip" style="background:var(--good)"></span>对齐</span>'
         '<span><span class="legend-chip" style="background:var(--bad)"></span>发散</span>'
         '</div>'
-        '<div id="helpModal" class="modal-ov" onclick="__closeModal()"><div class="modal" '
-        'onclick="event.stopPropagation()"><span class="close" onclick="__closeModal()">✕</span>'
+        '<div id="helpModal" class="modal-ov" role="dialog" aria-modal="true" aria-hidden="true" aria-label="指标说明" onclick="__closeModal()"><div class="modal" '
+        'onclick="event.stopPropagation()"><button type="button" class="close" aria-label="关闭指标说明" onclick="__closeModal()">✕</button>'
         '<div id="helpBody"></div></div></div>'
         '</div></div></div>'
     )

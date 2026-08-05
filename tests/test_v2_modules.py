@@ -171,6 +171,14 @@ class TestHtmlReportV2:
         # Self-contained (no external deps; SVG namespace URI is allowed)
         assert "http://" not in html.replace("http://www.w3.org/2000/svg", "")
         assert "https://" not in html
+        # Responsive/print contracts: charts and long tables stay readable.
+        assert "@media (max-width:680px)" in html
+        assert "@media print" in html
+        assert "chart-scroll" in html
+        assert "table-scroll" in html
+        # Metric help is keyboard-focusable rather than a click-only span.
+        assert "<button type='button' class='help'" in html
+        assert 'aria-label="指标说明"' in html
 
     def test_v1_backward_compat(self, tmp_path):
         from accuracy_checker.html_report import generate_html_report
