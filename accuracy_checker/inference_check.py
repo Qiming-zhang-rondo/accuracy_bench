@@ -529,7 +529,7 @@ def _dequant_single_expert_on_device(
             weight_data.to(target_device),
             deq_scale.to(target_device),
             input_scale.to(target_device) if input_scale is not None else None,
-            dtype,
+            dtype=dtype,
         )
         return w_fp
 
@@ -1121,7 +1121,9 @@ def _dequant_expert_weight_cpu(
     deq_scale = quant_weights.get(f"{quant_name}.deq_scale")
     input_scale = quant_weights.get(f"{quant_name}.input_scale")
     if deq_scale is not None:
-        w_fp, _ = dequantize_weight_static(weight_data, deq_scale, input_scale, dtype)
+        w_fp, _ = dequantize_weight_static(
+            weight_data, deq_scale, input_scale, dtype=dtype
+        )
         return w_fp
 
     return None
@@ -1182,7 +1184,7 @@ def _dequant_expert_weight(
     if deq_scale is not None:
         w_fp, _ = dequantize_weight_static(
             weight_data, deq_scale,
-            input_scale, dtype,
+            input_scale, dtype=dtype,
         )
         return w_fp.to(target_device)
 

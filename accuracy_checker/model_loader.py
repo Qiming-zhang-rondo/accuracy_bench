@@ -298,9 +298,21 @@ def dequantize_weight_static(
     Returns:
         (dequantized_weight, had_input_scale)
     """
-    # deq_scale 可能是 INT64 (NPU加速格式), 需要 reinterpret 为 FP32
-    if deq_scale.dtype == torch.int64:
-        deq_scale = deq_scale.view(torch.float64).float()
+    # msModelSlim 为 FP16 模型导出静态 W8A8 时，会把每个 float32
+    # deq_scale 的 32-bit 位模式先 reinterpret 成 int32，再数值扩展到
+    # int64 供 Ascend 量化算子直接消费。这里必须先收窄回 int32，再按
+    # float32 位模式解释；直接 ``view(float64)`` 或 ``.float()`` 都会把
+    # scale 破坏，导致权重归零或放大到 1e9 量级。
+    if deq_scale.dtype in (torch.int32, torch.int64):
+        scale_device = deq_scale.device
+        # The scale vector is tiny; bitcast on CPU so this path does not depend
+        # on whether a particular torch_npu/CUDA build implements view(dtype).
+        deq_scale = (
+            deq_scale.to(device="cpu", dtype=torch.int32)
+            .contiguous()
+            .view(torch.float32)
+            .to(scale_device)
+        )
 
     deq_scale = deq_scale.float()
 
@@ -314,6 +326,9 @@ def dequantize_weight_static(
 
     if weight_scale.dim() == 1:
         weight_scale = weight_scale.unsqueeze(1)
+
+    if not torch.isfinite(weight_scale).all():
+        raise ValueError("W8A8 dequantization produced non-finite weight_scale")
 
     w_fp = weight_data.to(torch.float32) * weight_scale
     return w_fp.to(dtype), had_input_scale
@@ -741,7 +756,7 @@ def _dequant_msslim_weight(weight_data: Tensor, quant_type: str, quant_name: str
             weight_data, weight_scale_u8, quant_type, dtype=dtype
         ), "loaded"
 
-    if quant_type == "W8A8":
+    if quant_type in ("W8A8", "W8A8S"):
         deq_scale = sf_reader.get_tensor(f"{quant_name}.deq_scale")
         input_scale = sf_reader.get_tensor(f"{quant_name}.input_scale")
         quant_bias = sf_reader.get_tensor(f"{quant_name}.quant_bias")
@@ -773,7 +788,7 @@ def _dequant_msslim_weight(weight_data: Tensor, quant_type: str, quant_name: str
 
 
 _KNOWN_QUANT_TYPES = (
-    "W8A8", "W8A8_DYNAMIC", "W8A8_MIX", "W8A8_MXFP8",
+    "W8A8", "W8A8S", "W8A8_DYNAMIC", "W8A8_MIX", "W8A8_MXFP8",
     "W4A8_MXFP", "W4A4_MXFP4",
     "W4A16", "W4A8_DYNAMIC", "W4A8",
     "W4A4_DYNAMIC", "W4A4_LAOS",
@@ -1381,7 +1396,7 @@ def _dequant_single_expert_indexed(weight_key, quant_type, sf_reader, dtype, use
     input_scale = sf_reader.get_tensor(f"{quant_name}.input_scale")
     if deq_scale is not None:
         w_fp, _ = dequantize_weight_static(
-            weight_data, deq_scale, input_scale, dtype
+            weight_data, deq_scale, input_scale, dtype=dtype
         )
         return w_fp
 

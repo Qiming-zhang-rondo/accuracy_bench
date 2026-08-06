@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -199,3 +200,36 @@ def test_cli_exposes_dspark_sample_and_seed(monkeypatch):
     assert args.dspark_sample == "sample.pt"
     assert args.dspark_seed == 17
     assert args.dspark_max_anchors == 4
+
+
+def _dspark_cli_args(**overrides):
+    values = {
+        "quant_method": "dequantize",
+        "compare_mode": "dual",
+        "ref_devices": None,
+        "quant_devices": None,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_dspark_cli_rejects_fake_quant_and_grouped_dual_early():
+    import run_accuracy_check
+
+    with pytest.raises(ValueError, match="dequantize"):
+        run_accuracy_check._validate_standalone_dspark_args(
+            _dspark_cli_args(quant_method="fake_quant"), "l1", True
+        )
+    with pytest.raises(ValueError, match="dual"):
+        run_accuracy_check._validate_standalone_dspark_args(
+            _dspark_cli_args(compare_mode="grouped_dual"), "l1", True
+        )
+
+
+def test_dspark_cli_rejects_multi_device_aliases():
+    import run_accuracy_check
+
+    with pytest.raises(ValueError, match="ref_device"):
+        run_accuracy_check._validate_standalone_dspark_args(
+            _dspark_cli_args(ref_devices="npu:0,1"), "l1", True
+        )

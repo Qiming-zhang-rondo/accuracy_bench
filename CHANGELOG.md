@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-08-06 — W8A8 streaming 修复 + CLI 命令生成器
+
+- 修复 `grouped_dual` streaming expert 将普通 W8A8/W8A8_DYNAMIC INT8 权重直接 cast 到浮点、未执行反量化的问题；统一复用普通层的反量化分派
+- 修复 msModelSlim 静态 W8A8 `deq_scale` 的 Ascend int32→int64 位模式恢复（按 float32 位模式解释，而非错误的 float64）并补充 W8A8S
+- 修正多个静态 W8A8 调用把 `dtype` 误传给 `quant_bias` 位置的问题
+- 首层已灾难性失真时不再把后续随机局部波动报告成 first bad block，优先提示加载/反量化契约错误
+- 新增交互式 `cli_params_guide.html`：输入 ref/quant 路径后推荐模型类型、设备拆分和命令，内置 Qwen3.6、Kimi K3、DSpark 与 boundary 场景
+- Layer 3 expert、hidden norm 与专项调试默认移到 DEBUG；新增 `--debug`
+
 ## 2026-08-06 — DSpark standalone draft L1
 
 - 运行 DeepSpec (`Qwen3DSparkModel` / `Gemma4DSparkModel`) 与标准 Speculators (`DSparkDraftModel`) checkpoint；识别并明确拒绝 forward 契约不同的 K3/TorchSpec/remote SpecForge 格式，避免误加载

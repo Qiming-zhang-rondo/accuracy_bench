@@ -1249,35 +1249,38 @@ class ShardedBlockComparator:
         return ref_moe, ref_orig_mlp_fwd, quant_moe, quant_orig_mlp_fwd
 
     def _log_norm_debug(self, layer_idx, ref_hidden, quant_hidden, stage):
-        """track hidden state explosion — print norm at key layers。"""
-        if layer_idx not in (0, 1, 2, 3, 5, 10, 20, 30, 40, 50, 60, 70, 76, 77) or not self.verbose:
+        """Track hidden-state explosion at DEBUG level only."""
+        if (
+            layer_idx not in (0, 1, 2, 3, 5, 10, 20, 30, 40, 50, 60, 70, 76, 77)
+            or not logger.isEnabledFor(logging.DEBUG)
+        ):
             return
         ref_n = ref_hidden.float().norm().item()
         quant_n = quant_hidden.float().norm().item()
         ref_max = ref_hidden.float().abs().max().item()
         quant_max = quant_hidden.float().abs().max().item()
-        logger.info(f"  [NORM L{layer_idx}] {stage}: ref_norm={ref_n:.4f} quant_norm={quant_n:.4f} ref_absmax={ref_max:.6f} quant_absmax={quant_max:.6f}")
+        logger.debug(f"  [NORM L{layer_idx}] {stage}: ref_norm={ref_n:.4f} quant_norm={quant_n:.4f} ref_absmax={ref_max:.6f} quant_absmax={quant_max:.6f}")
         if stage == "IN":
-            logger.info(f"  [NORM L{layer_idx}] IN: same_ptr={ref_hidden.data_ptr() == quant_hidden.data_ptr()}")
+            logger.debug(f"  [NORM L{layer_idx}] IN: same_ptr={ref_hidden.data_ptr() == quant_hidden.data_ptr()}")
 
     def _log_layer77_debug(self, layer_idx, ref_layer, quant_layer, ref_hidden, quant_hidden):
         """layer 77 weight + hidden state check。"""
-        if layer_idx != 77 or not self.verbose:
+        if layer_idx != 77 or not logger.isEnabledFor(logging.DEBUG):
             return
         try:
             ref_o = dict(ref_layer.named_parameters()).get('self_attn.o_proj.weight')
             quant_o = dict(quant_layer.named_parameters()).get('self_attn.o_proj.weight')
             if ref_o is not None and quant_o is not None:
-                logger.info(f"  [DEBUG L77] ref o_proj: min={ref_o.float().min().item():.4f}, max={ref_o.float().max().item():.4f}")
-                logger.info(f"  [DEBUG L77] quant o_proj: min={quant_o.float().min().item():.4f}, max={quant_o.float().max().item():.4f}")
-                logger.info(f"  [DEBUG L77] o_proj same storage? {ref_o.data_ptr() == quant_o.data_ptr()}")
-            logger.info(f"  [DEBUG L77] ref_hidden: shape={ref_hidden.shape}, min={ref_hidden.float().min().item():.6f}, max={ref_hidden.float().max().item():.6f}")
-            logger.info(f"  [DEBUG L77] quant_hidden: shape={quant_hidden.shape}, min={quant_hidden.float().min().item():.6f}, max={quant_hidden.float().max().item():.6f}")
-            logger.info(f"  [DEBUG L77] hidden same storage? {ref_hidden.data_ptr() == quant_hidden.data_ptr()}")
+                logger.debug(f"  [DEBUG L77] ref o_proj: min={ref_o.float().min().item():.4f}, max={ref_o.float().max().item():.4f}")
+                logger.debug(f"  [DEBUG L77] quant o_proj: min={quant_o.float().min().item():.4f}, max={quant_o.float().max().item():.4f}")
+                logger.debug(f"  [DEBUG L77] o_proj same storage? {ref_o.data_ptr() == quant_o.data_ptr()}")
+            logger.debug(f"  [DEBUG L77] ref_hidden: shape={ref_hidden.shape}, min={ref_hidden.float().min().item():.6f}, max={ref_hidden.float().max().item():.6f}")
+            logger.debug(f"  [DEBUG L77] quant_hidden: shape={quant_hidden.shape}, min={quant_hidden.float().min().item():.6f}, max={quant_hidden.float().max().item():.6f}")
+            logger.debug(f"  [DEBUG L77] hidden same storage? {ref_hidden.data_ptr() == quant_hidden.data_ptr()}")
             diff = (ref_hidden.float().cpu() - quant_hidden.float().cpu()).abs()
-            logger.info(f"  [DEBUG L77] hidden diff: mean={diff.mean().item():.8f}, max={diff.max().item():.8f}")
+            logger.debug(f"  [DEBUG L77] hidden diff: mean={diff.mean().item():.8f}, max={diff.max().item():.8f}")
         except Exception as e:
-            logger.info(f"  [DEBUG L77] error: {e}")
+            logger.debug(f"  [DEBUG L77] error: {e}")
 
     def _forward_grouped_dual_layers(self, ref_hidden, quant_hidden, ref_model, quant_model,
                                        layer_start, layer_end, ref_pos_ids, quant_pos_ids,
@@ -1299,10 +1302,9 @@ class ShardedBlockComparator:
             ref_state_input = ref_prev_topk
             quant_state_input = quant_prev_topk
             is_moe = self._is_moe_layer(ref_layer)
-            if layer_idx == 3:
+            if layer_idx == 3 and logger.isEnabledFor(logging.DEBUG):
                 self._debug_layer3_expert0 = True
                 self._debug_layer3_out = True
-                self._debug_layer3_scales = True
             self._log_norm_debug(layer_idx, ref_hidden, quant_hidden, "IN")
 
             ref_moe = quant_moe = None
@@ -1435,7 +1437,7 @@ class ShardedBlockComparator:
             and (quant_desc_str is not None or not is_quant or is_ct)
         )
 
-        if layer_idx == 3 and self.verbose:
+        if layer_idx == 3 and logger.isEnabledFor(logging.DEBUG):
             self._log_moe_l3_format(experts_mod, is_packed, is_module_list, use_streaming,
                                     sf_reader, quant_desc_str, is_quant)
 
@@ -1478,9 +1480,7 @@ class ShardedBlockComparator:
     def _dequant_streaming_proj(self, sf_reader, expert_prefix, expert_id, proj_name,
                                   w_type, device, is_ct=False):
         """反量化单个 streaming proj 权重 (gate/up/down)。返回 fp tensor 或 None。"""
-        from .model_loader import (dequantize_weight_mx, _MX_QUANT_TYPES,
-                                    unpack_int4_to_int8, dequantize_weight_dynamic)
-        _W4_TYPES = ("W4A8_DYNAMIC", "W4A16", "W4A8", "W4A4_DYNAMIC", "W4A4_LAOS")
+        from .model_loader import dequantize_weight_mx, _dequant_msslim_weight
         key = f"{expert_prefix}.{expert_id}.{proj_name}.weight"
         w = sf_reader.get_tensor(key)
         if w is None and is_ct:
@@ -1495,29 +1495,30 @@ class ShardedBlockComparator:
                 del packed, scale
                 return fp
         if w is None:
-            return None
-        if w_type in _MX_QUANT_TYPES:
-            scale = sf_reader.get_tensor(f"{expert_prefix}.{expert_id}.{proj_name}.weight_scale")
-            if scale is None:
-                del w
-                return None
-            fp = dequantize_weight_mx(w, scale, w_type, dtype=self.dtype).to(device)
-            del w, scale
-        elif w_type in _W4_TYPES:
-            scale = sf_reader.get_tensor(f"{expert_prefix}.{expert_id}.{proj_name}.weight_scale")
-            offset = sf_reader.get_tensor(f"{expert_prefix}.{expert_id}.{proj_name}.weight_offset")
-            if scale is not None and w.dtype == torch.int8:
-                unpacked = unpack_int4_to_int8(w)
-                del w
-                fp = dequantize_weight_dynamic(unpacked, scale, offset, self.dtype).to(device)
-                del unpacked, scale, offset
-            else:
-                del w
-                return None
-        else:
+            raise KeyError(f"streaming expert weight not found: {key}")
+        if w_type == "FLOAT":
             fp = w.to(device=device, dtype=self.dtype)
             del w
-        return fp
+            return fp
+
+        # Keep streaming experts on the same centralized dequantization path as
+        # ordinary layer weights.  The former local dispatch omitted W8A8 and
+        # W8A8_DYNAMIC, silently casting INT8 experts to BF16 without scales.
+        quant_name = key.rsplit('.', 1)[0]
+        fp, status = _dequant_msslim_weight(
+            w, w_type, quant_name, sf_reader, self.dtype
+        )
+        del w
+        if status == "unknown":
+            raise NotImplementedError(
+                f"streaming expert quant type is not supported: {w_type} ({key})"
+            )
+        if fp is None:
+            raise ValueError(
+                f"streaming expert is missing dequantization parameters: "
+                f"{w_type} ({key})"
+            )
+        return fp.to(device)
 
     def _streaming_expert_forward(
         self,
@@ -1534,16 +1535,13 @@ class ShardedBlockComparator:
         """Streaming expert forward: 从 safetensors 读取权重，反量化后传 NPU 计算。
 
         每个 expert 的权重用完立即释放，不在 CPU 上构造完整 3D tensor。
-        对量化模型: CPU 反量化 FP8→BF16，传 NPU 做 F.linear
+        对量化模型: CPU 反量化到目标 dtype，传 NPU 做 F.linear
         对非量化模型: 直接读 BF16，传 NPU 做 F.linear
 
         Returns:
             expert output tensor on device, 或 None
         """
-        from .model_loader import (dequantize_weight_mx, _MX_QUANT_TYPES,
-                                    unpack_int4_to_int8, dequantize_weight_dynamic)
         from .utils import parse_base_name
-        _W4_TYPES = ("W4A8_DYNAMIC", "W4A16", "W4A8", "W4A4_DYNAMIC", "W4A4_LAOS")
 
         gate_name, up_name, down_name = self._resolve_expert_proj_names(
             sf_reader, expert_prefix, expert_id)
@@ -1579,12 +1577,12 @@ class ShardedBlockComparator:
 
         # ---- gate_up_proj → SiLU(gate) * up → down_proj ----
         # DEBUG: print expert weight stats for first expert processed at layer 3
-        if self.verbose and hasattr(self, '_debug_layer3_expert0') and self._debug_layer3_expert0:
-            logger.info(f"  [STREAM EXPERT {expert_id}] g_type={g_type} u_type={u_type} d_type={d_type}")
-            logger.info(f"  [STREAM EXPERT {expert_id}] gate_fp: shape={gate_fp.shape} min={gate_fp.float().min().item():.6f} max={gate_fp.float().max().item():.6f} norm={gate_fp.float().norm().item():.6f}")
-            logger.info(f"  [STREAM EXPERT {expert_id}] up_fp: shape={up_fp.shape} min={up_fp.float().min().item():.6f} max={up_fp.float().max().item():.6f} norm={up_fp.float().norm().item():.6f}")
-            logger.info(f"  [STREAM EXPERT {expert_id}] down_fp: shape={down_fp.shape} min={down_fp.float().min().item():.6f} max={down_fp.float().max().item():.6f} norm={down_fp.float().norm().item():.6f}")
-            logger.info(f"  [STREAM EXPERT {expert_id}] x_chunk: shape={x_chunk.shape} min={x_chunk.float().min().item():.6f} max={x_chunk.float().max().item():.6f}")
+        if logger.isEnabledFor(logging.DEBUG) and getattr(self, '_debug_layer3_expert0', False):
+            logger.debug(f"  [STREAM EXPERT {expert_id}] g_type={g_type} u_type={u_type} d_type={d_type}")
+            logger.debug(f"  [STREAM EXPERT {expert_id}] gate_fp: shape={gate_fp.shape} min={gate_fp.float().min().item():.6f} max={gate_fp.float().max().item():.6f} norm={gate_fp.float().norm().item():.6f}")
+            logger.debug(f"  [STREAM EXPERT {expert_id}] up_fp: shape={up_fp.shape} min={up_fp.float().min().item():.6f} max={up_fp.float().max().item():.6f} norm={up_fp.float().norm().item():.6f}")
+            logger.debug(f"  [STREAM EXPERT {expert_id}] down_fp: shape={down_fp.shape} min={down_fp.float().min().item():.6f} max={down_fp.float().max().item():.6f} norm={down_fp.float().norm().item():.6f}")
+            logger.debug(f"  [STREAM EXPERT {expert_id}] x_chunk: shape={x_chunk.shape} min={x_chunk.float().min().item():.6f} max={x_chunk.float().max().item():.6f}")
             self._debug_layer3_expert0 = False  # only once
 
         # activation fake quant: 模拟 per-block 激活量化 (按 activation_quant_type 分派)
@@ -1604,11 +1602,11 @@ class ShardedBlockComparator:
         expert_out = torch.nn.functional.linear(act_out, down_fp)
 
         # DEBUG: print expert output stats at layer 3
-        if self.verbose and hasattr(self, '_debug_layer3_out') and self._debug_layer3_out:
-            logger.info(f"  [STREAM EXPERT OUT {expert_id}] gate_out: norm={gate_out.float().norm().item():.6f} absmax={gate_out.float().abs().max().item():.6f}")
-            logger.info(f"  [STREAM EXPERT OUT {expert_id}] up_out: norm={up_out.float().norm().item():.6f} absmax={up_out.float().abs().max().item():.6f}")
-            logger.info(f"  [STREAM EXPERT OUT {expert_id}] act_out: norm={act_out.float().norm().item():.6f} absmax={act_out.float().abs().max().item():.6f}")
-            logger.info(f"  [STREAM EXPERT OUT {expert_id}] expert_out: norm={expert_out.float().norm().item():.6f} absmax={expert_out.float().abs().max().item():.6f}")
+        if logger.isEnabledFor(logging.DEBUG) and getattr(self, '_debug_layer3_out', False):
+            logger.debug(f"  [STREAM EXPERT OUT {expert_id}] gate_out: norm={gate_out.float().norm().item():.6f} absmax={gate_out.float().abs().max().item():.6f}")
+            logger.debug(f"  [STREAM EXPERT OUT {expert_id}] up_out: norm={up_out.float().norm().item():.6f} absmax={up_out.float().abs().max().item():.6f}")
+            logger.debug(f"  [STREAM EXPERT OUT {expert_id}] act_out: norm={act_out.float().norm().item():.6f} absmax={act_out.float().abs().max().item():.6f}")
+            logger.debug(f"  [STREAM EXPERT OUT {expert_id}] expert_out: norm={expert_out.float().norm().item():.6f} absmax={expert_out.float().abs().max().item():.6f}")
             self._debug_layer3_out = False
 
         del gate_fp, up_fp, down_fp, gate_out, up_out, act_out
@@ -1778,13 +1776,13 @@ class ShardedBlockComparator:
     def _log_moe_l3_format(self, experts_mod, is_packed, is_module_list,
                             use_streaming, sf_reader, quant_desc_str, is_quant):
         """layer 3 MoE format debug 日志。"""
-        logger.info(f"  [MOE L3] is_packed={is_packed} is_module_list={is_module_list} use_streaming={use_streaming}")
-        logger.info(f"  [MOE L3] sf_reader={sf_reader is not None} quant_desc_str={quant_desc_str is not None} is_quant={is_quant}")
-        logger.info(f"  [MOE L3] experts type={type(experts_mod).__name__}")
+        logger.debug(f"  [MOE L3] is_packed={is_packed} is_module_list={is_module_list} use_streaming={use_streaming}")
+        logger.debug(f"  [MOE L3] sf_reader={sf_reader is not None} quant_desc_str={quant_desc_str is not None} is_quant={is_quant}")
+        logger.debug(f"  [MOE L3] experts type={type(experts_mod).__name__}")
         for attr in ['gate_up_proj', 'down_proj', 'gate_proj', 'up_proj']:
             v = getattr(experts_mod, attr, None)
             if v is not None:
-                logger.info(f"  [MOE L3] experts.{attr}: type={type(v).__name__} shape={getattr(v, 'shape', None)} dtype={getattr(v, 'dtype', None)}")
+                logger.debug(f"  [MOE L3] experts.{attr}: type={type(v).__name__} shape={getattr(v, 'shape', None)} dtype={getattr(v, 'dtype', None)}")
 
     @staticmethod
     def _forward_shared_expert(mlp, hidden_states):
@@ -1919,8 +1917,8 @@ class ShardedBlockComparator:
         out_weighted = (expert_out.to(torch.float32) *
                         s_chunk.unsqueeze(-1).to(torch.float32))
         y[token_mask] += out_weighted.to(primary_device)
-        if layer_idx == 3 and self.verbose:
-            logger.info(f"  [MOE L3] after expert {eid}: y_norm={y.float().norm().item():.6f} y_absmax={y.float().abs().max().item():.6f} expert_out_norm={expert_out.float().norm().item():.6f} s={s_chunk.tolist()}")
+        if layer_idx == 3 and logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"  [MOE L3] after expert {eid}: y_norm={y.float().norm().item():.6f} y_absmax={y.float().abs().max().item():.6f} expert_out_norm={expert_out.float().norm().item():.6f} s={s_chunk.tolist()}")
         return expert_out
 
     @staticmethod
@@ -1937,19 +1935,20 @@ class ShardedBlockComparator:
                               topk_scores, topk_indices, routed_scaling_factor):
         """加 shared expert + debug 日志，返回最终输出。"""
         orig_shape = hidden_states.shape
+        debug_l3 = layer_idx == 3 and logger.isEnabledFor(logging.DEBUG)
         if shared_output is not None:
             shared_flat = shared_output.view(-1, orig_shape[-1]).to(torch.float32)
-            if layer_idx == 3 and self.verbose:
-                logger.info(f"  [MOE L3] shared_output: norm={shared_flat.float().norm().item():.6f} absmax={shared_flat.float().abs().max().item():.6f}")
-                logger.info(f"  [MOE L3] routed y (pre-shared): norm={y.float().norm().item():.6f} absmax={y.float().abs().max().item():.6f}")
+            if debug_l3:
+                logger.debug(f"  [MOE L3] shared_output: norm={shared_flat.float().norm().item():.6f} absmax={shared_flat.float().abs().max().item():.6f}")
+                logger.debug(f"  [MOE L3] routed y (pre-shared): norm={y.float().norm().item():.6f} absmax={y.float().abs().max().item():.6f}")
             y = y + shared_flat.to(hidden_states.device)
-        elif layer_idx == 3 and self.verbose:
-            logger.info(f"  [MOE L3] routed y (no shared): norm={y.float().norm().item():.6f} absmax={y.float().abs().max().item():.6f}")
-        if layer_idx == 3 and self.verbose:
-            logger.info(f"  [MOE L3] topk_scores: {topk_scores[0].tolist()}")
-            logger.info(f"  [MOE L3] topk_indices: {topk_indices[0].tolist()}")
-            logger.info(f"  [MOE L3] routed_scaling_factor={routed_scaling_factor}")
-            logger.info(f"  [MOE L3] final y: norm={y.float().norm().item():.6f} absmax={y.float().abs().max().item():.6f}")
+        elif debug_l3:
+            logger.debug(f"  [MOE L3] routed y (no shared): norm={y.float().norm().item():.6f} absmax={y.float().abs().max().item():.6f}")
+        if debug_l3:
+            logger.debug(f"  [MOE L3] topk_scores: {topk_scores[0].tolist()}")
+            logger.debug(f"  [MOE L3] topk_indices: {topk_indices[0].tolist()}")
+            logger.debug(f"  [MOE L3] routed_scaling_factor={routed_scaling_factor}")
+            logger.debug(f"  [MOE L3] final y: norm={y.float().norm().item():.6f} absmax={y.float().abs().max().item():.6f}")
         return y.view(orig_shape).to(hidden_states.dtype)
 
     # ---- dual sharded forward 辅助方法 (Extract Method 降圈复杂度) ----
@@ -2022,6 +2021,8 @@ class ShardedBlockComparator:
     def _log_dual_layer_debug(self, layer_idx, layer_start, shard_idx,
                                 ref_hidden, quant_hidden, ref_layers, quant_layers):
         """dual 模式逐层 debug 日志 (NaN 检查 + 设备检查)。"""
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
         ref_input_nan = torch.isnan(ref_hidden).any() if ref_hidden is not None else False
         quant_input_nan = torch.isnan(quant_hidden).any() if quant_hidden is not None else False
         if layer_idx == layer_start:
@@ -2030,12 +2031,14 @@ class ShardedBlockComparator:
                 logger.info(f"    ref input shape: {ref_hidden.shape}, max: {ref_hidden.abs().max()}")
             if quant_input_nan:
                 logger.info(f"    quant input shape: {quant_hidden.shape}, max: {quant_hidden.abs().max()}")
-            logger.info(f"    ref_layer.{layer_idx} first param device: {next(ref_layers[layer_idx].parameters()).device}")
-            logger.info(f"    quant_layer.{layer_idx} first param device: {next(quant_layers[layer_idx].parameters()).device}")
+            logger.debug(f"    ref_layer.{layer_idx} first param device: {next(ref_layers[layer_idx].parameters()).device}")
+            logger.debug(f"    quant_layer.{layer_idx} first param device: {next(quant_layers[layer_idx].parameters()).device}")
 
     @staticmethod
     def _log_dual_post_forward_nan(layer_idx, ref_hidden, quant_hidden):
         """forward 后 NaN 检查日志。"""
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
         ref_has_nan = torch.isnan(ref_hidden).any()
         quant_has_nan = torch.isnan(quant_hidden).any()
         if ref_has_nan or quant_has_nan:

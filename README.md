@@ -133,16 +133,17 @@ python3 run_accuracy_check.py --mode l1 --model_type dspark \
 
 1. **必须提供 FP16/BF16 ref 模型** (不支持无 ref 比对)
 2. **L2 前必须先跑 L1** (`--l1 --cache_top_k N` 或 `--l1 --l1_target_layers ...`)
-3. **`--rotation_matrix`**: ref 与 quant 量化方案不同 (BF16 ref vs W8A8 quant) → 必传; 同方案 (W8A8 vs W8A8) → 不传 (RotBErr 兜底)
-   > 前提: R 独立可逆且 ref/quant 用同一 R; 若 R 已融合进权重则必须显式传
+3. **`--rotation_matrix`**: 只在 checkpoint 确实使用 QuaRot 等旋转且 R 未融合进权重时传；普通非旋转 W8A8 不传。不能仅凭“BF16 ref vs W8A8 quant”判断存在旋转
+   > 前提: R 独立可逆且 ref/quant 使用同一旋转契约；不确定时先检查量化配置与权重生成参数
 4. **MoE 强烈推荐 `grouped_dual`**: 8 卡并行 expert chunk, L1 从 70min → 7min (10x)；Kimi K3 为必选
 5. **`dtype`** 仅 `bfloat16`/`float16`; NPU 推荐 `bfloat16` (Cube 原生), `float16` 注意激活溢出; ref 与 quant 必须一致; 模型自动 `eval()`
 6. **L1 对 MoE router/DSA 层有已知 false-positive** (router softmax 附近 cos_sim 常偏低, 不一定是量化真正出错), 建议配 `v2_metrics` 的 `router_flip_risk` 信号交叉筛
 7. **DSpark 必须提供 verifier hidden-state 样本**: 不接受随机 hidden 或仅 prompt；`grouped_dual` 对 dense draft 无意义，使用专用 dual-device 路径
 
-> 详细 CLI 参数见 `cli_params_guide.html` 或 `python3 run_accuracy_check.py --help`
+> 交互式命令生成器与完整参数表见 [`cli_params_guide.html`](cli_params_guide.html)，也可运行 `python3 run_accuracy_check.py --help`
 > Cache 机制: 默认 `./.acc_cache/`, 可 `--cache_dir` 或 `ACC_CACHE_DIR` 环境变量覆盖
 > HTML 报告: `accuracy_checker.html_report.generate_html_report(boundary_results=..., l2_results=..., model_name=..., output_path=...)`
+> 默认不打印 hidden norm / MoE L3 expert 等开发上下文；需要这些诊断时追加 `--debug`
 
 ## 架构
 

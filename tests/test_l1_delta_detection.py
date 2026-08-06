@@ -299,5 +299,19 @@ class TestCaseE_RealBadcaseData(unittest.TestCase):
         self.assertTrue(layer_77.is_persistent, "Layer 77 (最后一层) 应 persistent=True")
 
 
+class TestCaseF_CatastrophicLayerZero(unittest.TestCase):
+    """加载/反量化已经在 layer 0 崩溃时，不应误报后续局部波动。"""
+
+    def test_layer_zero_overrides_later_local_drop(self):
+        cos_sims = [0.08, -0.001, 0.0, 0.01, -0.02, 0.02]
+        report = _make_results(cos_sims)
+        report.results[0].metrics["rel_err"] = 1.0e10
+
+        self.assertEqual(report.first_bad_block, "layer.0.block_output")
+        summary = report.summary()
+        self.assertIn("Catastrophic first-block mismatch", summary)
+        self.assertIn("Local-drop diagnosis suppressed", summary)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

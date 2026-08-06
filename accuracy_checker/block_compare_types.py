@@ -262,6 +262,27 @@ class BlockCompareReport:
     # 公开属性
     # ------------------------------------------------------------------
 
+    def _catastrophic_first_layer(self) -> Optional[BlockCompareResult]:
+        """Return layer 0 when the run is already numerically broken there.
+
+        Delta/MAD is useful only while the sequence still describes gradual
+        quantization drift.  Once the first decoder block is nearly orthogonal
+        *and* its relative error is already larger than the signal, a later
+        local fluctuation must not be reported as the root layer.
+        """
+        first = next(
+            (r for r in self.results if r.layer_name.startswith("layer.")),
+            None,
+        )
+        if first is None or _layer_idx_from_name(first.layer_name) != 0:
+            return None
+        metrics = first.metrics or {}
+        cos = metrics.get("cos_sim")
+        rel_err = metrics.get("rel_err")
+        if cos is not None and rel_err is not None and cos < 0.5 and rel_err > 2.0:
+            return first
+        return None
+
     @property
     def first_bad_block(self) -> Optional[str]:
         """首个显著局部突降层 (delta + MAD 检测)。
@@ -274,6 +295,9 @@ class BlockCompareReport:
         2. 首个 is_bad_jump 的层
         3. 首个 cos_sim < 0.99 的层 (绝对阈值, 仅兜底)
         """
+        catastrophic = self._catastrophic_first_layer()
+        if catastrophic is not None:
+            return catastrophic.layer_name
         detection = self._detect_bad_layers()
         if detection.first_bad:
             return detection.first_bad.layer_name
@@ -317,8 +341,21 @@ class BlockCompareReport:
             if detection.first_threshold_crossing:
                 lines.append(f"  First threshold crossing (cos<0.99): {detection.first_threshold_crossing}")
 
+            catastrophic = self._catastrophic_first_layer()
+            if catastrophic is not None:
+                metrics = catastrophic.metrics or {}
+                lines.append(
+                    "  Catastrophic first-block mismatch: "
+                    f"{catastrophic.layer_name} "
+                    f"(cos={metrics.get('cos_sim', 0):.6f}, "
+                    f"rel_err={metrics.get('rel_err', 0):.6g})"
+                )
+                lines.append(
+                    "    Local-drop diagnosis suppressed: check dequantization, "
+                    "weight mapping, and replay/runtime contracts first."
+                )
             # 显著局部突降 (根因定位)
-            if detection.first_bad:
+            elif detection.first_bad:
                 fb = detection.first_bad
                 lines.append(f"  First significant local drop: {fb.layer_name}")
                 lines.append(f"    delta={fb.delta_cos:+.6f} ({fb.drop_percent:+.4f}%), "
@@ -328,7 +365,7 @@ class BlockCompareReport:
                 lines.append("  无显著局部突降 (delta 检测未命中)")
 
             # Debug: 打印所有 bad jump 候选
-            if detection.bad_layers:
+            if detection.bad_layers and catastrophic is None:
                 lines.append(f"  Bad jump candidates ({len(detection.bad_layers)}):")
                 for b in detection.bad_layers:
                     lines.append(f"    {b.debug_str()}")

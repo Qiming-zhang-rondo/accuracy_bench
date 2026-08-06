@@ -77,6 +77,8 @@ def parse_args():
                         help="清除 L2 缓存目录后退出")
     parser.add_argument("--cache_dir", type=str, default=None,
                         help="L2 cache 目录")
+    parser.add_argument("--debug", action="store_true",
+                        help="输出模型结构、hidden norm 和 MoE expert 等诊断日志")
 
     # L1
     parser.add_argument("--per_device_memory", type=float, default=None,
@@ -261,6 +263,34 @@ def _resolve_devices(args):
     return ref_device, target_device, dtype
 
 
+def _validate_standalone_dspark_args(args, mode: str, standalone_dspark: bool):
+    """Fail early for options that the standalone DSpark runtime cannot honor."""
+    if not standalone_dspark:
+        return
+    if mode not in ("l1", "screening", "report"):
+        raise NotImplementedError(
+            "standalone DSpark 仅支持 --mode l1/screening/report；"
+            "draft 不能独立 generate，也不能进入普通 CausalLM boundary/full/L2。"
+        )
+    if mode != "l1":
+        return
+    if args.quant_method != "dequantize":
+        raise ValueError(
+            "standalone DSpark L1 仅支持 --quant_method dequantize；"
+            "当前 draft API 不支持 fake_quant。"
+        )
+    if args.compare_mode != "dual":
+        raise ValueError(
+            "standalone DSpark L1 仅支持 --compare_mode dual；"
+            "grouped_dual 只用于普通 MoE expert 分发。"
+        )
+    if args.ref_devices or args.quant_devices:
+        raise ValueError(
+            "standalone DSpark L1 使用 --ref_device/--quant_device；"
+            "不要传 --ref_devices/--quant_devices 多卡列表。"
+        )
+
+
 # ===========================================================================
 # L1 / L2 运行 (沿用历史实现)
 # ===========================================================================
@@ -283,9 +313,9 @@ def run_hf_l1(args, ref_device, target_device, dtype):
                 "provide --dspark_sample <verifier_hidden_states.pt>"
             )
         if getattr(args, 'compare_mode', 'dual') != 'dual':
-            logger.warning(
-                "DSpark draft is dense and uses its dedicated dual-device path; "
-                "--compare_mode grouped_dual is ignored"
+            raise ValueError(
+                "DSpark draft uses its dedicated dual-device path; "
+                "set --compare_mode dual"
             )
         from accuracy_checker.dspark import DSparkComparator
         comparator = DSparkComparator(
@@ -939,8 +969,11 @@ def _mode_inference(args):
 # ===========================================================================
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format="%(message)s",
+    )
 
     if args.cache_dir:
         from accuracy_checker.cache import set_cache_dir
@@ -958,11 +991,7 @@ def main():
         or is_dspark_checkpoint(getattr(args, "ref_model", None))
         or is_dspark_checkpoint(getattr(args, "quant_model", None))
     )
-    if standalone_dspark and mode not in ("l1", "screening", "report"):
-        raise NotImplementedError(
-            "standalone DSpark 仅支持 --mode l1/screening/report；"
-            "draft 不能独立 generate，也不能进入普通 CausalLM boundary/full/L2。"
-        )
+    _validate_standalone_dspark_args(args, mode, standalone_dspark)
 
     # report / inference 模式不需要 quant_model
     if mode not in ("report", "inference") and not args.quant_model:
