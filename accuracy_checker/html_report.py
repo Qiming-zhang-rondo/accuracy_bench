@@ -1167,6 +1167,29 @@ def _scan_sibling_reports(output_path: str, current_data: ReportData):
     return sidebar_entries, all_data, 0  # current_idx=0
 
 
+def _update_latest_report_link(target_path: str) -> str:
+    """Point the repository-level ``latest.html`` at a generated report page.
+
+    Linux uses a relative symlink so refreshing the browser always sees the
+    regenerated target.  Environments that cannot create symlinks (notably a
+    default Windows setup) receive a plain copy at the same stable path.
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    link_path = os.path.join(repo_root, "latest.html")
+    target_path = os.path.abspath(target_path)
+    try:
+        if os.path.lexists(link_path):
+            os.remove(link_path)
+        os.symlink(os.path.relpath(target_path, repo_root), link_path)
+    except OSError as exc:
+        try:
+            shutil.copyfile(target_path, link_path)
+            logger.debug("latest.html copied because symlink creation failed: %s", exc)
+        except OSError as copy_error:
+            logger.debug("Failed to update latest.html: %s", copy_error)
+    return link_path
+
+
 def generate_product_html_report(
     report_data: ReportData,
     output_path: Optional[str] = None,
@@ -1310,22 +1333,10 @@ def generate_product_html_report(
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html_doc)
 
-    # 更新 latest.html 软链接 → 刚生成的报告 (http://localhost:8765/latest.html)
-    try:
-        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        link_path = os.path.join(repo_root, "latest.html")
-        rel_target = os.path.relpath(output_path, repo_root)
-        if os.path.islink(link_path) or os.path.exists(link_path):
-            os.remove(link_path)
-        os.symlink(rel_target, link_path)
-    except OSError as e:
-        # Windows without Developer Mode commonly rejects symlink creation.
-        # Keep the documented latest.html entry point useful with a plain copy.
-        try:
-            shutil.copyfile(output_path, link_path)
-            logger.debug("latest.html copied because symlink creation failed: %s", e)
-        except OSError as copy_error:
-            logger.debug("Failed to update latest.html: %s", copy_error)
+    # Direct API callers still receive a useful latest.html.  CLI workflows
+    # generate index.html immediately afterwards, replacing this with the
+    # current + historical report dashboard.
+    _update_latest_report_link(output_path)
 
     return output_path
 
@@ -1398,6 +1409,7 @@ def generate_index_html(reports_dir: str, output_path: Optional[str] = None) -> 
         )
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(html_doc)
+        _update_latest_report_link(output_path)
         return output_path
 
     # Build sidebar + main area HTML
@@ -1531,6 +1543,7 @@ def generate_index_html(reports_dir: str, output_path: Optional[str] = None) -> 
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html_doc)
+    _update_latest_report_link(output_path)
     return output_path
 
 

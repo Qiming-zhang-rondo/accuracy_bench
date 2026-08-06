@@ -9,6 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 RUN_SCRIPT = ROOT / "run_accuracy_check.py"
 GUIDE = ROOT / "cli_params_guide.html"
+HTML_REPORT = ROOT / "accuracy_checker" / "html_report.py"
 
 
 class _GuideParser(HTMLParser):
@@ -76,6 +77,16 @@ class TestCliGuide(unittest.TestCase):
         self.assertIn('"product_report.html"', source)
         self.assertIn('"report_data.json"', source)
 
+    def test_report_runs_are_archived_and_latest_opens_history(self):
+        run_source = RUN_SCRIPT.read_text(encoding="utf-8")
+        html_source = HTML_REPORT.read_text(encoding="utf-8")
+        self.assertIn("def _resolve_report_run_dir(args, mode):", run_source)
+        self.assertIn('_resolve_report_run_dir(args, "full")', run_source)
+        self.assertIn("def _update_latest_report_link(target_path: str)", html_source)
+        self.assertGreaterEqual(
+            html_source.count("_update_latest_report_link(output_path)"), 3
+        )
+        self.assertIn("latest.html 左侧可切换当前与历史报告", self.html)
 
 if __name__ == "__main__":
     unittest.main()

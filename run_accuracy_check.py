@@ -546,13 +546,40 @@ def _mode_l1(args):
     return run_hf_l1(args, ref_device, target_device, dtype)
 
 
-def _default_stage_report_dir(args, mode):
-    """Create a non-overwriting default directory for L1/L2 HTML artifacts."""
+def _report_run_name(args, mode):
+    """Build a filesystem-safe, unique name for one archived report run."""
     model_path = args.quant_model or args.ref_model or "model"
     model_name = os.path.basename(os.path.normpath(model_path)) or "model"
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", model_name).strip("._")
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return os.path.join("reports", f"{safe_name or 'model'}_{mode}_{stamp}")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return f"{safe_name or 'model'}_{mode}_{stamp}"
+
+
+def _default_report_run_dir(args, mode):
+    """Return the default archive directory for one report-producing run."""
+    return os.path.join("reports", _report_run_name(args, mode))
+
+
+def _resolve_report_run_dir(args, mode):
+    """Resolve an output directory without overwriting a previous report.
+
+    ``--output_dir reports`` is treated as the report archive root.  A more
+    specific path is kept for its first run; if it already contains files, a
+    timestamped sibling is used so history remains available from latest.html.
+    """
+    requested = getattr(args, "output_dir", None)
+    if not requested:
+        return _default_report_run_dir(args, mode)
+
+    requested = os.path.normpath(requested)
+    if os.path.basename(requested).lower() == "reports":
+        return os.path.join(requested, _report_run_name(args, mode))
+
+    if os.path.isdir(requested) and os.listdir(requested):
+        parent = os.path.dirname(requested)
+        base = os.path.basename(requested)
+        return os.path.join(parent, f"{base}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}")
+    return requested
 
 
 def _write_stage_report_artifacts(args, report, mode):
@@ -566,7 +593,7 @@ def _write_stage_report_artifacts(args, report, mode):
         generate_product_html_report,
     )
 
-    out_dir = args.output_dir or _default_stage_report_dir(args, mode)
+    out_dir = _resolve_report_run_dir(args, mode)
     os.makedirs(out_dir, exist_ok=True)
 
     summary_text = report.summary()
@@ -600,10 +627,11 @@ def _write_stage_report_artifacts(args, report, mode):
         report_data, output_path=os.path.join(out_dir, "product_report.html")
     )
 
-    reports_root = os.path.dirname(out_dir) or "reports"
+    reports_root = os.path.dirname(os.path.abspath(out_dir))
     try:
         index_path = generate_index_html(reports_root)
         logger.info(f"  报告索引: {index_path}")
+        logger.info("  当前/历史统一入口: latest.html")
     except Exception as exc:  # noqa: BLE001
         logger.info(f"  报告索引生成跳过: {exc}")
 
@@ -846,7 +874,7 @@ def _full_assemble_and_write(args, l1_report, l2_results, boundary_dict,
     )
     logger.info(f"  run_status = {report_data.run_status}")
 
-    out_dir = args.output_dir or "reports"
+    out_dir = _resolve_report_run_dir(args, "full")
     os.makedirs(out_dir, exist_ok=True)
     json_path = os.path.join(out_dir, "report_data.json")
     with open(json_path, "w") as f:
@@ -859,10 +887,11 @@ def _full_assemble_and_write(args, l1_report, l2_results, boundary_dict,
 
     # Generate index.html with sidebar history
     from accuracy_checker import generate_index_html
-    reports_base = os.path.dirname(out_dir) or "reports"
+    reports_base = os.path.dirname(os.path.abspath(out_dir))
     try:
         index_path = generate_index_html(reports_base)
         logger.info(f"  Index HTML: {index_path}")
+        logger.info("  当前/历史统一入口: latest.html")
     except Exception as e:  # noqa: BLE001
         logger.info(f"  [full] Index HTML 生成失败: {e}")
 
@@ -914,7 +943,11 @@ def _mode_report(args):
     if not os.path.exists(json_path):
         logger.info(f"\n  [report] JSON 文件不存在: {json_path}")
         return
-    from accuracy_checker import ReportData, generate_product_html_report
+    from accuracy_checker import (
+        ReportData,
+        generate_index_html,
+        generate_product_html_report,
+    )
     with open(json_path) as f:
         data = json.load(f)
     report_data = ReportData.from_dict(data)
@@ -923,6 +956,12 @@ def _mode_report(args):
     out_path = os.path.join(out_dir, "product_report.html")
     path = generate_product_html_report(report_data, output_path=out_path)
     logger.info(f"\n  [report] HTML 已生成: {path}")
+    reports_base = os.path.dirname(os.path.abspath(out_dir))
+    try:
+        index_path = generate_index_html(reports_base)
+        logger.info(f"  [report] 当前/历史统一入口: latest.html ({index_path})")
+    except Exception as exc:  # noqa: BLE001
+        logger.info(f"  [report] 报告索引生成跳过: {exc}")
 
 
 def _mode_inference(args):

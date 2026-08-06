@@ -746,7 +746,7 @@
               <input id="cacheTopK" type="number" min="0" value="5">
             </div>
             <div>
-              <label for="outputDir">输出目录 <span class="optional">可选</span></label>
+              <label for="outputDir">输出目录 <span class="optional">可选；自动保留历史</span></label>
               <input id="outputDir" type="text" autocomplete="off" placeholder="reports/qwen36_l1">
             </div>
             <div class="wide" id="promptField">
@@ -890,7 +890,7 @@
             <tr><td><code>--ref_devices</code></td><td>空</td><td>grouped_dual 的 ref 多卡列表，例如 npu:0,1。</td></tr>
             <tr><td><code>--quant_devices</code></td><td>空</td><td>grouped_dual 的 quant 多卡列表，例如 npu:2,3。</td></tr>
             <tr><td><code>--expert_chunk_size</code></td><td>按卡数自动</td><td>grouped_dual 每批 expert 数；通常留空。</td></tr>
-            <tr><td><code>--output_dir</code></td><td>自动</td><td>报告输出目录；L1/L2 留空时自动创建带时间戳目录并生成 JSON + HTML。</td></tr>
+            <tr><td><code>--output_dir</code></td><td>自动</td><td>单次报告目录；留空或填写 reports 时自动创建带时间戳目录。重复使用已有非空目录时自动创建同级归档，避免覆盖历史。</td></tr>
             <tr><td><code>--model_type</code></td><td>auto</td><td>支持 dense、moe、GLM、Qwen3 系列、Qwen3.6、Kimi K3 与 dspark。</td></tr>
             <tr><td><code>--dspark_sample</code></td><td>空（必需）</td><td>DSpark verifier hidden-state .pt；包含 input_ids、hidden_states、loss_mask 等。</td></tr>
             <tr><td><code>--dspark_seed</code></td><td>0</td><td>DSpark anchor/noise 确定性采样 seed。</td></tr>
@@ -1198,7 +1198,7 @@
         if (el.rotationMatrix.value.trim()) addStatus("已加入 rotation_matrix；请确认 ref/quant 旋转契约一致", "ok");
         else if (["l1", "l2", "full"].indexOf(mode) !== -1) addStatus("未使用旋转矩阵：适用于非旋转量化或 R 已融合 checkpoint", "");
         if (["l1", "l2", "full"].indexOf(mode) !== -1) {
-          addStatus("运行成功后自动生成 report_data.json 与 product_report.html", "ok");
+          addStatus("运行成功后自动归档 JSON + HTML；latest.html 左侧可切换当前与历史报告", "ok");
         }
 
         var valid = validation.errors.length === 0;

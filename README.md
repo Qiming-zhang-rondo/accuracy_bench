@@ -142,7 +142,8 @@ python3 run_accuracy_check.py --mode l1 --model_type dspark \
 
 > 交互式命令生成器与完整参数表见 [`cli_params_guide.html`](cli_params_guide.html)：页面会预检路径/设备/模式参数，并按模型规模与每卡显存推荐卡数；也可运行 `python3 run_accuracy_check.py --help`
 > Cache 机制: 默认 `./.acc_cache/`, 可 `--cache_dir` 或 `ACC_CACHE_DIR` 环境变量覆盖
-> HTML 报告: `l1` / `l2` / `full` 成功后都会生成 `report_data.json` 与 `product_report.html`；未指定 `--output_dir` 时，L1/L2 自动写入带时间戳的 `reports/<model>_<mode>_<time>/`
+> HTML 报告: `l1` / `l2` / `full` 成功后都会生成 `report_data.json` 与 `product_report.html`，并按运行独立归档；未指定 `--output_dir` 时写入带时间戳的 `reports/<model>_<mode>_<time>/`。即使重复指定同一非空目录，也会自动使用带时间戳的同级目录，避免覆盖历史
+> 当前与历史报告统一入口: 在项目根目录运行 `python3 -m http.server 8765 --bind 127.0.0.1`，桌面浏览器固定打开 `http://127.0.0.1:8765/latest.html`；页面默认显示最新结果，左侧边栏可切换全部历史记录
 > 默认不打印 hidden norm / MoE L3 expert 等开发上下文；需要这些诊断时追加 `--debug`
 
 ## 架构
