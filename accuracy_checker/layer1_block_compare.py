@@ -71,6 +71,32 @@ def _make_act_fake_quant_hook(quant_type: str):
         return (x_fq,) + input[1:]
     return _hook
 
+
+class _ExpertSliceReader:
+    """Reader view that slices packed expert tensors on their first axis."""
+
+    def __init__(self, reader, expert_id: int, num_experts: int):
+        self.reader = reader
+        self.expert_id = expert_id
+        self.num_experts = num_experts
+        self.weight_map = getattr(reader, "weight_map", {})
+
+    def get_tensor(self, key: str):
+        get_slice = getattr(self.reader, "get_tensor_slice", None)
+        if callable(get_slice):
+            return get_slice(
+                key, self.expert_id,
+                expected_first_dim=self.num_experts,
+            )
+        tensor = self.reader.get_tensor(key)
+        if (
+            tensor is not None
+            and tensor.dim() > 0
+            and tensor.shape[0] == self.num_experts
+        ):
+            return tensor[self.expert_id]
+        return tensor
+
 class ShardedBlockComparator:
     """
     多卡Block对比器
@@ -1477,17 +1503,86 @@ class ShardedBlockComparator:
             y, shared_output, hidden_states, layer_idx,
             topk_scores, topk_indices, routed_scaling_factor)
 
-    def _dequant_streaming_proj(self, sf_reader, expert_prefix, expert_id, proj_name,
-                                  w_type, device, is_ct=False):
-        """反量化单个 streaming proj 权重 (gate/up/down)。返回 fp tensor 或 None。"""
+    @staticmethod
+    def _resolve_packed_expert_keys(sf_reader, expert_prefix):
+        """Resolve Qwen3.5/3.6 fused 3D expert storage, if present."""
+        weight_map = getattr(sf_reader, "weight_map", {})
+        candidates = (
+            (f"{expert_prefix}.gate_up_proj", f"{expert_prefix}.down_proj"),
+            (f"{expert_prefix}.gate_up_proj.weight",
+             f"{expert_prefix}.down_proj.weight"),
+        )
+        for gate_up_key, down_key in candidates:
+            if weight_map and gate_up_key in weight_map and down_key in weight_map:
+                get_shape = getattr(sf_reader, "get_tensor_shape", None)
+                gate_up_shape = get_shape(gate_up_key) if callable(get_shape) else None
+                down_shape = get_shape(down_key) if callable(get_shape) else None
+                if gate_up_shape is None or down_shape is None:
+                    gate_up_shape = tuple(sf_reader.get_tensor(gate_up_key).shape)
+                    down_shape = tuple(sf_reader.get_tensor(down_key).shape)
+                if len(gate_up_shape) == 3 and len(down_shape) == 3:
+                    if gate_up_shape[0] != down_shape[0]:
+                        raise ValueError(
+                            "packed expert tensors disagree on num_experts: "
+                            f"{gate_up_shape} vs {down_shape}"
+                        )
+                    return gate_up_key, down_key, gate_up_shape[0]
+
+        if not weight_map:
+            for gate_up_key, down_key in candidates:
+                gate_up = sf_reader.get_tensor(gate_up_key)
+                down = sf_reader.get_tensor(down_key)
+                if (
+                    gate_up is not None and down is not None
+                    and gate_up.dim() == 3 and down.dim() == 3
+                ):
+                    if gate_up.shape[0] != down.shape[0]:
+                        raise ValueError(
+                            "packed expert tensors disagree on num_experts: "
+                            f"{tuple(gate_up.shape)} vs {tuple(down.shape)}"
+                        )
+                    return gate_up_key, down_key, gate_up.shape[0]
+        return None
+
+    @staticmethod
+    def _streaming_quant_type(quant_desc_str, weight_key, default="FLOAT"):
+        """Look up quant type for both Parameter and Linear-style keys."""
+        if not quant_desc_str:
+            return default
+        from .utils import parse_base_name
+        candidates = [weight_key, parse_base_name(weight_key)]
+        if weight_key.endswith(".weight"):
+            candidates.append(weight_key[:-len(".weight")])
+        else:
+            candidates.extend((
+                f"{weight_key}.weight",
+                parse_base_name(f"{weight_key}.weight"),
+            ))
+        for candidate in candidates:
+            quant_type = quant_desc_str.get(candidate)
+            if isinstance(quant_type, str):
+                return quant_type
+        return default
+
+    def _dequant_streaming_weight(self, sf_reader, weight_key, w_type, device,
+                                    is_ct=False, expert_id=None,
+                                    num_experts=None):
+        """Read/dequantize one expert weight from split or fused storage."""
         from .model_loader import dequantize_weight_mx, _dequant_msslim_weight
-        key = f"{expert_prefix}.{expert_id}.{proj_name}.weight"
-        w = sf_reader.get_tensor(key)
+        reader = (
+            _ExpertSliceReader(sf_reader, expert_id, num_experts)
+            if expert_id is not None and num_experts is not None
+            else sf_reader
+        )
+        w = reader.get_tensor(weight_key)
+        quant_name = (
+            weight_key.rsplit('.', 1)[0]
+            if weight_key.endswith(".weight")
+            else weight_key
+        )
         if w is None and is_ct:
-            packed = sf_reader.get_tensor(
-                f"{expert_prefix}.{expert_id}.{proj_name}.weight_packed")
-            scale = sf_reader.get_tensor(
-                f"{expert_prefix}.{expert_id}.{proj_name}.weight_scale")
+            packed = reader.get_tensor(f"{quant_name}.weight_packed")
+            scale = reader.get_tensor(f"{quant_name}.weight_scale")
             if packed is not None and scale is not None:
                 fp = dequantize_weight_mx(
                     packed, scale, "W4A4_MXFP4", dtype=self.dtype,
@@ -1495,30 +1590,46 @@ class ShardedBlockComparator:
                 del packed, scale
                 return fp
         if w is None:
-            raise KeyError(f"streaming expert weight not found: {key}")
+            raise KeyError(f"streaming expert weight not found: {weight_key}")
         if w_type == "FLOAT":
+            if is_ct and not w.dtype.is_floating_point:
+                scale = reader.get_tensor(f"{quant_name}.weight_scale")
+                if scale is not None:
+                    fp = (w.to(self.dtype) * scale.to(self.dtype)).to(device)
+                    del w, scale
+                    return fp
+            if not w.dtype.is_floating_point:
+                raise ValueError(
+                    "integer streaming expert was classified as FLOAT; "
+                    f"quantization metadata is missing for {weight_key}"
+                )
             fp = w.to(device=device, dtype=self.dtype)
             del w
             return fp
 
-        # Keep streaming experts on the same centralized dequantization path as
-        # ordinary layer weights.  The former local dispatch omitted W8A8 and
-        # W8A8_DYNAMIC, silently casting INT8 experts to BF16 without scales.
-        quant_name = key.rsplit('.', 1)[0]
         fp, status = _dequant_msslim_weight(
-            w, w_type, quant_name, sf_reader, self.dtype
+            w, w_type, quant_name, reader, self.dtype
         )
         del w
         if status == "unknown":
             raise NotImplementedError(
-                f"streaming expert quant type is not supported: {w_type} ({key})"
+                f"streaming expert quant type is not supported: {w_type} "
+                f"({weight_key})"
             )
         if fp is None:
             raise ValueError(
-                f"streaming expert is missing dequantization parameters: "
-                f"{w_type} ({key})"
+                "streaming expert is missing dequantization parameters: "
+                f"{w_type} ({weight_key})"
             )
         return fp.to(device)
+
+    def _dequant_streaming_proj(self, sf_reader, expert_prefix, expert_id, proj_name,
+                                  w_type, device, is_ct=False):
+        """反量化单个 streaming proj 权重 (gate/up/down)。返回 fp tensor 或 None。"""
+        key = f"{expert_prefix}.{expert_id}.{proj_name}.weight"
+        return self._dequant_streaming_weight(
+            sf_reader, key, w_type, device, is_ct=is_ct,
+        )
 
     def _streaming_expert_forward(
         self,
@@ -1541,39 +1652,67 @@ class ShardedBlockComparator:
         Returns:
             expert output tensor on device, 或 None
         """
-        from .utils import parse_base_name
-
-        gate_name, up_name, down_name = self._resolve_expert_proj_names(
-            sf_reader, expert_prefix, expert_id)
-        gate_key = f"{expert_prefix}.{expert_id}.{gate_name}.weight"
-        up_key = f"{expert_prefix}.{expert_id}.{up_name}.weight"
-        down_key = f"{expert_prefix}.{expert_id}.{down_name}.weight"
-
-        if is_quant and quant_desc_str is not None:
-            g_type = quant_desc_str.get(gate_key,
-                      quant_desc_str.get(parse_base_name(gate_key), "FLOAT"))
-            u_type = quant_desc_str.get(up_key,
-                      quant_desc_str.get(parse_base_name(up_key), g_type))
-            d_type = quant_desc_str.get(down_key,
-                      quant_desc_str.get(parse_base_name(down_key), g_type))
+        packed_keys = self._resolve_packed_expert_keys(sf_reader, expert_prefix)
+        if packed_keys is not None:
+            gate_up_key, down_key, num_experts = packed_keys
+            g_type = self._streaming_quant_type(
+                quant_desc_str, gate_up_key, "FLOAT"
+            ) if is_quant else "FLOAT"
+            u_type = g_type
+            d_type = self._streaming_quant_type(
+                quant_desc_str, down_key, g_type
+            ) if is_quant else "FLOAT"
         else:
-            g_type = u_type = d_type = "FLOAT"
+            gate_name, up_name, down_name = self._resolve_expert_proj_names(
+                sf_reader, expert_prefix, expert_id)
+            gate_key = f"{expert_prefix}.{expert_id}.{gate_name}.weight"
+            up_key = f"{expert_prefix}.{expert_id}.{up_name}.weight"
+            down_key = f"{expert_prefix}.{expert_id}.{down_name}.weight"
+            if is_quant:
+                g_type = self._streaming_quant_type(
+                    quant_desc_str, gate_key, "FLOAT"
+                )
+                u_type = self._streaming_quant_type(
+                    quant_desc_str, up_key, g_type
+                )
+                d_type = self._streaming_quant_type(
+                    quant_desc_str, down_key, g_type
+                )
+            else:
+                g_type = u_type = d_type = "FLOAT"
 
         # ---- gate/up/down proj: 读+反量化(CPU)→传NPU ----
-        gate_fp = self._dequant_streaming_proj(
-            sf_reader, expert_prefix, expert_id, gate_name, g_type, device, is_ct=is_ct)
-        if gate_fp is None:
-            return None
-        up_fp = self._dequant_streaming_proj(
-            sf_reader, expert_prefix, expert_id, up_name, u_type, device, is_ct=is_ct)
-        if up_fp is None:
-            del gate_fp
-            return None
-        down_fp = self._dequant_streaming_proj(
-            sf_reader, expert_prefix, expert_id, down_name, d_type, device, is_ct=is_ct)
-        if down_fp is None:
-            del gate_fp, up_fp
-            return None
+        if packed_keys is not None:
+            gate_up_fp = self._dequant_streaming_weight(
+                sf_reader, gate_up_key, g_type, device, is_ct=is_ct,
+                expert_id=expert_id, num_experts=num_experts,
+            )
+            down_fp = self._dequant_streaming_weight(
+                sf_reader, down_key, d_type, device, is_ct=is_ct,
+                expert_id=expert_id, num_experts=num_experts,
+            )
+            intermediate_dim = down_fp.shape[-1]
+            if gate_up_fp.shape[0] != 2 * intermediate_dim:
+                raise ValueError(
+                    "packed gate_up_proj shape is incompatible with down_proj: "
+                    f"{tuple(gate_up_fp.shape)} vs {tuple(down_fp.shape)}"
+                )
+            gate_fp = gate_up_fp[:intermediate_dim]
+            up_fp = gate_up_fp[intermediate_dim:]
+            del gate_up_fp
+        else:
+            gate_fp = self._dequant_streaming_proj(
+                sf_reader, expert_prefix, expert_id, gate_name, g_type,
+                device, is_ct=is_ct,
+            )
+            up_fp = self._dequant_streaming_proj(
+                sf_reader, expert_prefix, expert_id, up_name, u_type,
+                device, is_ct=is_ct,
+            )
+            down_fp = self._dequant_streaming_proj(
+                sf_reader, expert_prefix, expert_id, down_name, d_type,
+                device, is_ct=is_ct,
+            )
 
         # ---- gate_up_proj → SiLU(gate) * up → down_proj ----
         # DEBUG: print expert weight stats for first expert processed at layer 3

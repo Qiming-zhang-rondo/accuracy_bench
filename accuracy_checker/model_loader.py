@@ -609,6 +609,18 @@ class ShardWeightReader:
             self._sf_cache[fname] = safe_open(fpath, framework='pt')
         return self._sf_cache[fname]
 
+    def _resolve_key(self, key: str):
+        """Return ``(resolved_key, shard_file)`` including prefix fallback."""
+        fname = self.weight_map.get(key)
+        if fname is not None:
+            return key, fname
+        if key.startswith("model.model."):
+            alt_key = key[len("model."):]
+            fname = self.weight_map.get(alt_key)
+            if fname is not None:
+                return alt_key, fname
+        return None, None
+
     def get_tensor(self, key: str):
         """读取单个 key 的 tensor，如果 key 不在 weight_map 中返回 None
 
@@ -633,6 +645,50 @@ class ShardWeightReader:
 
         return None
 
+    def get_tensor_shape(self, key: str):
+        """Return a tensor shape from safetensors metadata without loading it."""
+        resolved_key, fname = self._resolve_key(key)
+        if fname is None:
+            return None
+        sf = self._get_sf(fname)
+        get_slice = getattr(sf, "get_slice", None)
+        if callable(get_slice):
+            return tuple(get_slice(resolved_key).get_shape())
+        return tuple(sf.get_tensor(resolved_key).shape)
+
+    def get_tensor_slice(self, key: str, index: int,
+                         expected_first_dim: int = None):
+        """Read one first-dimension slice without loading a packed tensor.
+
+        Qwen3.5/3.6 stores routed experts in large 3D tensors.  Quantization
+        metadata is sliced only when it carries the same expert dimension;
+        scalar or shared metadata is returned unchanged.
+        """
+        resolved_key, fname = self._resolve_key(key)
+        if fname is None:
+            return None
+        sf = self._get_sf(fname)
+        get_slice = getattr(sf, "get_slice", None)
+        if not callable(get_slice):
+            tensor = sf.get_tensor(resolved_key)
+            if (
+                tensor.dim() > 0
+                and 0 <= index < tensor.shape[0]
+                and (expected_first_dim is None
+                     or tensor.shape[0] == expected_first_dim)
+            ):
+                return tensor[index]
+            return tensor
+        tensor_slice = get_slice(resolved_key)
+        shape = tuple(tensor_slice.get_shape())
+        if (
+            shape
+            and 0 <= index < shape[0]
+            and (expected_first_dim is None or shape[0] == expected_first_dim)
+        ):
+            return tensor_slice[index:index + 1][0]
+        return sf.get_tensor(resolved_key)
+
     def get_keys_for_layers(self, layer_indices: List[int], model: nn.Module = None,
                             include_non_layer: bool = False) -> set:
         """返回指定层需要的所有 weight_map key
@@ -654,7 +710,13 @@ class ShardWeightReader:
         """关闭所有 safetensors 文件句柄，释放 mmap 内存"""
         for sf in self._sf_cache.values():
             try:
-                sf.close()
+                close = getattr(sf, "close", None)
+                if callable(close):
+                    close()
+                else:
+                    exit_context = getattr(sf, "__exit__", None)
+                    if callable(exit_context):
+                        exit_context(None, None, None)
             except Exception as e:
                 logger.warning(f"Failed to close safetensors file handle: {e}")
         self._sf_cache.clear()
