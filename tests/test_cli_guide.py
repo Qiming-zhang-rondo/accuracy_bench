@@ -49,6 +49,8 @@ class TestCliGuide(unittest.TestCase):
         required = {
             "refModel", "quantModel", "modelType", "visibleDevices",
             "refDevices", "quantDevices", "commandOutput", "copyCommand",
+            "modelSizeB", "perDeviceMemory", "rotationMatrix",
+            "preflightSummary", "applyRecommendation",
             "dsparkSample", "paramSearch", "paramRows",
         }
         self.assertTrue(required.issubset(self.parser.ids))
@@ -60,6 +62,19 @@ class TestCliGuide(unittest.TestCase):
     def test_special_model_recommendations_are_present(self):
         for marker in ("qwen3_6_moe", "kimi_k3", "dspark", "grouped_dual"):
             self.assertIn(marker, self.html)
+
+    def test_preflight_blocks_invalid_commands_and_recommends_cards(self):
+        for marker in (
+            "validateParameters", "copyCommand.disabled",
+            "recommendedConfig", "应用推荐", "isAbsoluteLinuxPath",
+        ):
+            self.assertIn(marker, self.html)
+
+    def test_l1_standalone_run_writes_product_report(self):
+        source = RUN_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("_write_stage_report_artifacts(args, report, mode)", source)
+        self.assertIn('"product_report.html"', source)
+        self.assertIn('"report_data.json"', source)
 
 
 if __name__ == "__main__":

@@ -140,9 +140,9 @@ python3 run_accuracy_check.py --mode l1 --model_type dspark \
 6. **L1 对 MoE router/DSA 层有已知 false-positive** (router softmax 附近 cos_sim 常偏低, 不一定是量化真正出错), 建议配 `v2_metrics` 的 `router_flip_risk` 信号交叉筛
 7. **DSpark 必须提供 verifier hidden-state 样本**: 不接受随机 hidden 或仅 prompt；`grouped_dual` 对 dense draft 无意义，使用专用 dual-device 路径
 
-> 交互式命令生成器与完整参数表见 [`cli_params_guide.html`](cli_params_guide.html)，也可运行 `python3 run_accuracy_check.py --help`
+> 交互式命令生成器与完整参数表见 [`cli_params_guide.html`](cli_params_guide.html)：页面会预检路径/设备/模式参数，并按模型规模与每卡显存推荐卡数；也可运行 `python3 run_accuracy_check.py --help`
 > Cache 机制: 默认 `./.acc_cache/`, 可 `--cache_dir` 或 `ACC_CACHE_DIR` 环境变量覆盖
-> HTML 报告: `accuracy_checker.html_report.generate_html_report(boundary_results=..., l2_results=..., model_name=..., output_path=...)`
+> HTML 报告: `l1` / `l2` / `full` 成功后都会生成 `report_data.json` 与 `product_report.html`；未指定 `--output_dir` 时，L1/L2 自动写入带时间戳的 `reports/<model>_<mode>_<time>/`
 > 默认不打印 hidden norm / MoE L3 expert 等开发上下文；需要这些诊断时追加 `--debug`
 
 ## 架构

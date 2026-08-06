@@ -300,6 +300,17 @@
       font-size: 11px;
       line-height: 1.45;
     }
+    input.invalid, select.invalid, textarea.invalid {
+      border-color: #c94d4d;
+      box-shadow: 0 0 0 3px rgba(201,77,77,.1);
+    }
+    .validation-message {
+      display: block;
+      margin-top: 5px;
+      color: #b93838;
+      font-size: 11px;
+      line-height: 1.4;
+    }
 
     .advanced {
       margin-top: 20px;
@@ -332,6 +343,45 @@
     .recommendation p {
       margin-bottom: 0;
       font-size: 13px;
+    }
+    .recommend-actions {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      margin-top: 12px;
+    }
+    .apply-recommend {
+      padding: 7px 10px;
+      color: var(--navy);
+      background: var(--mint);
+      border: 0;
+      border-radius: 7px;
+      font-size: 11px;
+      font-weight: 800;
+    }
+    .apply-recommend:hover, .apply-recommend:focus-visible {
+      background: #b2f2d5;
+      outline: none;
+    }
+    .preflight-summary {
+      padding: 10px 12px;
+      margin: 0 0 14px;
+      color: #dce8ec;
+      background: rgba(255,255,255,.06);
+      border: 1px solid rgba(255,255,255,.12);
+      border-radius: 9px;
+      font-size: 12px;
+      font-weight: 750;
+    }
+    .preflight-summary.ok {
+      color: #c8f4dc;
+      border-color: rgba(150,230,195,.38);
+      background: rgba(150,230,195,.09);
+    }
+    .preflight-summary.error {
+      color: #ffd0d0;
+      border-color: rgba(255,139,139,.4);
+      background: rgba(255,139,139,.08);
     }
 
     .status-list {
@@ -391,6 +441,11 @@
       font-weight: 800;
     }
     .copy:hover, .copy:focus-visible { background: #b2f2d5; outline: none; }
+    .copy:disabled {
+      color: #71818a;
+      background: #c2ccd0;
+      cursor: not-allowed;
+    }
     pre {
       max-height: 520px;
       margin: 0;
@@ -633,6 +688,16 @@
               <span class="hint">例如物理卡 8–11 填 <code>8,9,10,11</code>；进程内会映射为 npu:0–3。</span>
             </div>
             <div>
+              <label for="modelSizeB">模型总规模（B） <span class="optional">可选，路径可自动识别</span></label>
+              <input id="modelSizeB" type="number" min="0.1" step="0.1" autocomplete="off" placeholder="例如 35">
+              <span class="hint">MoE 填总参数量，不填时从 35B-A3B 等路径名称推断。</span>
+            </div>
+            <div>
+              <label for="perDeviceMemory">每卡可用显存（GB）</label>
+              <input id="perDeviceMemory" type="number" min="8" max="256" step="1" value="64">
+              <span class="hint">按约 80% 安全水位估算 ref/quant 两侧起步卡数。</span>
+            </div>
+            <div>
               <label for="refDevices">Ref 逻辑设备</label>
               <input id="refDevices" type="text" value="npu:0,1" autocomplete="off">
             </div>
@@ -671,6 +736,11 @@
                 <option value="float16">float16</option>
               </select>
             </div>
+            <div class="wide">
+              <label for="rotationMatrix">旋转矩阵 <span class="optional">常用参数；仅 QuaRot 等旋转量化且 R 未融合时填写</span></label>
+              <input id="rotationMatrix" type="text" autocomplete="off" placeholder="/path/to/rotation.safetensors">
+              <span class="hint">普通非旋转 W8A8 留空。若提供，ref 与 quant 必须使用同一旋转契约。</span>
+            </div>
             <div>
               <label for="cacheTopK">L2 缓存 Top-K</label>
               <input id="cacheTopK" type="number" min="0" value="5">
@@ -704,10 +774,6 @@
           <details class="advanced">
             <summary>高级参数</summary>
             <div class="advanced-body grid-2">
-              <div class="wide">
-                <label for="rotationMatrix">旋转矩阵 <span class="optional">仅 QuaRot 等旋转量化</span></label>
-                <input id="rotationMatrix" type="text" autocomplete="off" placeholder="/path/to/rotation.safetensors">
-              </div>
               <div>
                 <label for="targetLayers">L2 目标层 <span class="optional">逗号分隔</span></label>
                 <input id="targetLayers" type="text" autocomplete="off" placeholder="11,20,33">
@@ -731,7 +797,11 @@
         <div class="recommendation">
           <strong id="recommendTitle">Qwen3.6 MoE · grouped_dual</strong>
           <p id="recommendReason">MoE expert 使用流式分发；4 卡按 ref 2 卡 / quant 2 卡拆分。</p>
+          <div class="recommend-actions">
+            <button class="apply-recommend" id="applyRecommendation" type="button">应用推荐卡数</button>
+          </div>
         </div>
+        <div class="preflight-summary" id="preflightSummary">正在检查参数…</div>
         <ul class="status-list" id="statusList"></ul>
         <div class="command-wrap">
           <div class="command-head">
@@ -820,7 +890,7 @@
             <tr><td><code>--ref_devices</code></td><td>空</td><td>grouped_dual 的 ref 多卡列表，例如 npu:0,1。</td></tr>
             <tr><td><code>--quant_devices</code></td><td>空</td><td>grouped_dual 的 quant 多卡列表，例如 npu:2,3。</td></tr>
             <tr><td><code>--expert_chunk_size</code></td><td>按卡数自动</td><td>grouped_dual 每批 expert 数；通常留空。</td></tr>
-            <tr><td><code>--output_dir</code></td><td>空 / reports</td><td>报告输出目录。</td></tr>
+            <tr><td><code>--output_dir</code></td><td>自动</td><td>报告输出目录；L1/L2 留空时自动创建带时间戳目录并生成 JSON + HTML。</td></tr>
             <tr><td><code>--model_type</code></td><td>auto</td><td>支持 dense、moe、GLM、Qwen3 系列、Qwen3.6、Kimi K3 与 dspark。</td></tr>
             <tr><td><code>--dspark_sample</code></td><td>空（必需）</td><td>DSpark verifier hidden-state .pt；包含 input_ids、hidden_states、loss_mask 等。</td></tr>
             <tr><td><code>--dspark_seed</code></td><td>0</td><td>DSpark anchor/noise 确定性采样 seed。</td></tr>
@@ -849,7 +919,8 @@
 
       var ids = [
         "refModel", "quantModel", "mode", "modelType", "visibleDevices",
-        "refDevices", "quantDevices", "compareMode", "layersPerShard",
+        "modelSizeB", "perDeviceMemory", "refDevices", "quantDevices",
+        "compareMode", "layersPerShard",
         "quantMethod", "dtype", "cacheTopK", "outputDir", "prompt",
         "dsparkSample", "dsparkSeed", "dsparkAnchors", "rotationMatrix",
         "targetLayers", "expertChunkSize", "frameworkBadOutput"
@@ -860,8 +931,12 @@
       var statusList = document.getElementById("statusList");
       var recommendTitle = document.getElementById("recommendTitle");
       var recommendReason = document.getElementById("recommendReason");
+      var preflightSummary = document.getElementById("preflightSummary");
+      var copyCommand = document.getElementById("copyCommand");
+      var applyRecommendation = document.getElementById("applyRecommendation");
       var dsparkFields = document.getElementById("dsparkFields");
       var promptField = document.getElementById("promptField");
+      var recommendedCardCount = 4;
 
       var modelLabels = {
         auto: "自动识别",
@@ -900,6 +975,45 @@
 
       function isMoe(type) {
         return ["moe", "glm_moe_dsa", "qwen3_moe", "qwen3_5_moe", "qwen3_6", "qwen3_6_moe", "kimi_k3"].indexOf(type) !== -1;
+      }
+
+      function inferredModelSizeB() {
+        var manual = Number(el.modelSizeB.value);
+        if (el.modelSizeB.value.trim() && Number.isFinite(manual) && manual > 0) {
+          return { value: manual, source: "手动填写" };
+        }
+        var matches = pathText().match(/\d+(?:\.\d+)?\s*b(?=[\-_.\/]|$)/g) || [];
+        var sizes = matches.map(function (text) { return Number.parseFloat(text); })
+          .filter(function (value) { return Number.isFinite(value) && value > 0; });
+        if (!sizes.length) return null;
+        return { value: Math.max.apply(Math, sizes), source: "模型路径" };
+      }
+
+      function evenAtLeastTwo(value) {
+        var rounded = Math.max(2, Math.ceil(value));
+        return rounded % 2 === 0 ? rounded : rounded + 1;
+      }
+
+      function recommendedConfig(type) {
+        var memory = Number(el.perDeviceMemory.value) || 64;
+        var sizeInfo = inferredModelSizeB();
+        var cards;
+        if (type === "dspark") {
+          cards = 2;
+        } else if (isMoe(type)) {
+          var familyBase = (type === "kimi_k3" || type === "glm_moe_dsa") ? 8 : 4;
+          if (sizeInfo && sizeInfo.value > 80) familyBase = Math.max(familyBase, 8);
+          cards = evenAtLeastTwo(familyBase * 64 / memory);
+        } else if (sizeInfo) {
+          var usableMemory = memory * 0.8;
+          var refCards = Math.ceil(sizeInfo.value * 2.2 / usableMemory);
+          cards = evenAtLeastTwo(refCards * 2);
+        } else {
+          cards = evenAtLeastTwo(2 * 64 / memory);
+        }
+        cards = Math.min(cards, 32);
+        var layers = isMoe(type) ? (memory < 48 ? 1 : 2) : (memory < 32 ? 1 : 2);
+        return { cards: cards, layers: layers, memory: memory, sizeInfo: sizeInfo };
       }
 
       function visibleIds() {
@@ -946,23 +1060,154 @@
         statusList.appendChild(li);
       }
 
-      function renderStatus(type, compare, mode) {
-        statusList.innerHTML = "";
+      function resetValidationUi() {
+        document.querySelectorAll(".invalid").forEach(function (node) {
+          node.classList.remove("invalid");
+          node.removeAttribute("aria-invalid");
+        });
+        document.querySelectorAll(".validation-message").forEach(function (node) {
+          node.remove();
+        });
+      }
+
+      function addIssue(list, field, message) {
+        list.push({ field: field, message: message });
+        var node = el[field];
+        if (!node || node.classList.contains("invalid")) return;
+        node.classList.add("invalid");
+        node.setAttribute("aria-invalid", "true");
+        var hint = document.createElement("span");
+        hint.className = "validation-message";
+        hint.textContent = message;
+        node.insertAdjacentElement("afterend", hint);
+      }
+
+      function isAbsoluteLinuxPath(value) {
+        return /^\/(?!\s*$)[^\u0000\r\n<>]*$/.test(value);
+      }
+
+      function parseLogicalDevices(value) {
+        if (!/^npu:\d+(?:,\d+)*$/.test(value)) return null;
+        return value.slice(4).split(",").map(function (item) { return Number(item); });
+      }
+
+      function hasDuplicates(values) {
+        return new Set(values).size !== values.length;
+      }
+
+      function validateParameters(type, compare, mode, recommendation) {
+        resetValidationUi();
+        var errors = [];
+        var warnings = [];
         var ref = el.refModel.value.trim();
         var quant = el.quantModel.value.trim();
-        var count = visibleIds().length;
-        var refDs = /dspark|speculator/i.test(ref);
-        var quantDs = /dspark|speculator/i.test(quant);
+        var refRequired = ["l1", "l2", "full", "screening"].indexOf(mode) !== -1 || type === "dspark";
 
-        addStatus(ref && quant ? "ref / quant 路径已填写" : "请填写 ref 与 quant 路径；当前命令使用占位符", ref && quant ? "ok" : "");
-        addStatus(count >= 2 ? count + " 张物理卡将映射为逻辑 npu:0–" + (count - 1) : "至少填写 2 张物理卡", count >= 2 ? "ok" : "error");
-        if (count % 2 !== 0) addStatus("可见卡数为奇数，ref/quant 无法等分", "error");
-        if (type === "dspark" && refDs !== quantDs) addStatus("DSpark 要求 ref 和 quant 都是 standalone draft checkpoint", "error");
-        if (type === "dspark") addStatus("DSpark 已固定为 l1 + dual + dequantize，并要求 verifier sample", "ok");
-        if (isMoe(type) && type !== "dspark") addStatus("MoE 使用 grouped_dual 流式 expert，默认不打印 MOE L3 调试上下文", "ok");
-        if (mode === "l2" && !el.targetLayers.value.trim()) addStatus("L2 需要 target_layers，或先运行 L1 生成 cache", "error");
-        if (el.rotationMatrix.value.trim()) addStatus("已加入 rotation_matrix；确认 ref/quant 使用同一旋转契约", "ok");
-        else if (mode === "l1" || mode === "full") addStatus("未加入 rotation_matrix；仅适用于非旋转量化或 R 已融合的 checkpoint", "");
+        if (refRequired && !ref) addIssue(errors, "refModel", "该模式必须填写 Ref 模型绝对路径");
+        if (ref && !isAbsoluteLinuxPath(ref)) addIssue(errors, "refModel", "必须是以 / 开头且不含换行或占位符的 Linux 路径");
+        if (!quant) addIssue(errors, "quantModel", "必须填写 Quant 模型绝对路径");
+        if (quant && !isAbsoluteLinuxPath(quant)) addIssue(errors, "quantModel", "必须是以 / 开头且不含换行或占位符的 Linux 路径");
+        if (ref && quant && ref === quant) addIssue(errors, "quantModel", "Ref 与 Quant 不能指向同一个 checkpoint");
+
+        var physicalText = el.visibleDevices.value.trim();
+        var physical = /^\d+(?:,\d+)*$/.test(physicalText)
+          ? physicalText.split(",").map(function (item) { return Number(item); }) : null;
+        if (!physical) addIssue(errors, "visibleDevices", "格式应为逗号分隔的物理卡号，例如 8,9,10,11");
+        if (physical && physical.length < 2) addIssue(errors, "visibleDevices", "ref/quant 对比至少需要 2 张物理卡");
+        if (physical && hasDuplicates(physical)) addIssue(errors, "visibleDevices", "物理卡号不能重复");
+        if (physical && compare === "grouped_dual" && physical.length % 2 !== 0) {
+          addIssue(errors, "visibleDevices", "grouped_dual 要求偶数张卡，供 ref/quant 等分");
+        }
+
+        var refLogical = parseLogicalDevices(el.refDevices.value.trim());
+        var quantLogical = parseLogicalDevices(el.quantDevices.value.trim());
+        if (mode !== "screening") {
+          if (!refLogical) addIssue(errors, "refDevices", "格式应为 npu:0,1");
+          if (!quantLogical) addIssue(errors, "quantDevices", "格式应为 npu:2,3");
+          if (refLogical && hasDuplicates(refLogical)) addIssue(errors, "refDevices", "Ref 逻辑设备不能重复");
+          if (quantLogical && hasDuplicates(quantLogical)) addIssue(errors, "quantDevices", "Quant 逻辑设备不能重复");
+          if (refLogical && quantLogical && refLogical.some(function (id) { return quantLogical.indexOf(id) !== -1; })) {
+            addIssue(errors, "quantDevices", "Ref 与 Quant 逻辑设备不能重叠");
+          }
+          if (physical && refLogical && refLogical.some(function (id) { return id >= physical.length; })) {
+            addIssue(errors, "refDevices", "逻辑设备编号超出可见物理卡映射范围");
+          }
+          if (physical && quantLogical && quantLogical.some(function (id) { return id >= physical.length; })) {
+            addIssue(errors, "quantDevices", "逻辑设备编号超出可见物理卡映射范围");
+          }
+          if (compare === "grouped_dual" && refLogical && quantLogical && refLogical.length !== quantLogical.length) {
+            addIssue(errors, "quantDevices", "grouped_dual 的 ref/quant 设备数量必须相同");
+          }
+        }
+
+        var memory = Number(el.perDeviceMemory.value);
+        if (!Number.isFinite(memory) || memory < 8 || memory > 256) {
+          addIssue(errors, "perDeviceMemory", "每卡可用显存必须在 8–256 GB 之间");
+        }
+        if (el.modelSizeB.value.trim()) {
+          var size = Number(el.modelSizeB.value);
+          if (!Number.isFinite(size) || size <= 0) addIssue(errors, "modelSizeB", "模型规模必须是大于 0 的数字");
+        }
+        if (!/^\d+$/.test(el.layersPerShard.value) || Number(el.layersPerShard.value) < 1) {
+          addIssue(errors, "layersPerShard", "layers_per_shard 必须是大于 0 的整数");
+        }
+        if (!/^\d+$/.test(el.cacheTopK.value) || Number(el.cacheTopK.value) < 0) {
+          addIssue(errors, "cacheTopK", "cache_top_k 必须是非负整数");
+        }
+        if (el.expertChunkSize.value && (!/^\d+$/.test(el.expertChunkSize.value) || Number(el.expertChunkSize.value) < 1)) {
+          addIssue(errors, "expertChunkSize", "expert_chunk_size 必须是大于 0 的整数");
+        }
+        if (mode === "l2" && !/^\d+(?:[\s,]+\d+)*$/.test(el.targetLayers.value.trim())) {
+          addIssue(errors, "targetLayers", "L2 目标层必填，例如 27 或 27,31,38");
+        }
+        if (type === "dspark") {
+          var sample = el.dsparkSample.value.trim();
+          if (!sample || !isAbsoluteLinuxPath(sample) || !/\.pt$/i.test(sample)) {
+            addIssue(errors, "dsparkSample", "DSpark 样本必须是绝对路径下的 .pt 文件");
+          }
+        }
+        var rotation = el.rotationMatrix.value.trim();
+        if (rotation && !isAbsoluteLinuxPath(rotation)) {
+          addIssue(errors, "rotationMatrix", "旋转矩阵必须是以 / 开头的 Linux 绝对路径");
+        }
+        if (rotation && ["l1", "l2", "full"].indexOf(mode) === -1) {
+          warnings.push("当前模式不会使用 rotation_matrix");
+        }
+        if (mode !== "screening" && type !== "dspark" && !el.prompt.value.trim()) {
+          addIssue(errors, "prompt", "该模式需要非空 Prompt");
+        }
+        var outputDir = el.outputDir.value.trim();
+        if (outputDir && (/^[\-]/.test(outputDir) || /[\u0000\r\n<>]/.test(outputDir))) {
+          addIssue(errors, "outputDir", "输出目录不能以 - 开头，也不能包含换行或占位符");
+        }
+        if (physical && physical.length < recommendation.cards) {
+          warnings.push("当前 " + physical.length + " 卡低于推荐的 " + recommendation.cards + " 卡，可能 OOM 或明显变慢");
+        }
+        if (type === "auto") warnings.push("无法从路径识别模型族；建议手动选择 model_type");
+        return { errors: errors, warnings: warnings };
+      }
+
+      function renderStatus(type, compare, mode, validation, recommendation) {
+        statusList.innerHTML = "";
+        validation.errors.forEach(function (item) { addStatus(item.message, "error"); });
+        validation.warnings.forEach(function (message) { addStatus(message, ""); });
+        if (!validation.errors.length) addStatus("参数格式、路径与设备映射预检通过", "ok");
+        addStatus("推荐 " + recommendation.cards + " 张物理卡，layers_per_shard=" + recommendation.layers, "ok");
+        if (type === "dspark") addStatus("DSpark 已固定为 l1 + dual + dequantize", "ok");
+        if (isMoe(type) && type !== "dspark") addStatus("MoE 使用 grouped_dual 流式 expert", "ok");
+        if (el.rotationMatrix.value.trim()) addStatus("已加入 rotation_matrix；请确认 ref/quant 旋转契约一致", "ok");
+        else if (["l1", "l2", "full"].indexOf(mode) !== -1) addStatus("未使用旋转矩阵：适用于非旋转量化或 R 已融合 checkpoint", "");
+        if (["l1", "l2", "full"].indexOf(mode) !== -1) {
+          addStatus("运行成功后自动生成 report_data.json 与 product_report.html", "ok");
+        }
+
+        var valid = validation.errors.length === 0;
+        preflightSummary.textContent = valid
+          ? "预检通过 · 命令可以复制运行"
+          : "预检失败 · " + validation.errors.length + " 项必须修正";
+        preflightSummary.className = "preflight-summary " + (valid ? "ok" : "error");
+        copyCommand.disabled = !valid;
+        copyCommand.textContent = valid ? "复制命令" : "修正后可复制";
       }
 
       function line(flag, value) {
@@ -980,6 +1225,8 @@
         var refPath = shellQuote(el.refModel.value, "<REF_MODEL_PATH>");
         var quantPath = shellQuote(el.quantModel.value, "<QUANT_MODEL_PATH>");
         var visible = el.visibleDevices.value.trim() || "0,1";
+        var recommendation = recommendedConfig(type);
+        recommendedCardCount = recommendation.cards;
 
         el.mode.disabled = dspark;
         el.compareMode.disabled = dspark;
@@ -1013,6 +1260,7 @@
           args.push(line("--cache_top_k", el.cacheTopK.value || "0"));
           args.push(line("--quant_method", quantMethod));
           args.push(line("--dtype", el.dtype.value));
+          args.push(line("--per_device_memory", el.perDeviceMemory.value || "64"));
           if (el.expertChunkSize.value) args.push(line("--expert_chunk_size", el.expertChunkSize.value));
         } else if (mode === "l2") {
           args.push(line("--ref_devices", el.refDevices.value.trim() || "npu:0"));
@@ -1049,24 +1297,34 @@
           commands.push(value + suffix);
         });
 
-        output.textContent = commands.join("\n");
-
-        var count = visibleIds().length;
-        recommendTitle.textContent = (modelLabels[type] || type) + " · " + compare;
+        var sizeText = recommendation.sizeInfo
+          ? recommendation.sizeInfo.value + "B（" + recommendation.sizeInfo.source + "识别）"
+          : "未识别模型规模";
+        recommendTitle.textContent = (modelLabels[type] || type) + " · 推荐 " + recommendation.cards + " 卡";
+        applyRecommendation.textContent = "应用推荐 " + recommendation.cards + " 卡";
         if (dspark) {
           recommendReason.textContent = "standalone draft 使用专用双设备 L1；ref/quant 参数契约会在加载权重前校验。";
         } else if (isMoe(type)) {
-          recommendReason.textContent = "MoE expert 使用流式分发；" + count + " 卡按 ref / quant 两侧拆分，4 卡建议 layers_per_shard=2 起步。";
+          recommendReason.textContent = sizeText + "，按每卡 " + recommendation.memory + "GB 和流式 expert 估算；ref/quant 两侧等分，layers_per_shard=" + recommendation.layers + " 起步。";
         } else {
-          recommendReason.textContent = "Dense 模型使用 dual 分片；ref 与 quant 各使用一个主设备。";
+          recommendReason.textContent = sizeText + "，按每卡 " + recommendation.memory + "GB、80% 安全水位估算 BF16 ref 侧，再为 quant 侧预留同等卡数。";
         }
-        renderStatus(type, compare, mode);
+        var validation = validateParameters(type, compare, mode, recommendation);
+        renderStatus(type, compare, mode, validation, recommendation);
+        if (validation.errors.length) {
+          output.textContent = "# 参数预检未通过\n" + validation.errors.map(function (item, index) {
+            return "# " + (index + 1) + ". " + item.message;
+          }).join("\n");
+          return;
+        }
+        output.textContent = commands.join("\n");
       }
 
       function applyPreset(name) {
         if (name === "qwen36") {
           el.mode.value = "l1";
           el.modelType.value = "qwen3_6_moe";
+          el.modelSizeB.value = "35";
           el.visibleDevices.value = "8,9,10,11";
           el.layersPerShard.value = "2";
           el.cacheTopK.value = "5";
@@ -1074,18 +1332,21 @@
         } else if (name === "kimi") {
           el.mode.value = "l1";
           el.modelType.value = "kimi_k3";
+          el.modelSizeB.value = "";
           el.visibleDevices.value = "0,1,2,3,4,5,6,7";
           el.layersPerShard.value = "2";
           el.cacheTopK.value = "1";
         } else if (name === "dspark") {
           el.mode.value = "l1";
           el.modelType.value = "dspark";
+          el.modelSizeB.value = "";
           el.visibleDevices.value = "0,1";
           el.layersPerShard.value = "1";
           el.cacheTopK.value = "0";
         } else if (name === "boundary") {
           el.mode.value = "boundary";
           el.modelType.value = "auto";
+          el.modelSizeB.value = "";
           el.visibleDevices.value = "0,1";
         }
         syncDevices();
@@ -1104,7 +1365,21 @@
         button.addEventListener("click", function () { applyPreset(button.getAttribute("data-preset")); });
       });
 
-      document.getElementById("copyCommand").addEventListener("click", function () {
+      applyRecommendation.addEventListener("click", function () {
+        var current = visibleIds();
+        var start = current.length && /^\d+$/.test(current[0]) ? Number(current[0]) : 0;
+        var physical = [];
+        var index;
+        for (index = 0; index < recommendedCardCount; index += 1) {
+          physical.push(start + index);
+        }
+        el.visibleDevices.value = physical.join(",");
+        el.layersPerShard.value = String(recommendedConfig(inferModelType()).layers);
+        syncDevices();
+        buildCommand();
+      });
+
+      copyCommand.addEventListener("click", function () {
         var button = this;
         var text = output.textContent;
         var done = function () {

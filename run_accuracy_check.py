@@ -15,8 +15,10 @@
 """
 
 import argparse
+from datetime import datetime
 import json
 import os
+import re
 import sys
 
 import torch
@@ -544,6 +546,73 @@ def _mode_l1(args):
     return run_hf_l1(args, ref_device, target_device, dtype)
 
 
+def _default_stage_report_dir(args, mode):
+    """Create a non-overwriting default directory for L1/L2 HTML artifacts."""
+    model_path = args.quant_model or args.ref_model or "model"
+    model_name = os.path.basename(os.path.normpath(model_path)) or "model"
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", model_name).strip("._")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join("reports", f"{safe_name or 'model'}_{mode}_{stamp}")
+
+
+def _write_stage_report_artifacts(args, report, mode):
+    """Persist text, ReportData JSON and product HTML for standalone L1/L2."""
+    if report.l1 is None and not report.l2_reports:
+        return None
+
+    from accuracy_checker import (
+        assemble_report,
+        generate_index_html,
+        generate_product_html_report,
+    )
+
+    out_dir = args.output_dir or _default_stage_report_dir(args, mode)
+    os.makedirs(out_dir, exist_ok=True)
+
+    summary_text = report.summary()
+    text_path = os.path.join(out_dir, "alignment_report.txt")
+    with open(text_path, "w", encoding="utf-8") as f:
+        f.write(summary_text)
+    if report.l1 is not None:
+        with open(os.path.join(out_dir, "l1_report.txt"), "w", encoding="utf-8") as f:
+            f.write(report.l1.summary())
+
+    device_mode = (
+        getattr(args, "ref_devices", None)
+        or getattr(args, "ref_device", None)
+        or getattr(args, "devices", None)
+        or getattr(args, "device", "")
+    )
+    report_data = assemble_report(
+        l1_report=report.l1,
+        l2_results=report.l2_reports,
+        model_name=args.model_name or os.path.basename(args.quant_model or "model"),
+        ref_model_path=args.ref_model or "",
+        quant_model_path=args.quant_model or "",
+        quant_format=args.quant_format or "",
+        device_mode=str(device_mode or ""),
+        prompt=args.prompt or "",
+    )
+    json_path = os.path.join(out_dir, "report_data.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        f.write(report_data.to_json(indent=2))
+    html_path = generate_product_html_report(
+        report_data, output_path=os.path.join(out_dir, "product_report.html")
+    )
+
+    reports_root = os.path.dirname(out_dir) or "reports"
+    try:
+        index_path = generate_index_html(reports_root)
+        logger.info(f"  报告索引: {index_path}")
+    except Exception as exc:  # noqa: BLE001
+        logger.info(f"  报告索引生成跳过: {exc}")
+
+    logger.info(f"\n  文本报告: {text_path}")
+    logger.info(f"  JSON 报告: {json_path}")
+    logger.info(f"  HTML 报告: {html_path}")
+    return html_path
+
+
 def _mode_l2(args, l1_report=None):
     target_layers = _parse_target_layers(args)
     if target_layers is None and l1_report is not None and l1_report.first_bad_block:
@@ -1025,15 +1094,7 @@ def main():
 
     summary_text = report.summary()
     logger.info(summary_text)
-    if args.output_dir:
-        os.makedirs(args.output_dir, exist_ok=True)
-        report_path = os.path.join(args.output_dir, "alignment_report.txt")
-        with open(report_path, "w") as f:
-            f.write(summary_text)
-        logger.info(f"\n  报告已保存: {report_path}")
-        if report.l1 is not None:
-            with open(os.path.join(args.output_dir, "l1_report.txt"), "w") as f:
-                f.write(report.l1.summary())
+    _write_stage_report_artifacts(args, report, mode)
 
 
 if __name__ == "__main__":
