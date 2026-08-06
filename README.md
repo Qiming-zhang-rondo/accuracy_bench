@@ -36,6 +36,34 @@ python3 run_accuracy_check.py --l2 --target_layers 11 20 33 \
   --rotation_matrix <ROT> [--mla_fine]
 ```
 
+## 定界使用实例
+
+定界回答的是“坏输出来自量化权重，还是来自部署框架”。`--quant_model` 运行 Transformers 反量化基线；提供 `--ref_model` 后还会增加 BF16/FP16 基线，用于区分量化回归与 base 模型本身行为。
+
+```bash
+# 1. 本地复现：ref + 量化模型 + Transformers generate
+ASCEND_RT_VISIBLE_DEVICES=0,1 \
+python3 run_accuracy_check.py --mode boundary \
+  --ref_model <BF16_REF> --quant_model <QUANT_MODEL> \
+  --devices npu:0,1 --dtype bfloat16 \
+  --prompt "请计算 17 * 23，并只输出结果" --max_new_tokens 64
+
+# 2. 加入部署框架坏输出：判断 vLLM/MindIE 与 Transformers 是否同样复现
+python3 run_accuracy_check.py --mode boundary \
+  --ref_model <BF16_REF> --quant_model <QUANT_MODEL> \
+  --devices npu:0,1 --framework_name vllm-ascend \
+  --framework_bad_output "<从部署服务复制的完整坏输出>" \
+  --prompt "<触发该坏输出的原始 prompt>" --max_new_tokens 128
+
+# 3. Chat 模型：messages 必须是合法 JSON，工具会调用 apply_chat_template
+python3 run_accuracy_check.py --mode boundary \
+  --ref_model <BF16_REF> --quant_model <QUANT_MODEL> --devices npu:0,1 \
+  --messages '[{"role":"user","content":"比较 0.1 和 0.01"}]' \
+  --thinking none --max_new_tokens 128
+```
+
+结果含义：`WEIGHT_OR_QUANTIZATION` = Transformers 量化基线也复现、ref 正常；`INFERENCE_FRAMEWORK` = Transformers 正常、部署框架复现；`BOTH` = ref/量化/框架均复现；`INCONCLUSIVE` = 输出过短或证据不足；`INVALID_RUN` = 某次模型运行未完成。没有 `--framework_bad_output` 时只能验证本地 ref/quant，不能单独证明部署框架有问题。
+
 ## 能力
 
 | 能力 | 干什么 | 状态 |
@@ -60,12 +88,46 @@ python3 run_accuracy_check.py --l2 --target_layers 11 20 33 \
 
 ## 支持范围
 
-- **模型**: GLM-5.1 (MLA + DSA + MoE, QuaRot) / Qwen3 / Qwen3MoE / Qwen3VL / Qwen3.5 MoE / **Qwen3.6** / **Kimi K3**
+- **模型**: GLM-5.1 (MLA + DSA + MoE, QuaRot) / Qwen3 / Qwen3MoE / Qwen3VL / Qwen3.5 MoE / **Qwen3.6** / **Kimi K3** / **DeepSpec、Speculators DSpark standalone draft（专用 L1）**
   > Kimi K3 已支持 text backbone 的 KDA/MLA、Stable LatentMoE、AttnRes、SiTU 和嵌套 MXFP4 配置；官方模型代码依赖 `fla-core`，Ascend 环境仍需提供可在 NPU 上运行的 KDA kernel/backend。
   > Kimi K3 官方 896-expert `ModuleList` 必须用 `--compare_mode grouped_dual` 跑 L1；MoE 层 L2 暂不物化全部专家，会明确拒绝并提示使用流式 replay/内部 packed 模型。该边界待内网 NPU 回归后继续收敛。
   > GLM-5.2 (head_dim=192, indexer_types) 需按 `reference_glm_version_identification` 自行校验结构和子图兼容性
 - **量化格式**: W8A8 / W4A8 / W4A4 / MXFP8 / MXFP4 / compressed-tensors (自动识别)
 - **覆盖**: 多模型族 × 6 量化格式 × 多个已验证 bad case (GLM-5.1 W4A8 GT HIT layer 77 o_proj；Kimi K3/Qwen3.6 待内网 NPU 回归)
+
+### DSpark：参数对齐与使用边界
+
+DSpark 是 speculative decoding 的 draft/speculator，不是可独立 `generate` 的目标模型。acc_bench 会在加载权重前强校验 ref/quant 的 `block_size`、`num_anchors`（若配置固定）、draft 层数、目标 hidden 层 ID/顺序、hidden/vocab size、attention heads/head_dim、FFN、RMSNorm、RoPE、mask token、verifier 模型、Markov head、confidence head 和 `sample_from_anchor`；任何一项不一致都会终止，避免比较两套不同 draft 契约。
+
+支持两种 standalone checkpoint 格式：
+
+- DeepSpec 官方格式：`Qwen3DSparkModel` / `Gemma4DSparkModel`。官方仓库当前不是 pip package：clone `deepseek-ai/DeepSpec`、安装其 `requirements.txt`，并把仓库根目录加入 `PYTHONPATH`
+- Speculators 标准格式：`DSparkDraftModel` / `speculators_model_type=dspark`，安装 `pip install speculators`。其 `config.json` 中 `speculators_config.verifier.name_or_path` 必须在内网可解析；draft checkpoint 通常不重复保存 embedding/LM head，工具会按官方加载路径从 verifier 补齐
+
+`K3DSparkModel`（例如 Inferact/Kimi-K3-DSpark）、带 `_torchspec_version` 的 TorchSpec checkpoint，以及仅靠 `auto_map` 加载的 SpecForge checkpoint 会被识别，但不会被误当成上述两种格式运行。它们的 forward/runtime 契约不同：Kimi K3 原生格式依赖 vLLM MLA DSpark runtime，且 `block_size` 不在 checkpoint 中，而由部署参数 `speculative_config.num_speculative_tokens` 提供。acc_bench 当前会明确拒绝这类 standalone L1；部署定界请传 verifier/目标模型并提供 `--framework_bad_output`。截至本版本，vLLM Ascend 的 DSpark 仍处于 RFC/开发状态，不能把 CUDA/AMD 上可运行直接等同于 NPU 已可运行。
+
+先用对应 verifier/目标模型导出一条 `.pt` 样本。必需字段为 `input_ids`、`hidden_states`（别名 `target_hidden_states`）和 `loss_mask`；Speculators 格式还必须包含 `verifier_last_hidden_states`。`hidden_states` 可为 `[B,S,N,H]` 或 `[B,S,N*H]`，其中 `N` 必须等于配置中的目标层数量。
+
+```python
+torch.save({
+    "input_ids": input_ids,                       # [B, S]
+    "hidden_states": auxiliary_hidden_states,    # [B, S, N, H] 或 [B, S, N*H]
+    "loss_mask": loss_mask,                      # [B, S]
+    "verifier_last_hidden_states": last_hidden,  # [B, S, H], Speculators 必需
+    "document_ids": document_ids,                # 可选；缺省按单文档处理
+}, "dspark_sample.pt")
+```
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1 \
+python3 run_accuracy_check.py --mode l1 --model_type dspark \
+  --ref_model <BF16_DSPARK_DRAFT> --quant_model <QUANT_DSPARK_DRAFT> \
+  --dspark_sample dspark_sample.pt --dspark_seed 0 --dspark_max_anchors 8 \
+  --ref_device npu:0 --quant_device npu:1 \
+  --compare_mode dual --quant_method dequantize --dtype bfloat16
+```
+
+`--dspark_max_anchors` 控制单次诊断的显存峰值，工具还会按样本有效 anchor 数和 checkpoint 上限自动下调。当前边界：standalone DSpark 支持 draft backbone、Markov head、confidence head 和 draft logits 的 L1 对齐；不支持普通 CausalLM L2、prompt-only、`full`/`boundary` 或 `fake_quant`。对“部署 DSpark 后是否仍有坏输出”做定界时，`--quant_model` 应传 verifier/目标模型（或可独立生成的融合 checkpoint），并把 DSpark 部署输出作为 `--framework_bad_output`；不要把 standalone draft 当成生成模型。
 
 ## 使用约束
 
@@ -76,6 +138,7 @@ python3 run_accuracy_check.py --l2 --target_layers 11 20 33 \
 4. **MoE 强烈推荐 `grouped_dual`**: 8 卡并行 expert chunk, L1 从 70min → 7min (10x)；Kimi K3 为必选
 5. **`dtype`** 仅 `bfloat16`/`float16`; NPU 推荐 `bfloat16` (Cube 原生), `float16` 注意激活溢出; ref 与 quant 必须一致; 模型自动 `eval()`
 6. **L1 对 MoE router/DSA 层有已知 false-positive** (router softmax 附近 cos_sim 常偏低, 不一定是量化真正出错), 建议配 `v2_metrics` 的 `router_flip_risk` 信号交叉筛
+7. **DSpark 必须提供 verifier hidden-state 样本**: 不接受随机 hidden 或仅 prompt；`grouped_dual` 对 dense draft 无意义，使用专用 dual-device 路径
 
 > 详细 CLI 参数见 `cli_params_guide.html` 或 `python3 run_accuracy_check.py --help`
 > Cache 机制: 默认 `./.acc_cache/`, 可 `--cache_dir` 或 `ACC_CACHE_DIR` 环境变量覆盖
@@ -87,6 +150,7 @@ python3 run_accuracy_check.py --l2 --target_layers 11 20 33 \
 run_accuracy_check.py (7 modes: screening/boundary/l1/l2/full/report/inference)
 ├── L1: ShardedBlockComparator (layer1_block_compare.py)
 │   ├── model_loader.py — 分片加载 / 3D expert / 反量化
+│   ├── dspark.py — draft 参数契约 / verifier cache / 专用 L1
 │   ├── *_fake_quant.py — MXFP8/MXFP4/INT4 激活伪量化
 │   └── model_structure.py — 统一结构/能力探测（含多模态 wrapper、Kimi K3）
 ├── 定界: inference_check.py — NPU 加速反量化 → generate → 重复检测
@@ -103,7 +167,6 @@ run_accuracy_check.py (7 modes: screening/boundary/l1/l2/full/report/inference)
 
 - **L0 完整性校验**: 未合入 (路标)
 - **Custom 模型** (DeepSeek V3.2/V4): 未合入 (路标)
-- **`--boundary` CLI**: 占位, 通过 `scripts/glm5_inference_check.py` 或 Python API `from accuracy_checker.inference_check import hf_inference_check` 调用
 - **多轮 generate N tokens 对齐**: 未支持 (路标)
 
 > 详见 `docs/roadmap.md` 和 `docs/capability_gap.md`

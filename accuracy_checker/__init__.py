@@ -24,6 +24,11 @@ from .utils import (
     clear_device_cache,
 )
 from .model_structure import ModelComponents, get_model_components, get_text_config
+from .dspark import (
+    DSparkContract, DSparkSample, DSparkComparator,
+    is_dspark_checkpoint, load_dspark_contract, validate_dspark_pair,
+    load_dspark_sample,
+)
 
 # ---- 报告 schema (standalone) ----
 from .report_schema import (
@@ -83,6 +88,9 @@ __all__ = [
     "get_decoder_layers", "get_embed_module", "get_norm_module", "get_lm_head_module",
     "get_num_layers",
     "ModelComponents", "get_model_components", "get_text_config",
+    "DSparkContract", "DSparkSample", "DSparkComparator",
+    "is_dspark_checkpoint", "load_dspark_contract", "validate_dspark_pair",
+    "load_dspark_sample",
     "auto_device", "parse_dtype", "clear_device_cache",
     # 报告 schema
     "ReportData", "OverviewData", "L1LayerData", "L2LayerData", "SubgraphData",

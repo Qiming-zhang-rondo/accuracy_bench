@@ -118,11 +118,21 @@ def parse_args():
                         choices=["auto", "dense", "moe",
                                  "glm_mla", "glm_moe_dsa",
                                  "qwen3", "qwen3_moe", "qwen3_5_moe", "qwen3_vl",
-                                 "qwen3_6", "qwen3_6_moe", "kimi_k3"],
+                                 "qwen3_6", "qwen3_6_moe", "kimi_k3", "dspark"],
                         help="L2: 模型类型 (默认 auto 自动检测; 偶尔需手动覆盖; "
                              "qwen3=Qwen3/Qwen2, qwen3_moe=Qwen3 MoE, "
                              "qwen3_5_moe=Qwen3.5/3.6 official model_type, "
-                             "qwen3_6=Qwen3.6 alias, kimi_k3=Kimi K3)")
+                             "qwen3_6=Qwen3.6 alias, kimi_k3=Kimi K3, "
+                             "dspark=standalone DSpark draft)")
+    parser.add_argument("--dspark_sample", type=str, default=None,
+                        help="[DSpark L1] verifier hidden-state .pt sample; required fields: "
+                             "input_ids, hidden_states/target_hidden_states, loss_mask; "
+                             "Speculators format additionally needs verifier_last_hidden_states")
+    parser.add_argument("--dspark_seed", type=int, default=0,
+                        help="[DSpark L1] deterministic anchor/noise sampling seed")
+    parser.add_argument("--dspark_max_anchors", type=int, default=8,
+                        help="[DSpark L1] maximum verifier anchors per sample (default 8; "
+                             "automatically capped by valid sample anchors/config)")
 
     # ---- full/boundary 模式专用 ----
     parser.add_argument("--devices", type=str, default=None,
@@ -256,6 +266,42 @@ def _resolve_devices(args):
 # ===========================================================================
 
 def run_hf_l1(args, ref_device, target_device, dtype):
+    from accuracy_checker.dspark import is_dspark_checkpoint
+
+    ref_is_dspark = is_dspark_checkpoint(args.ref_model)
+    quant_is_dspark = is_dspark_checkpoint(args.quant_model)
+    explicit_dspark = getattr(args, 'model_type', 'auto') == 'dspark'
+    if ref_is_dspark or quant_is_dspark or explicit_dspark:
+        if not (ref_is_dspark and quant_is_dspark):
+            raise ValueError(
+                "DSpark L1 requires both --ref_model and --quant_model to be "
+                "standalone DSpark checkpoints"
+            )
+        if not args.dspark_sample:
+            raise ValueError(
+                "DSpark is a draft model and cannot run from prompt text alone; "
+                "provide --dspark_sample <verifier_hidden_states.pt>"
+            )
+        if getattr(args, 'compare_mode', 'dual') != 'dual':
+            logger.warning(
+                "DSpark draft is dense and uses its dedicated dual-device path; "
+                "--compare_mode grouped_dual is ignored"
+            )
+        from accuracy_checker.dspark import DSparkComparator
+        comparator = DSparkComparator(
+            ref_model_path=args.ref_model,
+            quant_model_path=args.quant_model,
+            sample_path=args.dspark_sample,
+            ref_device=ref_device,
+            quant_device=target_device,
+            dtype=dtype,
+            quant_method=args.quant_method,
+            seed=args.dspark_seed,
+            max_anchors=args.dspark_max_anchors,
+            verbose=True,
+        )
+        return comparator.compare()
+
     from transformers import AutoTokenizer
     from accuracy_checker import ShardedBlockComparator
 
@@ -296,6 +342,17 @@ def run_hf_l1(args, ref_device, target_device, dtype):
 
 
 def run_hf_l2(args, ref_device, target_device, dtype, bad_layers):
+    from accuracy_checker.dspark import is_dspark_checkpoint
+    if (
+        getattr(args, 'model_type', 'auto') == 'dspark'
+        or is_dspark_checkpoint(args.ref_model)
+        or is_dspark_checkpoint(args.quant_model)
+    ):
+        raise NotImplementedError(
+            "Standalone DSpark currently supports dedicated L1 output alignment; "
+            "normal CausalLM L2 replay is invalid because each draft layer also "
+            "consumes verifier target_hidden_states"
+        )
     from accuracy_checker.subgraph_locate import diagnose_layers, print_report
 
     logger.info("\n" + "=" * 70)
@@ -894,6 +951,18 @@ def main():
         return
 
     mode = _resolve_mode(args)
+
+    from accuracy_checker.dspark import is_dspark_checkpoint
+    standalone_dspark = (
+        getattr(args, "model_type", "auto") == "dspark"
+        or is_dspark_checkpoint(getattr(args, "ref_model", None))
+        or is_dspark_checkpoint(getattr(args, "quant_model", None))
+    )
+    if standalone_dspark and mode not in ("l1", "screening", "report"):
+        raise NotImplementedError(
+            "standalone DSpark 仅支持 --mode l1/screening/report；"
+            "draft 不能独立 generate，也不能进入普通 CausalLM boundary/full/L2。"
+        )
 
     # report / inference 模式不需要 quant_model
     if mode not in ("report", "inference") and not args.quant_model:

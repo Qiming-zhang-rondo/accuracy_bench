@@ -562,6 +562,15 @@ def build_weight_index(model_path: str) -> Dict[str, str]:
             with open(index_path, 'r') as f:
                 index_data = json.load(f)
             return index_data.get("weight_map", {})
+    # Unsharded HF checkpoints do not carry an index.json.  Build the same
+    # key->file view from safetensors metadata so indexed loading remains
+    # lazy and works for small standalone drafts such as DSpark.
+    for single_name in ("model.safetensors", "quant_model_weights.safetensors"):
+        single_path = os.path.join(model_path, single_name)
+        if not os.path.exists(single_path):
+            continue
+        with safe_open(single_path, framework="pt") as handle:
+            return {key: single_name for key in handle.keys()}
     return {}
 
 
@@ -1379,6 +1388,126 @@ def _dequant_single_expert_indexed(weight_key, quant_type, sf_reader, dtype, use
     return None
 
 
+def _create_dspark_model_from_config(model_path: str, dtype: torch.dtype):
+    """Instantiate a supported standalone DSpark draft on the current device.
+
+    DeepSpec and Speculators intentionally use different model/config classes.
+    Resolve those classes explicitly because ``AutoModelForCausalLM`` would
+    otherwise instantiate the verifier architecture from ``model_type``.
+    """
+    from .dspark import load_dspark_contract
+
+    contract = load_dspark_contract(model_path)
+    try:
+        if contract.architecture == "Qwen3DSparkModel":
+            from deepspec.modeling.dspark.qwen3.modeling import Qwen3DSparkModel
+            config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+            config._attn_implementation = "eager"
+            model = Qwen3DSparkModel(config)
+        elif contract.architecture == "Gemma4DSparkModel":
+            from deepspec.modeling.dspark.gemma4.modeling import Gemma4DSparkModel
+            config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+            config._attn_implementation = "eager"
+            model = Gemma4DSparkModel(config)
+        else:
+            from speculators.models.dspark import (
+                DSparkDraftModel,
+                DSparkSpeculatorConfig,
+            )
+            config = DSparkSpeculatorConfig.from_pretrained(model_path)
+            transformer_config = getattr(config, "transformer_layer_config", None)
+            if transformer_config is not None:
+                transformer_config._attn_implementation = "eager"
+            model = DSparkDraftModel(config)
+    except ImportError as exc:
+        dependency = (
+            "DeepSpec source on PYTHONPATH (clone the official repository and "
+            "install its requirements)"
+            if contract.flavor == "deepspec"
+            else "speculators (pip install speculators)"
+        )
+        raise ImportError(
+            f"Loading {contract.architecture} requires {dependency}"
+        ) from exc
+
+    # The constructor runs under a meta-device context.  Preserve the requested
+    # comparison dtype before to_empty() allocates real storage.
+    for parameter in model.parameters():
+        if parameter.is_floating_point():
+            parameter.data = parameter.data.to(dtype=dtype)
+    return model, config
+
+
+def _initialize_rotary_modules(model: nn.Module, device: str) -> None:
+    """Rebuild non-persistent RoPE buffers after ``to_empty`` materialization."""
+    seen = set()
+    for module in model.modules():
+        if id(module) in seen or not hasattr(module, "inv_freq"):
+            continue
+        seen.add(id(module))
+        config = getattr(module, "config", None)
+        compute = getattr(type(module), "compute_default_rope_parameters", None)
+        rope_init_fn = getattr(module, "rope_init_fn", None)
+        if config is None or (compute is None and not callable(rope_init_fn)):
+            continue
+        module.to(device)
+        initializer = compute if compute is not None else rope_init_fn
+        inv_freq, attention_scaling = initializer(config, device=device)
+        module.inv_freq = inv_freq
+        if hasattr(module, "attention_scaling"):
+            module.attention_scaling = attention_scaling
+        if hasattr(module, "original_inv_freq"):
+            module.original_inv_freq = inv_freq.clone()
+
+
+def _load_speculators_verifier_weights(
+    model: nn.Module,
+    weight_map: Dict[str, str],
+    verifier_model: Optional[str],
+) -> None:
+    """Populate verifier-owned embeddings/heads omitted by Speculators drafts.
+
+    Standard Speculators checkpoints intentionally do not duplicate these large
+    tensors. Their custom ``from_pretrained`` path fetches them from the
+    configured verifier; acc_bench's indexed loader must preserve that contract.
+    """
+    if not verifier_model:
+        raise ValueError(
+            "Speculators DSpark requires "
+            "speculators_config.verifier.name_or_path"
+        )
+    loader = getattr(model, "load_verifier_weights", None)
+    if not callable(loader):
+        raise RuntimeError(
+            "Installed speculators DSpark model has no load_verifier_weights() API"
+        )
+
+    # Upstream only reloads some shared tensors when their placeholder contains
+    # NaNs. ``to_empty`` destroys the constructor's NaN sentinel, so restore it
+    # only for tensors that really are absent from the draft checkpoint.
+    verifier_owned = (
+        "embed_tokens.weight",
+        "lm_head.weight",
+        "verifier_lm_head.weight",
+    )
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if not any(name.endswith(suffix) for suffix in verifier_owned):
+                continue
+            if any(key == name or key.endswith(f".{name}") for key in weight_map):
+                continue
+            if parameter.is_floating_point():
+                parameter.fill_(float("nan"))
+
+    try:
+        loader()
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to load Speculators verifier-owned DSpark weights from "
+            f"{verifier_model!r}; make that model/path resolvable in this environment"
+        ) from exc
+
+
 def create_model_skeleton(
     model_path: str,
     dtype: torch.dtype = torch.bfloat16,
@@ -1397,11 +1526,18 @@ def create_model_skeleton(
     Returns:
         模型骨架（meta device）
     """
-    # 加载config
-    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    from .dspark import is_dspark_checkpoint
+
+    is_dspark = is_dspark_checkpoint(model_path)
+    # 加载config。DSpark 不能交给 AutoModelForCausalLM，否则会按 verifier 的
+    # model_type 创建普通 Qwen/Gemma 模型并丢掉 Markov/confidence head。
+    if is_dspark:
+        config = None
+    else:
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
 
     # 多模态 ForConditionalGeneration 模型 (如 Qwen3.6): num_hidden_layers 在 text_config 里
-    if not hasattr(config, 'num_hidden_layers'):
+    if config is not None and not hasattr(config, 'num_hidden_layers'):
         if hasattr(config, 'text_config') and hasattr(config.text_config, 'num_hidden_layers'):
             config.num_hidden_layers = config.text_config.num_hidden_layers
         elif hasattr(config, 'num_layer'):
@@ -1410,37 +1546,101 @@ def create_model_skeleton(
             raise ValueError("config 中缺少 num_hidden_layers 和 num_layer，无法确定模型层数")
 
     if verbose:
-        logger.info(f"  创建模型骨架 (meta device): {config.num_hidden_layers} 层")
+        if is_dspark:
+            from .dspark import load_dspark_contract
+            logger.info(
+                "  创建 DSpark 模型骨架 (meta device): %s 层",
+                load_dspark_contract(model_path).draft_layers,
+            )
+        else:
+            logger.info(f"  创建模型骨架 (meta device): {config.num_hidden_layers} 层")
 
     # 创建模型结构 (meta device)
     # 多模态 ForConditionalGeneration 模型不能用 AutoModelForCausalLM，需用 architectures 指定的类
     with torch.device('meta'):
-        try:
-            model = AutoModelForCausalLM.from_config(
-                config,
-                torch_dtype=dtype,
-                trust_remote_code=True,
-                attn_implementation='eager',
-            )
-        except (AttributeError, TypeError) as e:
-            # Fallback: 用 architectures 中指定的模型类
-            architectures = getattr(config, 'architectures', []) or []
-            if not architectures:
-                raise ValueError(f"AutoModelForCausalLM 失败且无 architectures: {e}")
-            import importlib
-            cls_name = architectures[0]
-            # 从 transformers 顶层获取模型类
-            import transformers
-            model_cls = getattr(transformers, cls_name, None)
-            if model_cls is None:
-                raise ValueError(f"transformers 中找不到 {cls_name}: {e}")
-            model = model_cls(config)
-            # 设置 dtype
-            for p in model.parameters():
-                p.data = p.data.to(dtype)
+        if is_dspark:
+            model, config = _create_dspark_model_from_config(model_path, dtype)
+        else:
+            try:
+                model = AutoModelForCausalLM.from_config(
+                    config,
+                    torch_dtype=dtype,
+                    trust_remote_code=True,
+                    attn_implementation='eager',
+                )
+            except (AttributeError, TypeError) as e:
+                # Fallback: 用 architectures 中指定的模型类
+                architectures = getattr(config, 'architectures', []) or []
+                if not architectures:
+                    raise ValueError(f"AutoModelForCausalLM 失败且无 architectures: {e}")
+                cls_name = architectures[0]
+                # 从 transformers 顶层获取模型类
+                import transformers
+                model_cls = getattr(transformers, cls_name, None)
+                if model_cls is None:
+                    raise ValueError(f"transformers 中找不到 {cls_name}: {e}")
+                model = model_cls(config)
+                # 设置 dtype
+                for p in model.parameters():
+                    p.data = p.data.to(dtype)
     model = model.to_empty(device='cpu')
 
     return model
+
+
+def _load_dspark_model_for_comparison(
+    model_path: str,
+    device: str,
+    dtype: torch.dtype,
+    verbose: bool,
+) -> Tuple[nn.Module, bool]:
+    """Load a standalone DSpark draft through acc_bench indexed dequantization."""
+    from .dspark import load_dspark_contract
+
+    is_quant = is_quantized_model(model_path)
+    is_ct = is_compressed_tensors_model(model_path)
+    model = create_model_skeleton(model_path, dtype=dtype, verbose=verbose)
+    contract = load_dspark_contract(model_path)
+    weight_map = build_weight_index(model_path)
+    if not weight_map:
+        raise FileNotFoundError(
+            f"No safetensors weights/index found in DSpark checkpoint: {model_path}"
+        )
+    reader = ShardWeightReader(model_path, weight_map)
+    quant_desc = None
+    quant_desc_path = os.path.join(model_path, "quant_model_description.json")
+    if is_quant and not is_ct and os.path.isfile(quant_desc_path):
+        with open(quant_desc_path, "r", encoding="utf-8") as handle:
+            quant_desc = json.load(handle)
+    try:
+        common = dict(
+            model=model,
+            model_path=model_path,
+            device=device,
+            dtype=dtype,
+            weight_map=weight_map,
+            sf_reader=reader,
+            is_quant=is_quant,
+            is_ct=is_ct,
+            quant_desc=quant_desc,
+            verbose=verbose,
+        )
+        # [] loads embeddings/projections/heads except final norm/lm_head;
+        # layer IDs load the draft backbone; -1 loads final norm/lm_head.
+        load_layer_weights_indexed(layers=[], **common)
+        load_layer_weights_indexed(
+            layers=list(range(contract.draft_layers)), **common
+        )
+        load_layer_weights_indexed(layers=[-1], **common)
+    finally:
+        reader.close()
+    if contract.flavor == "speculators":
+        _load_speculators_verifier_weights(
+            model, weight_map, contract.verifier_model
+        )
+    model = model.to(device)
+    _initialize_rotary_modules(model, device)
+    return model, is_quant
 
 
 def _extract_layer_idx(param_name: str) -> Optional[int]:
@@ -1490,7 +1690,26 @@ def load_model_for_comparison(
     For sharded mode (layers != None): returns skeleton model (no weights loaded).
     For full mode: loads all weights using from_pretrained.
     """
+    from .dspark import is_dspark_checkpoint
+
     is_quant = is_quantized_model(model_path)
+
+    if is_dspark_checkpoint(model_path):
+        if layers is not None:
+            return create_model_skeleton(model_path, dtype, verbose=verbose), is_quant
+        if use_fake_quant:
+            raise NotImplementedError(
+                "DSpark fake_quant loading is not supported yet; use "
+                "--quant_method dequantize so ref/quant run the same draft API"
+            )
+        single_device = (
+            device.split(',')[0]
+            if isinstance(device, str) and ',' in device
+            else device
+        )
+        return _load_dspark_model_for_comparison(
+            model_path, single_device, dtype, verbose
+        )
 
     # Sharded mode: return skeleton only
     if layers is not None:

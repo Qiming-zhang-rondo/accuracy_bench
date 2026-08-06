@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-08-06 — DSpark standalone draft L1
+
+- 运行 DeepSpec (`Qwen3DSparkModel` / `Gemma4DSparkModel`) 与标准 Speculators (`DSparkDraftModel`) checkpoint；识别并明确拒绝 forward 契约不同的 K3/TorchSpec/remote SpecForge 格式，避免误加载
+- ref/quant 权重加载前强校验 block、目标 hidden 层、hidden/vocab、Markov/confidence head 等参数契约
+- 新增 `--dspark_sample` / `--dspark_seed` / `--dspark_max_anchors`，使用 verifier 导出的真实 hidden-state cache 对齐 draft layers、Markov/confidence head 与 logits
+- standalone DSpark 明确定界为专用 L1；普通 CausalLM L2、prompt-only、boundary/full 与 fake-quant fail-fast
+- README 增加定界命令、判定结果解释和 DSpark cache/运行示例
+
 ## 2026-08-05 — Qwen3.6 / Kimi K3 + 结构探测统一
 
 - 删除未完整接入主流程的两套 Adapter 抽象，统一由 `model_structure.py` 解析模型容器、文本层和跨层状态
