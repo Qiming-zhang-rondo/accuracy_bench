@@ -2326,17 +2326,51 @@ class ShardedBlockComparator:
             chunk_idx = eid // chunk_size
             active_by_chunk.setdefault(chunk_idx, []).append(eid)
 
+        pending_chunks = []
+        pending_device_keys = set()
+
+        def _flush_device_round():
+            if not pending_chunks:
+                return
+            # Stripe expert submissions across devices instead of queueing an
+            # entire range on device 0 before device 1 receives any work.
+            max_active = max(len(chunk_ids) for _, chunk_ids in pending_chunks)
+            for expert_offset in range(max_active):
+                for chunk_device, chunk_ids in pending_chunks:
+                    if expert_offset >= len(chunk_ids):
+                        continue
+                    eid = chunk_ids[expert_offset]
+                    expert_out = self._forward_single_routed_expert(
+                        eid, h_flat, scores_flat, indices_flat, chunk_device,
+                        experts_mod, is_packed, is_module_list, use_streaming,
+                        expert_prefix, sf_reader, quant_desc_str, is_quant,
+                        is_ct, mlp, y, primary_device, layer_idx,
+                    )
+                    if expert_out is not None:
+                        del expert_out
+            # Expert outputs from secondary devices are accumulated on the
+            # primary device, so include it even when this round has no local
+            # expert chunk there.
+            sync_devices = [device for device, _ in pending_chunks]
+            sync_keys = {str(device) for device in sync_devices}
+            if str(primary_device) not in sync_keys:
+                sync_devices.append(primary_device)
+            for sync_device in sync_devices:
+                self._sync_chunk_device(sync_device)
+            pending_chunks.clear()
+            pending_device_keys.clear()
+
         for chunk_idx, chunk_ids in active_by_chunk.items():
             chunk_device = devices[chunk_idx % len(devices)]
-            for eid in chunk_ids:
-                expert_out = self._forward_single_routed_expert(
-                    eid, h_flat, scores_flat, indices_flat, chunk_device,
-                    experts_mod, is_packed, is_module_list, use_streaming,
-                    expert_prefix, sf_reader, quant_desc_str, is_quant, is_ct, mlp,
-                    y, primary_device, layer_idx)
-                if expert_out is not None:
-                    del expert_out
-            self._sync_chunk_device(chunk_device)
+            chunk_device_key = str(chunk_device)
+            # Queue at most one range per device in a round.  This keeps the
+            # previous per-device memory bound while allowing all devices to
+            # execute their expert ranges concurrently.
+            if chunk_device_key in pending_device_keys:
+                _flush_device_round()
+            pending_chunks.append((chunk_device, chunk_ids))
+            pending_device_keys.add(chunk_device_key)
+        _flush_device_round()
         return y
 
     def _forward_single_routed_expert(self, eid, h_flat, scores_flat, indices_flat,

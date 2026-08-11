@@ -383,21 +383,27 @@ def test_grouped_dual_visits_only_router_selected_kimi_experts():
     comparator = object.__new__(ShardedBlockComparator)
     visited = []
     synchronized = []
+    events = []
 
     def _record_expert(self, expert_id, *args):
         visited.append(expert_id)
+        events.append(("expert", expert_id))
         return None
+
+    def _record_sync(device):
+        synchronized.append(device)
+        events.append(("sync", device))
 
     comparator._forward_single_routed_expert = MethodType(
         _record_expert, comparator
     )
-    comparator._sync_chunk_device = synchronized.append
+    comparator._sync_chunk_device = _record_sync
     reader = SimpleNamespace(weight_map={
         "model.layers.0.block_sparse_moe.experts.1.w1.weight": "part-1",
     })
-    hidden = torch.zeros(1, 2, 4)
-    scores = torch.tensor([[[0.6, 0.4], [0.7, 0.3]]])
-    indices = torch.tensor([[[1, 300], [700, 300]]])
+    hidden = torch.zeros(1, 3, 4)
+    scores = torch.tensor([[[0.6, 0.4], [0.7, 0.3], [0.8, 0.2]]])
+    indices = torch.tensor([[[1, 300], [2, 301], [700, 301]]])
 
     output = comparator._run_expert_chunks(
         mlp=None,
@@ -420,8 +426,18 @@ def test_grouped_dual_visits_only_router_selected_kimi_experts():
         primary_device="npu:0",
     )
 
-    assert visited == [1, 300, 700]
+    assert visited == [1, 300, 2, 301, 700]
     assert synchronized == ["npu:0", "npu:1", "npu:0"]
+    assert events == [
+        ("expert", 1),
+        ("expert", 300),
+        ("expert", 2),
+        ("expert", 301),
+        ("sync", "npu:0"),
+        ("sync", "npu:1"),
+        ("expert", 700),
+        ("sync", "npu:0"),
+    ]
     assert torch.equal(output, torch.zeros_like(hidden.view(-1, 4)).float())
 
 
