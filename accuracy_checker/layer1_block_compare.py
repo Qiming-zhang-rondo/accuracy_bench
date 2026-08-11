@@ -596,15 +596,18 @@ class ShardedBlockComparator:
         from .utils import get_norm_module, get_lm_head_module
 
         # 加载 norm 和 lm_head 权重
+        self._materialize_final_modules_to_cpu(ref_model, quant_model)
         load_layer_weights_indexed(ref_model, self.ref_model_path, [-1], ref_device, self.dtype,
                                    self._ref_weight_map, self._ref_reader,
                                    is_quant=self._ref_is_quant, is_ct=self._ref_is_ct,
                                    quant_desc=self._ref_quant_desc,
+                                   strict_final_only=True,
                                    verbose=False)
         load_layer_weights_indexed(quant_model, self.quant_model_path, [-1], quant_device, self.dtype,
                                    self._quant_weight_map, self._quant_reader,
                                    is_quant=self._quant_is_quant, is_ct=self._quant_is_ct,
                                    quant_desc=self._quant_quant_desc,
+                                   strict_final_only=True,
                                    verbose=False)
 
         # 移到设备
@@ -811,9 +814,9 @@ class ShardedBlockComparator:
                     "lm_head was not loaded correctly"
                 )
 
-    def _load_norm_and_head_to_cpu(self, ref_model, quant_model):
-        """Load norm and lm_head modules to CPU."""
-        from .model_loader import load_layer_weights_indexed
+    @staticmethod
+    def _materialize_final_modules_to_cpu(ref_model, quant_model):
+        """Materialize only resolved final norm/head modules from meta."""
         from .utils import get_norm_module, get_lm_head_module
 
         for model in (ref_model, quant_model):
@@ -824,15 +827,24 @@ class ShardedBlockComparator:
                 if any(tensor.is_meta for tensor in tensors):
                     module.to_empty(device="cpu")
 
+    def _load_norm_and_head_to_cpu(self, ref_model, quant_model):
+        """Load norm and lm_head modules to CPU."""
+        from .model_loader import load_layer_weights_indexed
+        from .utils import get_norm_module, get_lm_head_module
+
+        self._materialize_final_modules_to_cpu(ref_model, quant_model)
+
         load_layer_weights_indexed(ref_model, self.ref_model_path, [-1], 'cpu', self.dtype,
                                    self._ref_weight_map, self._ref_reader,
                                    is_quant=self._ref_is_quant, is_ct=self._ref_is_ct,
                                    quant_desc=self._ref_quant_desc,
+                                   strict_final_only=True,
                                    verbose=False)
         load_layer_weights_indexed(quant_model, self.quant_model_path, [-1], 'cpu', self.dtype,
                                    self._quant_weight_map, self._quant_reader,
                                    is_quant=self._quant_is_quant, is_ct=self._quant_is_ct,
                                    quant_desc=self._quant_quant_desc,
+                                   strict_final_only=True,
                                    verbose=False)
 
         for model in [ref_model, quant_model]:
@@ -936,26 +948,18 @@ class ShardedBlockComparator:
         """materialize norm+lm_head 到 CPU + 加载权重。"""
         from .model_loader import load_layer_weights_indexed
         from .utils import get_norm_module, get_lm_head_module
-        for model in [ref_model, quant_model]:
-            norm_mod = get_norm_module(model)
-            head_mod = get_lm_head_module(model)
-            for mod in [norm_mod, head_mod]:
-                if mod is not None:
-                    try:
-                        p = next(mod.parameters())
-                        if p.device.type == 'meta':
-                            mod.to_empty(device='cpu')
-                    except StopIteration:
-                        pass
+        self._materialize_final_modules_to_cpu(ref_model, quant_model)
         load_layer_weights_indexed(ref_model, self.ref_model_path, [-1], 'cpu', self.dtype,
                                    self._ref_weight_map, self._ref_reader,
                                    is_quant=self._ref_is_quant, is_ct=self._ref_is_ct,
                                    quant_desc=self._ref_quant_desc,
+                                   strict_final_only=True,
                                    verbose=False)
         load_layer_weights_indexed(quant_model, self.quant_model_path, [-1], 'cpu', self.dtype,
                                    self._quant_weight_map, self._quant_reader,
                                    is_quant=self._quant_is_quant, is_ct=self._quant_is_ct,
                                    quant_desc=self._quant_quant_desc,
+                                   strict_final_only=True,
                                    verbose=False)
         for model in [ref_model, quant_model]:
             norm_mod = get_norm_module(model)

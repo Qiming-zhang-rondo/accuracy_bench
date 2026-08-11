@@ -31,7 +31,8 @@ def cos_sim(a: Tensor, b: Tensor, use_cpu: bool = True) -> float:
         norm_a, norm_b = a.norm(), b.norm()
         if norm_a == 0 or norm_b == 0:
             return 0.0
-        return (a @ b / (norm_a * norm_b)).item()
+        cos = (a @ b / (norm_a * norm_b)).item()
+        return max(-1.0, min(1.0, cos))
 
     # 大向量: float64 分块累积
     chunk = 1_000_000  # 1M elements per chunk

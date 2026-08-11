@@ -467,6 +467,48 @@ class TestCollectFullLogits:
         assert model.lm_head.weight is not model.embed_tokens.weight
         assert model.lm_head.weight.abs().max().item() > 0
 
+    def test_strict_final_load_skips_unrelated_meta_norm(self):
+        """Kimi final logits must not assign CPU data to another meta norm."""
+        from accuracy_checker.model_loader import load_layer_weights_indexed
+
+        class _Reader:
+            def __init__(self, tensors):
+                self.tensors = tensors
+                self.weight_map = {
+                    name: "model.safetensors" for name in tensors
+                }
+
+            def get_tensor(self, name):
+                return self.tensors.get(name)
+
+        model = _MockModel(8, 12)
+        model.aux_norm = nn.LayerNorm(8)
+        for module in (model.norm, model.lm_head, model.aux_norm):
+            module.to_empty(device="meta")
+        # Mirrors the final-logits path: only resolved final modules are
+        # materialized before indexed loading.
+        model.norm.to_empty(device="cpu")
+        model.lm_head.to_empty(device="cpu")
+        reader = _Reader({
+            "norm.weight": torch.full((8,), 2.0),
+            "lm_head.weight": torch.full((12, 8), 3.0),
+            "aux_norm.weight": torch.full((8,), 4.0),
+            "aux_norm.bias": torch.full((8,), 5.0),
+        })
+
+        loaded = load_layer_weights_indexed(
+            model, "/fake", [-1], "cpu", torch.float32,
+            reader.weight_map, reader,
+            strict_final_only=True,
+            verbose=False,
+        )
+
+        assert loaded == 2
+        assert torch.equal(model.norm.weight, torch.full((8,), 2.0))
+        assert torch.equal(model.lm_head.weight, torch.full((12, 8), 3.0))
+        assert model.aux_norm.weight.is_meta
+        assert model.aux_norm.bias.is_meta
+
     def test_cpu_topk_uses_real_final_norm(self, monkeypatch):
         """Qwen RMSNorm forward must run; generic F.layer_norm is not equivalent."""
         import accuracy_checker.model_loader as ML

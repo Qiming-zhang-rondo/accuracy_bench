@@ -910,7 +910,8 @@ def _load_msslim_quant_param(name: str, param, sf_reader: ShardWeightReader,
 def _load_named_buffers(model: nn.Module, sf_reader: ShardWeightReader,
                         layer_set: set, load_embed_only: bool,
                         load_norm_head_only: bool,
-                        strict_embed_buffer_ids: Optional[set] = None) -> int:
+                        strict_embed_buffer_ids: Optional[set] = None,
+                        strict_final_buffer_ids: Optional[set] = None) -> int:
     """Load register_buffer tensors (e.g. e_score_correction_bias). Returns loaded count.
 
     Extracted from load_layer_weights_indexed.
@@ -927,9 +928,22 @@ def _load_named_buffers(model: nn.Module, sf_reader: ShardWeightReader,
             and id(buf) not in strict_embed_buffer_ids
         ):
             continue
+        if (
+            load_norm_head_only
+            and strict_final_buffer_ids is not None
+            and id(buf) not in strict_final_buffer_ids
+        ):
+            continue
         b_layer_idx = _extract_layer_idx(bname)
-        if not _decide_should_load(bname, b_layer_idx, layer_set,
-                                   load_embed_only, load_norm_head_only, False):
+        should_load = (
+            id(buf) in strict_final_buffer_ids
+            if load_norm_head_only and strict_final_buffer_ids is not None
+            else _decide_should_load(
+                bname, b_layer_idx, layer_set,
+                load_embed_only, load_norm_head_only, False,
+            )
+        )
+        if not should_load:
             continue
         # 从 weight_map 找 key (msmodelslim 量化场景 key 在 quant_model_weights-*.safetensors)
         try:
@@ -1026,6 +1040,7 @@ def load_layer_weights_indexed(
     use_fake_quant: bool = False,
     skip_routed_experts: bool = False,
     strict_embed_only: bool = False,
+    strict_final_only: bool = False,
     verbose: bool = True,
 ) -> int:
     """按需加载指定层权重 (使用 safe_open + get_tensor，避免 load_file 读整个 shard)
@@ -1051,6 +1066,8 @@ def load_layer_weights_indexed(
         use_fake_quant: 是否 fake quant
         skip_routed_experts: 跳过 routed experts 权重加载 (由 _moe_forward_chunked streaming 读取)
         strict_embed_only: layers=[] 时只加载实际 text embedding 模块，跳过视觉/projector
+        strict_final_only: layers=[-1] 时只加载结构解析得到的 final norm/lm_head，
+            避免 Kimi streaming 骨架中其他顶层 meta norm 被名称匹配误加载
         verbose: 是否打印进度
 
     Returns:
@@ -1075,6 +1092,28 @@ def load_layer_weights_indexed(
         strict_embed_param_ids = {id(param) for param in embed_module.parameters()}
         strict_embed_buffer_ids = {id(buf) for buf in embed_module.buffers()}
 
+    strict_final_param_ids = None
+    strict_final_buffer_ids = None
+    if load_norm_head_only and strict_final_only:
+        from .utils import get_norm_module, get_lm_head_module
+        final_modules = tuple(
+            module for module in (
+                get_norm_module(model), get_lm_head_module(model)
+            ) if module is not None
+        )
+        if not final_modules:
+            raise RuntimeError(
+                "Strict final load requested but no final norm/lm_head was found"
+            )
+        strict_final_param_ids = {
+            id(param) for module in final_modules
+            for param in module.parameters()
+        }
+        strict_final_buffer_ids = {
+            id(buf) for module in final_modules
+            for buf in module.buffers()
+        }
+
     # 修正 quant_desc key 与 named_modules() 的前缀不匹配
     if is_quant and quant_desc is not None:
         quant_desc = normalize_quant_desc_keys(quant_desc, model)
@@ -1092,10 +1131,20 @@ def load_layer_weights_indexed(
         ):
             skipped_count += 1
             continue
+        if (
+            strict_final_param_ids is not None
+            and id(param) not in strict_final_param_ids
+        ):
+            skipped_count += 1
+            continue
         layer_idx = _extract_layer_idx(name)
-        should_load = _decide_should_load(
-            name, layer_idx, layer_set, load_embed_only, load_norm_head_only,
-            verbose, param,
+        should_load = (
+            id(param) in strict_final_param_ids
+            if strict_final_param_ids is not None
+            else _decide_should_load(
+                name, layer_idx, layer_set, load_embed_only,
+                load_norm_head_only, verbose, param,
+            )
         )
         if not should_load:
             skipped_count += 1
@@ -1124,6 +1173,7 @@ def load_layer_weights_indexed(
     loaded_count += _load_named_buffers(
         model, sf_reader, layer_set, load_embed_only, load_norm_head_only,
         strict_embed_buffer_ids=strict_embed_buffer_ids,
+        strict_final_buffer_ids=strict_final_buffer_ids,
     )
 
     if verbose:

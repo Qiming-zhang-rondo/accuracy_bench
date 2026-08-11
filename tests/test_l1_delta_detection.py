@@ -216,6 +216,13 @@ class TestCaseD_NumericalStability(unittest.TestCase):
         cs = cos_sim(a, b)
         self.assertGreater(cs, 0.9999)
 
+    def test_small_identical_bfloat16_is_clamped(self):
+        """Identical hidden states must never report cosine above one."""
+        a = torch.randn(20, 7168, dtype=torch.bfloat16)
+        cs = cos_sim(a, a.clone())
+        self.assertLessEqual(cs, 1.0)
+        self.assertGreater(cs, 0.9999)
+
     def test_opposite_large_tensor(self):
         """相反张量应得到约 -1.0
 

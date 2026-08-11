@@ -6,6 +6,8 @@
 - 流式量化专家改为先把压缩权重与 scale 搬到目标设备，再执行反量化，避免 CPU 展开 BF16 后产生约 4 倍 H2D 传输；可用 `ACC_STREAM_DEQUANT_DEVICE=cpu` 临时回退兼容路径
 - expert chunk 同步后默认保留 NPU caching allocator，避免每层反复 `empty_cache`；ref/quant shard 卸载合并为一次 GC/缓存回收，并输出每个 shard 的 load/forward/cleanup 耗时
 - 修复 `grouped_dual` 多卡 expert chunk 实际串行的问题：同一轮先交错向各 NPU 下发专家任务，再统一同步；每张卡仍只保留一个 chunk 的峰值范围
+- 修复 Kimi streaming 收尾阶段 top-k/full-logits 将 CPU 权重误写入无关 meta norm 的问题；final 权重加载改为严格限定结构解析得到的 final norm 与 lm_head
+- 小张量 cosine 快速路径统一钳制到 `[-1, 1]`，不再把完全相同的 BF16 hidden state 显示为 `1.000076`
 - Kimi `grouped_dual` 改为真正的 streaming-meta 骨架：构造期不再实例化 92×896 routed experts，也不再整模 `to_empty(cpu)`；仅物化当前 shard，完成后立即卸载回 meta
 - Kimi remote code 强制设置的 `flash_attention_2` 在骨架创建后恢复为 eager，避免 MLA forward 误入 CUDA FlashAttention 路径
 - 新增 `--kimi_kda_backend auto|torch|chunk|fused_recurrent`；Ascend `auto` 默认使用无 Triton 依赖的 eager torch KDA recurrence
