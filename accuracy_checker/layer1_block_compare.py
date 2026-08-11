@@ -11,6 +11,7 @@ L1: 逐block对比
 
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -1542,49 +1543,70 @@ class ShardedBlockComparator:
         from .utils import get_decoder_layers
         ref_layers = get_decoder_layers(ref_model)
         quant_layers = get_decoder_layers(quant_model)
-        for layer_idx in range(layer_start, layer_end):
-            ref_layer = ref_layers[layer_idx]
-            quant_layer = quant_layers[layer_idx]
-            ref_layer_input = ref_hidden
-            quant_layer_input = quant_hidden
-            ref_state_input = ref_prev_topk
-            quant_state_input = quant_prev_topk
-            is_moe = self._is_moe_layer(ref_layer)
-            if layer_idx == 3 and logger.isEnabledFor(logging.DEBUG):
-                self._debug_layer3_expert0 = True
-                self._debug_layer3_out = True
-            self._log_norm_debug(layer_idx, ref_hidden, quant_hidden, "IN")
+        parallel_forward = self._can_parallel_dual_forward()
+        if (self.verbose
+                and not getattr(self, "_dual_forward_mode_logged", False)):
+            if parallel_forward:
+                logger.info(
+                    "  ref/quant forward: concurrent (disjoint device groups)"
+                )
+            else:
+                logger.info("  ref/quant forward: serial")
+            self._dual_forward_mode_logged = True
 
-            ref_moe = quant_moe = None
-            ref_orig_mlp_fwd = quant_orig_mlp_fwd = None
-            if is_moe:
-                ref_moe, ref_orig_mlp_fwd, quant_moe, quant_orig_mlp_fwd = self._patch_moe_forward_for_layer(
-                    ref_layer, quant_layer, layer_idx, ref_reader, quant_reader,
-                    ref_quant_desc, quant_quant_desc, ref_is_quant, quant_is_quant,
-                    ref_is_ct, quant_is_ct)
+        executor = (
+            ThreadPoolExecutor(max_workers=2, thread_name_prefix="acc-dual")
+            if parallel_forward else None
+        )
+        try:
+            for layer_idx in range(layer_start, layer_end):
+                ref_layer = ref_layers[layer_idx]
+                quant_layer = quant_layers[layer_idx]
+                ref_layer_input = ref_hidden
+                quant_layer_input = quant_hidden
+                ref_state_input = ref_prev_topk
+                quant_state_input = quant_prev_topk
+                is_moe = self._is_moe_layer(ref_layer)
+                if layer_idx == 3 and logger.isEnabledFor(logging.DEBUG):
+                    self._debug_layer3_expert0 = True
+                    self._debug_layer3_out = True
+                self._log_norm_debug(layer_idx, ref_hidden, quant_hidden, "IN")
 
-            ref_hidden, quant_hidden, ref_prev_topk, quant_prev_topk = self._forward_single_dual_layer(
-                ref_layer, quant_layer, ref_hidden, quant_hidden,
-                ref_pos_ids, quant_pos_ids, ref_pe, quant_pe,
-                ref_prev_topk, quant_prev_topk)
+                ref_moe = quant_moe = None
+                ref_orig_mlp_fwd = quant_orig_mlp_fwd = None
+                if is_moe:
+                    ref_moe, ref_orig_mlp_fwd, quant_moe, quant_orig_mlp_fwd = self._patch_moe_forward_for_layer(
+                        ref_layer, quant_layer, layer_idx, ref_reader, quant_reader,
+                        ref_quant_desc, quant_quant_desc, ref_is_quant, quant_is_quant,
+                        ref_is_ct, quant_is_ct)
 
-            self._log_norm_debug(layer_idx, ref_hidden, quant_hidden, "OUT")
-            if is_moe:
-                ref_moe.forward = ref_orig_mlp_fwd
-                quant_moe.forward = quant_orig_mlp_fwd
+                try:
+                    ref_hidden, quant_hidden, ref_prev_topk, quant_prev_topk = self._forward_single_dual_layer(
+                        ref_layer, quant_layer, ref_hidden, quant_hidden,
+                        ref_pos_ids, quant_pos_ids, ref_pe, quant_pe,
+                        ref_prev_topk, quant_prev_topk, executor=executor)
+                finally:
+                    if is_moe:
+                        ref_moe.forward = ref_orig_mlp_fwd
+                        quant_moe.forward = quant_orig_mlp_fwd
 
-            is_target = (self.l1_target_layers is not None and layer_idx in self.l1_target_layers)
-            if not is_target and self.l1_target_layers is not None:
-                continue
-            self._log_layer77_debug(layer_idx, ref_layer, quant_layer, ref_hidden, quant_hidden)
-            metrics, result = self._compute_layer_metrics_and_cache(
-                ref_hidden, quant_hidden, layer_idx, layer_cos_sims, layer_inputs,
-                ref_layer_input=ref_layer_input,
-                quant_layer_input=quant_layer_input,
-                ref_layer_state=ref_state_input,
-                quant_layer_state=quant_state_input,
-            )
-            all_results.append(result)
+                self._log_norm_debug(layer_idx, ref_hidden, quant_hidden, "OUT")
+
+                is_target = (self.l1_target_layers is not None and layer_idx in self.l1_target_layers)
+                if not is_target and self.l1_target_layers is not None:
+                    continue
+                self._log_layer77_debug(layer_idx, ref_layer, quant_layer, ref_hidden, quant_hidden)
+                metrics, result = self._compute_layer_metrics_and_cache(
+                    ref_hidden, quant_hidden, layer_idx, layer_cos_sims, layer_inputs,
+                    ref_layer_input=ref_layer_input,
+                    quant_layer_input=quant_layer_input,
+                    ref_layer_state=ref_state_input,
+                    quant_layer_state=quant_state_input,
+                )
+                all_results.append(result)
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
         return ref_hidden, quant_hidden, ref_prev_topk, quant_prev_topk
 
     @staticmethod
@@ -2545,39 +2567,105 @@ class ShardedBlockComparator:
             self._kimi_kda_backend_logged = True
         return backend
 
+    @staticmethod
+    def _normalized_device_group(devices) -> set:
+        """Normalize CLI device spellings for overlap checks."""
+        normalized = set()
+        if isinstance(devices, str):
+            devices = (devices,)
+        for device in devices or ():
+            for part in str(device).split(","):
+                key = part.strip().lower()
+                if not key:
+                    continue
+                if key in {"npu", "cuda"}:
+                    key += ":0"
+                normalized.add(key)
+        return normalized
+
+    def _can_parallel_dual_forward(self) -> bool:
+        """Run both sides concurrently only when they cannot share a device."""
+        force_serial = os.getenv("ACC_DUAL_FORWARD_SERIAL", "0").strip().lower()
+        if force_serial in {"1", "true", "yes", "on"}:
+            return False
+        # Debug probes mutate comparator-level state and intentionally preserve
+        # deterministic ref-then-quant ordering.
+        if logger.isEnabledFor(logging.DEBUG):
+            return False
+        ref_group = self._normalized_device_group(getattr(self, "ref_devices", ()))
+        quant_group = self._normalized_device_group(getattr(self, "quant_devices", ()))
+        return bool(ref_group and quant_group and ref_group.isdisjoint(quant_group))
+
+    @staticmethod
+    def _build_single_layer_forward_kwargs(
+        layer, hidden_states, position_ids, position_embeddings, previous_state
+    ):
+        kwargs = {"position_ids": position_ids}
+        if position_embeddings is not None:
+            kwargs["position_embeddings"] = position_embeddings
+        attention_mask = build_replay_attention_mask(layer, hidden_states)
+        if attention_mask is not None:
+            kwargs["attention_mask"] = attention_mask
+        kwargs.update(ShardedBlockComparator._build_cross_layer_state_kwargs(
+            layer, previous_state, hidden_states
+        ))
+        return kwargs
+
+    @staticmethod
+    def _forward_one_layer_side(
+        layer, hidden_states, kwargs, previous_state, bind_worker_device=False
+    ):
+        """Forward one side inside a worker-local no-grad/device context."""
+        if bind_worker_device:
+            device = hidden_states.device
+            device_api = getattr(torch, device.type, None)
+            set_device = getattr(device_api, "set_device", None)
+            if set_device is not None:
+                set_device(device)
+        # Grad mode is thread-local; the caller's no_grad context does not
+        # propagate into ThreadPoolExecutor workers.
+        with torch.no_grad():
+            output = layer(hidden_states, **kwargs)
+        next_hidden = output[0] if isinstance(output, tuple) else output
+        next_state = previous_state
+        if isinstance(output, tuple) and len(output) > 1 and output[1] is not None:
+            next_state = output[1]
+        return next_hidden, next_state
+
     def _forward_single_dual_layer(self, ref_layer, quant_layer, ref_hidden, quant_hidden,
                                      ref_pos_ids, quant_pos_ids, ref_pe, quant_pe,
-                                     ref_prev_topk, quant_prev_topk):
+                                     ref_prev_topk, quant_prev_topk, executor=None):
         """forward 单层 ref+quant，返回更新后的 hidden + prev_topk。"""
         self._configure_kimi_kda_backend(ref_layer, ref_hidden)
         self._configure_kimi_kda_backend(quant_layer, quant_hidden)
-        ref_fwd_kwargs = {}
-        if ref_pe is not None:
-            ref_fwd_kwargs['position_embeddings'] = ref_pe
-        ref_fwd_kwargs['position_ids'] = ref_pos_ids
-        ref_attention_mask = build_replay_attention_mask(ref_layer, ref_hidden)
-        if ref_attention_mask is not None:
-            ref_fwd_kwargs['attention_mask'] = ref_attention_mask
-        ref_fwd_kwargs.update(self._build_cross_layer_state_kwargs(
-            ref_layer, ref_prev_topk, ref_hidden))
-        ref_out = ref_layer(ref_hidden, **ref_fwd_kwargs)
-        ref_hidden = ref_out[0] if isinstance(ref_out, tuple) else ref_out
-        if isinstance(ref_out, tuple) and len(ref_out) > 1 and ref_out[1] is not None:
-            ref_prev_topk = ref_out[1]
+        ref_fwd_kwargs = self._build_single_layer_forward_kwargs(
+            ref_layer, ref_hidden, ref_pos_ids, ref_pe, ref_prev_topk
+        )
+        quant_fwd_kwargs = self._build_single_layer_forward_kwargs(
+            quant_layer, quant_hidden, quant_pos_ids, quant_pe, quant_prev_topk
+        )
 
-        quant_fwd_kwargs = {}
-        if quant_pe is not None:
-            quant_fwd_kwargs['position_embeddings'] = quant_pe
-        quant_fwd_kwargs['position_ids'] = quant_pos_ids
-        quant_attention_mask = build_replay_attention_mask(quant_layer, quant_hidden)
-        if quant_attention_mask is not None:
-            quant_fwd_kwargs['attention_mask'] = quant_attention_mask
-        quant_fwd_kwargs.update(self._build_cross_layer_state_kwargs(
-            quant_layer, quant_prev_topk, quant_hidden))
-        quant_out = quant_layer(quant_hidden, **quant_fwd_kwargs)
-        quant_hidden = quant_out[0] if isinstance(quant_out, tuple) else quant_out
-        if isinstance(quant_out, tuple) and len(quant_out) > 1 and quant_out[1] is not None:
-            quant_prev_topk = quant_out[1]
+        if executor is None:
+            ref_hidden, ref_prev_topk = self._forward_one_layer_side(
+                ref_layer, ref_hidden, ref_fwd_kwargs, ref_prev_topk
+            )
+            quant_hidden, quant_prev_topk = self._forward_one_layer_side(
+                quant_layer, quant_hidden, quant_fwd_kwargs, quant_prev_topk
+            )
+        else:
+            ref_future = executor.submit(
+                self._forward_one_layer_side,
+                ref_layer, ref_hidden, ref_fwd_kwargs, ref_prev_topk, True,
+            )
+            quant_future = executor.submit(
+                self._forward_one_layer_side,
+                quant_layer, quant_hidden, quant_fwd_kwargs, quant_prev_topk, True,
+            )
+            # Keep layer-by-layer comparison semantics while overlapping the
+            # independent ref/quant device groups.
+            wait((ref_future, quant_future))
+            ref_hidden, ref_prev_topk = ref_future.result()
+            quant_hidden, quant_prev_topk = quant_future.result()
         return ref_hidden, quant_hidden, ref_prev_topk, quant_prev_topk
 
     def _log_dual_layer_debug(self, layer_idx, layer_start, shard_idx,

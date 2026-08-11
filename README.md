@@ -92,7 +92,7 @@ python3 run_accuracy_check.py --mode boundary \
   > Kimi K3 已支持 text backbone 的 KDA/MLA、Stable LatentMoE、AttnRes、SiTU 和嵌套 MXFP4 配置。`--kimi_kda_backend auto` 在 Ascend 上会在加载 remote code 前安装纯 PyTorch import shim，并使用原生 PyTorch/NPU 短卷积、gated RMSNorm 和 KDA recurrence；该路径不要求安装 `fla-core`，也不会进入 CANN 8.5.1 无法编译的 FLA Triton 路径。确认环境内核兼容后可显式选 `chunk` 或 `fused_recurrent`。
   > Kimi K3 官方 896-expert `ModuleList` 必须用 `--compare_mode grouped_dual` 跑 L1。该模式在骨架构造阶段每层只保留一个无权重 expert 占位，仅流式读取 router 实际命中的专家；量化权重默认以压缩形态传到目标设备后再反量化。非当前 shard 的 attention/router/shared expert 保持 meta，不会先全量加载到 CPU/NPU 再卸载。若目标运行时缺少反量化所需算子，可临时设置 `ACC_STREAM_DEQUANT_DEVICE=cpu` 回退到 CPU 反量化。MoE 层 L2 暂不物化全部专家，会明确拒绝并提示使用流式 replay/内部 packed 模型。
   > Streaming expert 默认复用 NPU allocator 缓存，避免每个 expert chunk 强制 `empty_cache`；若特定 torch_npu/CANN 组合出现持续显存增长，可临时设置 `ACC_STREAM_EMPTY_CACHE=1` 恢复保守回收。运行日志会按 shard 输出 load / forward / cleanup 耗时，便于区分读盘、计算和回收瓶颈。
-  > `grouped_dual` 会按轮次向同侧各张 NPU 交错下发 expert，再统一同步；多卡不再逐卡串行等待。ref 与 quant 两侧仍保持确定性的先后顺序。
+  > `grouped_dual` 会按轮次向同侧各张 NPU 交错下发 expert，再统一同步；多卡不再逐卡串行等待。当 ref/quant 设备组互不重叠时，两侧 forward 也会自动并发；设备重叠、DEBUG 模式或设置 `ACC_DUAL_FORWARD_SERIAL=1` 时自动使用串行路径。
   > GLM-5.2 (head_dim=192, indexer_types) 需按 `reference_glm_version_identification` 自行校验结构和子图兼容性
 - **量化格式**: W8A8 / W4A8 / W4A4 / MXFP8 / MXFP4 / compressed-tensors (自动识别)
 - **覆盖**: 多模型族 × 6 量化格式 × 多个已验证 bad case (GLM-5.1 W4A8 GT HIT layer 77 o_proj；Kimi K3/Qwen3.6 待内网 NPU 回归)

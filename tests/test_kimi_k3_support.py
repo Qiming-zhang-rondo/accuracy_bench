@@ -491,3 +491,74 @@ def test_streaming_chunk_sync_reuses_allocator_cache_by_default(
 
     fake_npu.synchronize.assert_called_once_with("npu:3")
     fake_npu.empty_cache.assert_not_called()
+
+
+def test_dual_forward_parallel_guard_requires_disjoint_devices(monkeypatch):
+    from accuracy_checker.layer1_block_compare import ShardedBlockComparator
+
+    comparator = object.__new__(ShardedBlockComparator)
+    comparator.ref_devices = ["npu:0", "npu:1"]
+    comparator.quant_devices = ["npu:2", "npu:3"]
+    monkeypatch.delenv("ACC_DUAL_FORWARD_SERIAL", raising=False)
+
+    with patch(
+        "accuracy_checker.layer1_block_compare.logger.isEnabledFor",
+        return_value=False,
+    ):
+        assert comparator._can_parallel_dual_forward()
+        comparator.quant_devices = ["npu:1", "npu:2"]
+        assert not comparator._can_parallel_dual_forward()
+        comparator.quant_devices = ["npu:2", "npu:3"]
+        monkeypatch.setenv("ACC_DUAL_FORWARD_SERIAL", "1")
+        assert not comparator._can_parallel_dual_forward()
+
+
+def test_dual_layer_forward_overlaps_both_sides_without_grad():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from accuracy_checker.layer1_block_compare import ShardedBlockComparator
+
+    barrier = Barrier(2)
+    grad_modes = []
+
+    class BarrierLayer(nn.Module):
+        def __init__(self, delta, next_state):
+            super().__init__()
+            self.delta = delta
+            self.next_state = next_state
+
+        def forward(self, hidden_states, **kwargs):
+            grad_modes.append(torch.is_grad_enabled())
+            barrier.wait(timeout=2.0)
+            return hidden_states + self.delta, self.next_state
+
+    comparator = object.__new__(ShardedBlockComparator)
+    ref_hidden = torch.zeros(1, 2, 4)
+    quant_hidden = torch.ones(1, 2, 4)
+    position_ids = torch.arange(2).unsqueeze(0)
+
+    with patch(
+        "accuracy_checker.layer1_block_compare.build_replay_attention_mask",
+        return_value=None,
+    ), ThreadPoolExecutor(max_workers=2) as executor:
+        outputs = comparator._forward_single_dual_layer(
+            BarrierLayer(2.0, "ref-state"),
+            BarrierLayer(3.0, "quant-state"),
+            ref_hidden,
+            quant_hidden,
+            position_ids,
+            position_ids,
+            None,
+            None,
+            None,
+            None,
+            executor=executor,
+        )
+
+    ref_output, quant_output, ref_state, quant_state = outputs
+    assert torch.equal(ref_output, torch.full_like(ref_hidden, 2.0))
+    assert torch.equal(quant_output, torch.full_like(quant_hidden, 4.0))
+    assert ref_state == "ref-state"
+    assert quant_state == "quant-state"
+    assert grad_modes == [False, False]

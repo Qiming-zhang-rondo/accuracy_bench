@@ -109,7 +109,7 @@ acc_bench/
 
 核心流程不再维护按模型名复制的 Adapter 类。`model_structure.py` 只解析主流程真正使用的能力：文本容器、decoder layers、特殊模块、MoE 容器和跨层状态。模型名 alias 仅保留在 CLI/子图展示层。
 
-Kimi K3 官方 checkpoint 的每个 MoE 层包含 896 个独立 expert module。L1 `grouped_dual` 会在 meta 阶段移除 expert module 权重并从 safetensors 流式读取；普通 `dual` 会 fail-fast。KDA 在 Ascend 上默认使用 `torch` recurrence（普通 torch-npu elementwise/matmul），避免依赖 FLA chunk Triton 内核；可用 `--kimi_kda_backend` 覆盖。L2 当前仍要求完整目标层，因此对这类 MoE 层 fail-fast，直到流式 expert replay 支持完成；packed 内部实现不受该结构检查限制。
+Kimi K3 官方 checkpoint 的每个 MoE 层包含 896 个独立 expert module。L1 `grouped_dual` 会在 meta 阶段移除 expert module 权重并从 safetensors 流式读取；普通 `dual` 会 fail-fast。KDA 在 Ascend 上默认使用 `torch` recurrence（普通 torch-npu elementwise/matmul），避免依赖 FLA chunk Triton 内核；可用 `--kimi_kda_backend` 覆盖。ref/quant 设备组互不重叠时，两侧 layer forward 由两个 worker 并发执行；设备重叠、DEBUG 模式或 `ACC_DUAL_FORWARD_SERIAL=1` 时回退为串行。L2 当前仍要求完整目标层，因此对这类 MoE 层 fail-fast，直到流式 expert replay 支持完成；packed 内部实现不受该结构检查限制。
 
 加 `--mla_fine` 对 MLA attention 细粒度拆分：
 `q_a_proj` / `q_b_proj` / `kv_a_proj_with_mqa` / `kv_b_proj` / `o_proj` / `indexer` (wq_b / wk / weights_proj / k_norm)

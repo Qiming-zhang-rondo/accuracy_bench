@@ -2,6 +2,7 @@
 
 ## 2026-08-11 — Kimi K3 Ascend KDA fallback
 
+- `grouped_dual` 在 ref/quant 设备组互不重叠时并发执行两侧 layer forward；重叠设备、DEBUG 或 `ACC_DUAL_FORWARD_SERIAL=1` 自动回退串行
 - `grouped_dual` 性能优化：每层只读取 router 实际命中的专家，不再扫描全部 896 个专家；按真实专家数规划 device chunk，减少同步和 `empty_cache` 次数
 - 流式量化专家改为先把压缩权重与 scale 搬到目标设备，再执行反量化，避免 CPU 展开 BF16 后产生约 4 倍 H2D 传输；可用 `ACC_STREAM_DEQUANT_DEVICE=cpu` 临时回退兼容路径
 - expert chunk 同步后默认保留 NPU caching allocator，避免每层反复 `empty_cache`；ref/quant shard 卸载合并为一次 GC/缓存回收，并输出每个 shard 的 load/forward/cleanup 耗时
