@@ -1,6 +1,7 @@
 """CPU-only structural tests for Kimi K3 support."""
 
 import json
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -292,3 +293,82 @@ def test_portable_fla_modules_preserve_kimi_weight_contracts():
     expected = torch.tensor([[[0.6, 0.8]]]) * (2.0 ** 0.5) * 0.5
     assert torch.allclose(normalized, expected)
     assert set(norm.state_dict()) == {"weight"}
+
+
+def test_kimi_streaming_skeleton_discards_routed_expert_parameters():
+    """grouped_dual keeps routing metadata but no routed expert weights."""
+    from accuracy_checker.model_loader import _finalize_kimi_streaming_skeleton
+
+    class FakeStreamingMoe(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(num_experts=896)
+            self.num_experts = 1
+            self.experts_per_rank = 1
+            self.experts = nn.ModuleList([nn.Linear(4, 4, bias=False)])
+
+    model = nn.Module()
+    model.moe = FakeStreamingMoe()
+    collapsed = _finalize_kimi_streaming_skeleton(model, {896})
+
+    assert collapsed == 1
+    assert len(model.moe.experts) == 1
+    assert isinstance(model.moe.experts[0], nn.Identity)
+    assert model.moe.num_experts == 896
+    assert model.moe.experts_per_rank == 896
+    assert not list(model.moe.experts.parameters())
+
+
+def test_kimi_streaming_skeleton_forces_eager_attention():
+    from accuracy_checker.model_loader import _force_kimi_eager_attention
+
+    text_config = SimpleNamespace(_attn_implementation="flash_attention_2")
+    model = nn.Module()
+    model.config = SimpleNamespace(
+        _attn_implementation="flash_attention_2",
+        text_config=text_config,
+    )
+    model.text = nn.Module()
+    model.text.config = text_config
+    model.text._use_flash_attention_2 = True
+
+    _force_kimi_eager_attention(model)
+
+    assert model.config._attn_implementation == "eager"
+    assert text_config._attn_implementation == "eager"
+    assert model.text._use_flash_attention_2 is False
+
+
+def test_kimi_streaming_construction_collapses_only_expert_range():
+    from accuracy_checker.model_loader import _kimi_streaming_construction
+
+    fake_module = ModuleType("fake_kimi.modeling_kimi_linear")
+
+    class KimiFakeModel:
+        def post_init(self):
+            return "original"
+
+    class FakeDynamicModel:
+        pass
+
+    fake_module.KimiFakeModel = KimiFakeModel
+    fake_module.KimiBlockSparseMLP = object
+    config = SimpleNamespace(
+        text_config=SimpleNamespace(num_experts=896),
+    )
+    original_post_init = KimiFakeModel.post_init
+
+    with patch(
+        "accuracy_checker.model_loader._load_kimi_modeling_modules",
+        return_value=(FakeDynamicModel, [fake_module]),
+    ):
+        with _kimi_streaming_construction(config, "/fake/kimi", True) as state:
+            counts, model_cls = state
+            assert counts == {896}
+            assert model_cls is FakeDynamicModel
+            assert list(fake_module.range(896)) == [0]
+            assert list(fake_module.range(3)) == [0, 1, 2]
+            assert KimiFakeModel().post_init() is None
+
+    assert "range" not in fake_module.__dict__
+    assert KimiFakeModel.post_init is original_post_init

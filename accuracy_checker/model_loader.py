@@ -9,9 +9,12 @@
 支持的量化类型:
 """
 
+import builtins
 import os
 import json
 import gc
+import sys
+from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -906,7 +909,8 @@ def _load_msslim_quant_param(name: str, param, sf_reader: ShardWeightReader,
 
 def _load_named_buffers(model: nn.Module, sf_reader: ShardWeightReader,
                         layer_set: set, load_embed_only: bool,
-                        load_norm_head_only: bool) -> int:
+                        load_norm_head_only: bool,
+                        strict_embed_buffer_ids: Optional[set] = None) -> int:
     """Load register_buffer tensors (e.g. e_score_correction_bias). Returns loaded count.
 
     Extracted from load_layer_weights_indexed.
@@ -916,6 +920,12 @@ def _load_named_buffers(model: nn.Module, sf_reader: ShardWeightReader,
         return loaded_count
     for bname, buf in model.named_buffers():
         if buf is None:
+            continue
+        if (
+            load_embed_only
+            and strict_embed_buffer_ids is not None
+            and id(buf) not in strict_embed_buffer_ids
+        ):
             continue
         b_layer_idx = _extract_layer_idx(bname)
         if not _decide_should_load(bname, b_layer_idx, layer_set,
@@ -1015,6 +1025,7 @@ def load_layer_weights_indexed(
     quant_desc: dict = None,
     use_fake_quant: bool = False,
     skip_routed_experts: bool = False,
+    strict_embed_only: bool = False,
     verbose: bool = True,
 ) -> int:
     """按需加载指定层权重 (使用 safe_open + get_tensor，避免 load_file 读整个 shard)
@@ -1039,6 +1050,7 @@ def load_layer_weights_indexed(
         quant_desc: 量化描述 dict (quant_model_description.json, 仅 msmodelslim 需要)
         use_fake_quant: 是否 fake quant
         skip_routed_experts: 跳过 routed experts 权重加载 (由 _moe_forward_chunked streaming 读取)
+        strict_embed_only: layers=[] 时只加载实际 text embedding 模块，跳过视觉/projector
         verbose: 是否打印进度
 
     Returns:
@@ -1053,6 +1065,16 @@ def load_layer_weights_indexed(
     loaded_count = 0
     skipped_count = 0
 
+    strict_embed_param_ids = None
+    strict_embed_buffer_ids = None
+    if load_embed_only and strict_embed_only:
+        from .utils import get_embed_module
+        embed_module = get_embed_module(model)
+        if embed_module is None:
+            raise RuntimeError("Strict embedding load requested but no embedding module was found")
+        strict_embed_param_ids = {id(param) for param in embed_module.parameters()}
+        strict_embed_buffer_ids = {id(buf) for buf in embed_module.buffers()}
+
     # 修正 quant_desc key 与 named_modules() 的前缀不匹配
     if is_quant and quant_desc is not None:
         quant_desc = normalize_quant_desc_keys(quant_desc, model)
@@ -1064,6 +1086,12 @@ def load_layer_weights_indexed(
         quant_desc_str = None
 
     for name, param in model.named_parameters():
+        if (
+            strict_embed_param_ids is not None
+            and id(param) not in strict_embed_param_ids
+        ):
+            skipped_count += 1
+            continue
         layer_idx = _extract_layer_idx(name)
         should_load = _decide_should_load(
             name, layer_idx, layer_set, load_embed_only, load_norm_head_only,
@@ -1094,7 +1122,8 @@ def load_layer_weights_indexed(
 
     # 加载 register_buffer 注册的非参数张量
     loaded_count += _load_named_buffers(
-        model, sf_reader, layer_set, load_embed_only, load_norm_head_only
+        model, sf_reader, layer_set, load_embed_only, load_norm_head_only,
+        strict_embed_buffer_ids=strict_embed_buffer_ids,
     )
 
     if verbose:
@@ -1585,10 +1614,174 @@ def _load_speculators_verifier_weights(
         ) from exc
 
 
+_MISSING_GLOBAL = object()
+
+
+def _kimi_expert_counts(config) -> set:
+    """Return routed-expert counts from outer and nested Kimi configs."""
+    counts = set()
+    for candidate in (config, getattr(config, "text_config", None)):
+        value = getattr(candidate, "num_experts", None)
+        if isinstance(value, int) and value > 1:
+            counts.add(value)
+    return counts
+
+
+def _load_kimi_modeling_modules(config, model_path: str) -> tuple:
+    """Import Kimi remote code without constructing the model yet."""
+    auto_map = getattr(config, "auto_map", None) or {}
+    class_ref = auto_map.get("AutoModelForCausalLM") or auto_map.get("AutoModel")
+    if isinstance(class_ref, (list, tuple)):
+        class_ref = class_ref[0] if class_ref else None
+    if not class_ref:
+        raise RuntimeError(
+            "Kimi streaming skeleton requires an AutoModelForCausalLM entry "
+            "in config.auto_map"
+        )
+
+    try:
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+        model_cls = get_class_from_dynamic_module(class_ref, model_path)
+    except Exception as exc:
+        raise RuntimeError(
+            "Unable to import Kimi remote code before streaming skeleton creation"
+        ) from exc
+
+    package_prefix = model_cls.__module__.rsplit(".", 1)[0]
+    modules = []
+    for name, module in tuple(sys.modules.items()):
+        if module is None or not name.startswith(package_prefix + "."):
+            continue
+        if (
+            name == model_cls.__module__
+            or name.endswith(".modeling_kimi_linear")
+            or hasattr(module, "KimiBlockSparseMLP")
+        ):
+            modules.append(module)
+    has_linear_modeling = any(
+        getattr(module, "__name__", "").endswith(".modeling_kimi_linear")
+        or hasattr(module, "KimiBlockSparseMLP")
+        for module in modules
+    )
+    if not has_linear_modeling:
+        raise RuntimeError(
+            "Kimi remote code was imported but modeling_kimi_linear was not found; "
+            "refusing to fall back to a full 896-expert skeleton"
+        )
+    return model_cls, modules
+
+
+@contextmanager
+def _kimi_streaming_construction(config, model_path: str, enabled: bool):
+    """Collapse Kimi's per-layer expert construction while building on meta.
+
+    Kimi's remote code uses ``range(config.num_experts)`` to instantiate one
+    Python module per routed expert. grouped_dual never executes those modules;
+    it streams the selected expert tensors directly from safetensors. During
+    skeleton construction, replace only that module-local range with range(1)
+    and suppress Kimi post_init weight initialization, which is unnecessary for
+    a checkpoint-backed meta skeleton.
+    """
+    if not enabled:
+        yield set(), None
+        return
+
+    expert_counts = _kimi_expert_counts(config)
+    if not expert_counts:
+        raise RuntimeError(
+            "Kimi streaming skeleton requested but num_experts was not found"
+        )
+    model_cls, modules = _load_kimi_modeling_modules(config, model_path)
+
+    patched_globals = []
+    patched_post_init = []
+
+    def streaming_range(*args):
+        if len(args) == 1 and args[0] in expert_counts:
+            return builtins.range(1)
+        return builtins.range(*args)
+
+    try:
+        for module in modules:
+            old_range = module.__dict__.get("range", _MISSING_GLOBAL)
+            module.__dict__["range"] = streaming_range
+            patched_globals.append((module, old_range))
+
+            for value in tuple(module.__dict__.values()):
+                if not isinstance(value, type) or not value.__name__.startswith("Kimi"):
+                    continue
+                if not hasattr(value, "post_init"):
+                    continue
+                old_post_init = value.__dict__.get("post_init", _MISSING_GLOBAL)
+                value.post_init = lambda self: None
+                patched_post_init.append((value, old_post_init))
+        yield expert_counts, model_cls
+    finally:
+        for cls, old_post_init in reversed(patched_post_init):
+            if old_post_init is _MISSING_GLOBAL:
+                delattr(cls, "post_init")
+            else:
+                cls.post_init = old_post_init
+        for module, old_range in reversed(patched_globals):
+            if old_range is _MISSING_GLOBAL:
+                module.__dict__.pop("range", None)
+            else:
+                module.__dict__["range"] = old_range
+
+
+def _finalize_kimi_streaming_skeleton(model: nn.Module, expert_counts: set) -> int:
+    """Replace the one prototype expert per Kimi MoE layer with Identity."""
+    collapsed_layers = 0
+    for module in model.modules():
+        experts = getattr(module, "experts", None)
+        module_config = getattr(module, "config", None)
+        configured_count = getattr(module_config, "num_experts", None)
+        if configured_count not in expert_counts or not isinstance(experts, nn.ModuleList):
+            continue
+        if len(experts) != 1:
+            raise RuntimeError(
+                "Kimi streaming skeleton failed to collapse routed experts: "
+                f"expected 1 prototype, found {len(experts)}"
+            )
+        experts[0] = nn.Identity()
+        module.num_experts = configured_count
+        if hasattr(module, "experts_per_rank"):
+            module.experts_per_rank = configured_count
+        module._acc_bench_streaming_experts = True
+        collapsed_layers += 1
+
+    if collapsed_layers == 0:
+        raise RuntimeError(
+            "Kimi streaming skeleton did not find any routed MoE layers; "
+            "refusing to materialize the full model"
+        )
+    return collapsed_layers
+
+
+def _force_kimi_eager_attention(model: nn.Module) -> None:
+    """Undo Kimi remote code's forced FlashAttention choice before L1 forward."""
+    seen_configs = set()
+    for candidate in (
+        getattr(model, "config", None),
+        getattr(getattr(model, "config", None), "text_config", None),
+    ):
+        if candidate is not None:
+            seen_configs.add(id(candidate))
+            candidate._attn_implementation = "eager"
+    for module in model.modules():
+        module_config = getattr(module, "config", None)
+        if module_config is not None and id(module_config) not in seen_configs:
+            module_config._attn_implementation = "eager"
+            seen_configs.add(id(module_config))
+        if hasattr(module, "_use_flash_attention_2"):
+            module._use_flash_attention_2 = False
+
+
 def create_model_skeleton(
     model_path: str,
     dtype: torch.dtype = torch.bfloat16,
     verbose: bool = True,
+    streaming_experts: bool = False,
 ) -> nn.Module:
     """
     只创建模型骨架（meta device），不加载任何权重。
@@ -1599,13 +1792,18 @@ def create_model_skeleton(
         model_path: 模型路径
         dtype: 数据类型
         verbose: 是否打印进度
+        streaming_experts: Kimi grouped_dual 使用轻量 expert 占位并保持整模 meta
 
     Returns:
         模型骨架（meta device）
     """
     from .dspark import is_dspark_checkpoint
+    from .kimi_fla_shim import is_kimi_k3_checkpoint
 
     is_dspark = is_dspark_checkpoint(model_path)
+    use_kimi_streaming_skeleton = (
+        streaming_experts and is_kimi_k3_checkpoint(model_path)
+    )
     # 加载config。DSpark 不能交给 AutoModelForCausalLM，否则会按 verifier 的
     # model_type 创建普通 Qwen/Gemma 模型并丢掉 Markov/confidence head。
     if is_dspark:
@@ -1634,9 +1832,21 @@ def create_model_skeleton(
 
     # 创建模型结构 (meta device)
     # 多模态 ForConditionalGeneration 模型不能用 AutoModelForCausalLM，需用 architectures 指定的类
-    with torch.device('meta'):
+    with _kimi_streaming_construction(
+        config, model_path, enabled=use_kimi_streaming_skeleton
+    ) as kimi_streaming_context, torch.device('meta'):
+        kimi_expert_counts, kimi_model_cls = kimi_streaming_context
         if is_dspark:
             model, config = _create_dspark_model_from_config(model_path, dtype)
+        elif use_kimi_streaming_skeleton:
+            # Reuse the class imported before the scoped range/post_init patch;
+            # calling AutoModel again could reload the dynamic module and lose it.
+            config._attn_implementation = "eager"
+            model = kimi_model_cls._from_config(
+                config,
+                torch_dtype=dtype,
+                attn_implementation="eager",
+            )
         else:
             try:
                 model = AutoModelForCausalLM.from_config(
@@ -1660,7 +1870,20 @@ def create_model_skeleton(
                 # 设置 dtype
                 for p in model.parameters():
                     p.data = p.data.to(dtype)
-    model = model.to_empty(device='cpu')
+    if use_kimi_streaming_skeleton:
+        collapsed_layers = _finalize_kimi_streaming_skeleton(
+            model, kimi_expert_counts
+        )
+        _force_kimi_eager_attention(model)
+        model._acc_bench_lazy_meta = True
+        if verbose:
+            logger.info(
+                "  Kimi streaming skeleton: %d MoE layers; routed experts stay "
+                "in safetensors and inactive layers stay on meta",
+                collapsed_layers,
+            )
+    else:
+        model = model.to_empty(device='cpu')
 
     return model
 

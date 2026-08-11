@@ -10,6 +10,7 @@ L1: 逐block对比
 """
 
 import os
+import time
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -290,7 +291,11 @@ class ShardedBlockComparator:
         if rotary is None:
             return
         single_dev = device.split(',')[0] if ',' in device else device
-        rotary.to(single_dev)
+        rotary_tensors = tuple(rotary.parameters()) + tuple(rotary.buffers())
+        if any(tensor.is_meta for tensor in rotary_tensors):
+            rotary.to_empty(device=single_dev)
+        else:
+            rotary.to(single_dev)
         if hasattr(rotary, 'config') and hasattr(rotary, 'compute_default_rope_parameters'):
             inv_freq, attn_scaling = type(rotary).compute_default_rope_parameters(rotary.config, device=single_dev)
             rotary.inv_freq = inv_freq
@@ -310,12 +315,44 @@ class ShardedBlockComparator:
         if self.verbose:
             logger.info(f"\n[Sharded L1] 创建模型骨架...")
 
-        ref_model = create_model_skeleton(self.ref_model_path, self.dtype, verbose=False)
-        quant_model = create_model_skeleton(self.quant_model_path, self.dtype, verbose=False)
+        streaming_experts = self.compare_mode == "grouped_dual"
+        skeleton_started = time.perf_counter()
+        ref_model = create_model_skeleton(
+            self.ref_model_path,
+            self.dtype,
+            verbose=self.verbose,
+            streaming_experts=streaming_experts,
+        )
+        ref_seconds = time.perf_counter() - skeleton_started
+        quant_started = time.perf_counter()
+        quant_model = create_model_skeleton(
+            self.quant_model_path,
+            self.dtype,
+            verbose=self.verbose,
+            streaming_experts=streaming_experts,
+        )
+        quant_seconds = time.perf_counter() - quant_started
+        ref_lazy_meta = bool(getattr(ref_model, "_acc_bench_lazy_meta", False))
+        quant_lazy_meta = bool(getattr(quant_model, "_acc_bench_lazy_meta", False))
 
         if self.verbose:
-            logger.info(f"  ref/quant 模型骨架已创建")
+            logger.info(
+                "  ref/quant 模型骨架已创建: ref=%.1fs, quant=%.1fs, mode=%s",
+                ref_seconds,
+                quant_seconds,
+                "streaming-meta" if ref_lazy_meta or quant_lazy_meta else "cpu",
+            )
             logger.info(f"  加载 embed_tokens, rotary_emb 到各自设备...")
+
+        # Kimi streaming skeletons intentionally keep the full model on meta.
+        # Only text embeddings are needed before the first decoder shard.
+        from .utils import get_embed_module
+        for model in (ref_model, quant_model):
+            embed_module = get_embed_module(model)
+            if embed_module is None:
+                raise RuntimeError("L1 skeleton has no embedding module")
+            if any(param.is_meta for param in embed_module.parameters()):
+                embed_module.to_empty(device="cpu")
 
         # 构建 weight_map + reader，缓存到 self 供后续 shard 加载复用
         if not hasattr(self, '_ref_weight_map') or self._ref_weight_map is None:
@@ -326,11 +363,13 @@ class ShardedBlockComparator:
                                    self._ref_weight_map, self._ref_reader,
                                    is_quant=self._ref_is_quant, is_ct=self._ref_is_ct,
                                    quant_desc=self._ref_quant_desc,
+                                   strict_embed_only=ref_lazy_meta,
                                    verbose=True)
         load_layer_weights_indexed(quant_model, self.quant_model_path, layers, quant_device, self.dtype,
                                    self._quant_weight_map, self._quant_reader,
                                    is_quant=self._quant_is_quant, is_ct=self._quant_is_ct,
                                    quant_desc=self._quant_quant_desc,
+                                   strict_embed_only=quant_lazy_meta,
                                    verbose=True)
 
         # rotary_emb 初始化
@@ -753,6 +792,14 @@ class ShardedBlockComparator:
         """Load norm and lm_head modules to CPU."""
         from .model_loader import load_layer_weights_indexed
         from .utils import get_norm_module, get_lm_head_module
+
+        for model in (ref_model, quant_model):
+            for module in (get_norm_module(model), get_lm_head_module(model)):
+                if module is None:
+                    continue
+                tensors = tuple(module.parameters()) + tuple(module.buffers())
+                if any(tensor.is_meta for tensor in tensors):
+                    module.to_empty(device="cpu")
 
         load_layer_weights_indexed(ref_model, self.ref_model_path, [-1], 'cpu', self.dtype,
                                    self._ref_weight_map, self._ref_reader,

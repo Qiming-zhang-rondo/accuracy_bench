@@ -2,6 +2,8 @@
 
 ## 2026-08-11 — Kimi K3 Ascend KDA fallback
 
+- Kimi `grouped_dual` 改为真正的 streaming-meta 骨架：构造期不再实例化 92×896 routed experts，也不再整模 `to_empty(cpu)`；仅物化当前 shard，完成后立即卸载回 meta
+- Kimi remote code 强制设置的 `flash_attention_2` 在骨架创建后恢复为 eager，避免 MLA forward 误入 CUDA FlashAttention 路径
 - 新增 `--kimi_kda_backend auto|torch|chunk|fused_recurrent`；Ascend `auto` 默认使用无 Triton 依赖的 eager torch KDA recurrence
 - 修复 Kimi remote code 在模型创建前强制 import FLA 的时序问题；torch backend 预装 ShortConvolution、FusedRMSNormGated、KDA 与 mask utils 兼容 shim，不再要求环境安装 `fla-core`
 - torch fallback 对齐 FLA KDA 的 q/k L2Norm、gate、beta、delta-rule、GVA 与 state layout 契约
