@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-08-11 — Kimi K3 Ascend KDA fallback
+
+- 新增 `--kimi_kda_backend auto|torch|chunk|fused_recurrent`；Ascend `auto` 默认使用无 Triton 依赖的 eager torch KDA recurrence
+- torch fallback 对齐 FLA KDA 的 q/k L2Norm、gate、beta、delta-rule、GVA 与 state layout 契约
+- shard forward 失败后不再调用会同步设备的 `empty_cache()`，避免 NPU 异常 context 将原始错误覆盖成 507014 timeout
+- 参数页接入 KDA backend 推荐、预检状态和命令生成
+
 ## 2026-08-06 — W8A8 streaming 修复 + CLI 命令生成器
 
 - 修复 `grouped_dual` streaming expert 将普通 W8A8/W8A8_DYNAMIC INT8 权重直接 cast 到浮点、未执行反量化的问题；统一复用普通层的反量化分派

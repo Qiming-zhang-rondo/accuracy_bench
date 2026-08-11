@@ -149,6 +149,19 @@ def test_activation_quant_type_added():
     assert found, "--activation_quant_type 参数未找到"
 
 
+def test_kimi_kda_backend_added():
+    """Kimi K3 exposes an Ascend-safe KDA backend policy."""
+    calls = _get_add_argument_calls(_parse_run_script())
+    for name, kwargs in calls:
+        if name == "--kimi_kda_backend":
+            assert kwargs.get("default") == "auto"
+            assert kwargs.get("choices") == [
+                "auto", "torch", "chunk", "fused_recurrent"
+            ]
+            return
+    raise AssertionError("--kimi_kda_backend 参数未找到")
+
+
 # ---------------------------------------------------------------------------
 # 6. subgraph_locate.py 无 import argparse
 # ---------------------------------------------------------------------------

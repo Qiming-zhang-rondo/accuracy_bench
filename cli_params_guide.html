@@ -713,6 +713,16 @@
               </select>
             </div>
             <div>
+              <label for="kimiKdaBackend">Kimi K3 KDA 后端</label>
+              <select id="kimiKdaBackend">
+                <option value="auto">auto · Ascend 推荐</option>
+                <option value="torch">torch · 无 Triton 依赖</option>
+                <option value="fused_recurrent">fused_recurrent · 兼容路径</option>
+                <option value="chunk">chunk · 原模型默认</option>
+              </select>
+              <span class="hint">auto 在 NPU 上使用原生 torch recurrence，完全避开当前无法编译的 Triton KDA；非 Kimi 模型会忽略。</span>
+            </div>
+            <div>
               <label for="layersPerShard">每个 shard 层数</label>
               <input id="layersPerShard" type="number" min="1" value="2">
             </div>
@@ -890,6 +900,7 @@
             <tr><td><code>--ref_devices</code></td><td>空</td><td>grouped_dual 的 ref 多卡列表，例如 npu:0,1。</td></tr>
             <tr><td><code>--quant_devices</code></td><td>空</td><td>grouped_dual 的 quant 多卡列表，例如 npu:2,3。</td></tr>
             <tr><td><code>--expert_chunk_size</code></td><td>按卡数自动</td><td>grouped_dual 每批 expert 数；通常留空。</td></tr>
+            <tr><td><code>--kimi_kda_backend</code></td><td>auto</td><td>auto / torch / chunk / fused_recurrent；auto 在 Ascend 上使用等价的 torch KDA recurrence，完全避开 Triton KDA 编译失败。</td></tr>
             <tr><td><code>--output_dir</code></td><td>自动</td><td>单次报告目录；留空或填写 reports 时自动创建带时间戳目录。重复使用已有非空目录时自动创建同级归档，避免覆盖历史。</td></tr>
             <tr><td><code>--model_type</code></td><td>auto</td><td>支持 dense、moe、GLM、Qwen3 系列、Qwen3.6、Kimi K3 与 dspark。</td></tr>
             <tr><td><code>--dspark_sample</code></td><td>空（必需）</td><td>DSpark verifier hidden-state .pt；包含 input_ids、hidden_states、loss_mask 等。</td></tr>
@@ -920,7 +931,7 @@
       var ids = [
         "refModel", "quantModel", "mode", "modelType", "visibleDevices",
         "modelSizeB", "perDeviceMemory", "refDevices", "quantDevices",
-        "compareMode", "layersPerShard",
+        "compareMode", "kimiKdaBackend", "layersPerShard",
         "quantMethod", "dtype", "cacheTopK", "outputDir", "prompt",
         "dsparkSample", "dsparkSeed", "dsparkAnchors", "rotationMatrix",
         "targetLayers", "expertChunkSize", "frameworkBadOutput"
@@ -1157,6 +1168,9 @@
         if (el.expertChunkSize.value && (!/^\d+$/.test(el.expertChunkSize.value) || Number(el.expertChunkSize.value) < 1)) {
           addIssue(errors, "expertChunkSize", "expert_chunk_size 必须是大于 0 的整数");
         }
+        if (type === "kimi_k3" && ["chunk", "fused_recurrent"].indexOf(el.kimiKdaBackend.value) !== -1) {
+          warnings.push("所选 KDA backend 仍依赖 FLA/Triton；CANN 8.5.1 环境建议使用 auto 或 torch");
+        }
         if (mode === "l2" && !/^\d+(?:[\s,]+\d+)*$/.test(el.targetLayers.value.trim())) {
           addIssue(errors, "targetLayers", "L2 目标层必填，例如 27 或 27,31,38");
         }
@@ -1195,6 +1209,7 @@
         addStatus("推荐 " + recommendation.cards + " 张物理卡，layers_per_shard=" + recommendation.layers, "ok");
         if (type === "dspark") addStatus("DSpark 已固定为 l1 + dual + dequantize", "ok");
         if (isMoe(type) && type !== "dspark") addStatus("MoE 使用 grouped_dual 流式 expert", "ok");
+        if (type === "kimi_k3") addStatus("KDA backend=" + el.kimiKdaBackend.value + "；auto 在 Ascend 上使用无 Triton 依赖的 torch recurrence", "ok");
         if (el.rotationMatrix.value.trim()) addStatus("已加入 rotation_matrix；请确认 ref/quant 旋转契约一致", "ok");
         else if (["l1", "l2", "full"].indexOf(mode) !== -1) addStatus("未使用旋转矩阵：适用于非旋转量化或 R 已融合 checkpoint", "");
         if (["l1", "l2", "full"].indexOf(mode) !== -1) {
@@ -1262,6 +1277,7 @@
           args.push(line("--dtype", el.dtype.value));
           args.push(line("--per_device_memory", el.perDeviceMemory.value || "64"));
           if (el.expertChunkSize.value) args.push(line("--expert_chunk_size", el.expertChunkSize.value));
+          if (type === "kimi_k3") args.push(line("--kimi_kda_backend", el.kimiKdaBackend.value));
         } else if (mode === "l2") {
           args.push(line("--ref_devices", el.refDevices.value.trim() || "npu:0"));
           args.push(line("--quant_devices", el.quantDevices.value.trim() || "npu:1"));
@@ -1336,6 +1352,7 @@
           el.visibleDevices.value = "0,1,2,3,4,5,6,7";
           el.layersPerShard.value = "2";
           el.cacheTopK.value = "1";
+          el.kimiKdaBackend.value = "auto";
         } else if (name === "dspark") {
           el.mode.value = "l1";
           el.modelType.value = "dspark";

@@ -126,6 +126,7 @@ class ShardedBlockComparator:
         ref_devices: Optional[List[str]] = None,
         quant_devices: Optional[List[str]] = None,
         expert_chunk_size: Optional[int] = None,
+        kimi_kda_backend: str = "auto",
         activation_quant: bool = False,
         activation_quant_type: str = "W8A8_MXFP8",
         # Full logits capture on the L1 forward pass (no extra model reload).
@@ -153,6 +154,12 @@ class ShardedBlockComparator:
         self.ref_devices = ref_devices or [ref_device]
         self.quant_devices = quant_devices or [quant_device]
         self.expert_chunk_size = expert_chunk_size
+        if kimi_kda_backend not in {"auto", "torch", "chunk", "fused_recurrent"}:
+            raise ValueError(
+                "kimi_kda_backend must be auto, torch, chunk, or fused_recurrent"
+            )
+        self.kimi_kda_backend = kimi_kda_backend
+        self._kimi_kda_backend_logged = False
         self.activation_quant = activation_quant
         self.activation_quant_type = activation_quant_type
         self.collect_full_logits = collect_full_logits
@@ -1056,6 +1063,7 @@ class ShardedBlockComparator:
             for model in [ref_model, quant_model]:
                 self._materialize_meta_layers(model, layers)
 
+            shard_succeeded = False
             try:
                 load_layer_weights_indexed(ref_model, self.ref_model_path, layers, ref_device, self.dtype,
                                            ref_weight_map, ref_reader,
@@ -1118,18 +1126,21 @@ class ShardedBlockComparator:
                         ref_mem = torch.npu.memory_allocated(ref_device) / 1024**3
                         quant_mem = torch.npu.memory_allocated(quant_device) / 1024**3
                         logger.info(f"  [NPU MEM] ref: {ref_mem:.1f}GB, quant: {quant_mem:.1f}GB")
+                shard_succeeded = True
             finally:
                 # 清理激活伪量化 hook (在 unload 前移除，避免 hook 引用已释放的模块)
                 self._clear_activation_quant_hooks()
 
-                # 清理当前 shard 的层：移回 meta device 释放 CPU+NPU 内存
-                # 之前用 move_layers_to_device(layers, 'cpu') 只移到 CPU，权重仍占内存
-                # 对 MoE 模型（GLM5.1 每层 256 experts ~21GB）会导致 CPU OOM
-                unload_layers_to_meta(ref_model, layers)
-                unload_layers_to_meta(quant_model, layers)
+                # A failed asynchronous NPU kernel poisons the device context.
+                # Synchronizing in empty_cache then masks the original error
+                # with 507014.  The process is terminating, so skip device
+                # cleanup and preserve the actionable root exception.
+                if shard_succeeded:
+                    unload_layers_to_meta(ref_model, layers)
+                    unload_layers_to_meta(quant_model, layers)
 
-                from .utils import clear_device_cache
-                clear_device_cache()
+                    from .utils import clear_device_cache
+                    clear_device_cache()
 
             if self.verbose:
                 logger.info(f"  [RSS] after unload+gc: {self._get_rss_gb():.1f}GB")
@@ -1236,6 +1247,7 @@ class ShardedBlockComparator:
             # materialize meta layers + 替换 3D routed expert params 为 placeholder
             self._materialize_and_replace_experts(ref_model, quant_model, layers)
 
+            shard_succeeded = False
             try:
                 # streaming 模式跳过 routed experts
                 load_layer_weights_indexed(ref_model, self.ref_model_path, layers, ref_device, self.dtype,
@@ -1290,14 +1302,16 @@ class ShardedBlockComparator:
 
                 if self.verbose:
                     logger.info(f"  [RSS] after forward: {self._get_rss_gb():.1f}GB")
+                shard_succeeded = True
             finally:
                 self._clear_activation_quant_hooks()
 
-                unload_layers_to_meta(ref_model, layers)
-                unload_layers_to_meta(quant_model, layers)
+                if shard_succeeded:
+                    unload_layers_to_meta(ref_model, layers)
+                    unload_layers_to_meta(quant_model, layers)
 
-                from .utils import clear_device_cache
-                clear_device_cache(set(self.ref_devices + self.quant_devices))
+                    from .utils import clear_device_cache
+                    clear_device_cache(set(self.ref_devices + self.quant_devices))
 
             if self.verbose:
                 logger.info(f"  [RSS] after unload+gc: {self._get_rss_gb():.1f}GB")
@@ -2234,10 +2248,83 @@ class ShardedBlockComparator:
             state = state.to(hidden_states.device)
         return {state_name: state}
 
+    @staticmethod
+    def _resolve_kimi_kda_backend(requested: str, device) -> Optional[str]:
+        """Resolve the Kimi KDA execution mode for the current device."""
+        if requested != "auto":
+            return requested
+        device_type = getattr(device, "type", str(device).split(":", 1)[0])
+        if str(device_type).lower() == "npu":
+            # Kimi's chunk_kda reaches chunk_gla kernels that are not compiled
+            # by the CANN 8.5.1 Triton-Ascend stack.  Use an equivalent eager
+            # torch recurrence so this correctness tool does not depend on a
+            # Triton KDA compiler path at all.
+            return "torch"
+        return None
+
+    def _configure_kimi_kda_backend(self, layer, hidden_states) -> Optional[str]:
+        """Select Kimi K3's KDA backend without touching MLA layers."""
+        attn = getattr(layer, "self_attn", None)
+        is_kda = bool(
+            attn is not None
+            and getattr(attn, "q_conv1d", None) is not None
+            and getattr(attn, "f_a_proj", None) is not None
+            and hasattr(attn, "mode")
+        )
+        if not is_kda:
+            return None
+        backend = self._resolve_kimi_kda_backend(
+            getattr(self, "kimi_kda_backend", "auto"), hidden_states.device
+        )
+        if backend is None:
+            return getattr(attn, "mode", None)
+        forward_fn = getattr(attn.forward, "__func__", attn.forward)
+        forward_globals = getattr(forward_fn, "__globals__", None)
+        if forward_globals is None:
+            raise RuntimeError(
+                "[Kimi K3] cannot configure KDA backend: forward globals unavailable"
+            )
+        original_chunk_key = "__acc_bench_original_chunk_kda"
+        original_recurrent_key = "__acc_bench_original_fused_recurrent_kda"
+        if original_chunk_key not in forward_globals:
+            forward_globals[original_chunk_key] = forward_globals.get("chunk_kda")
+        if original_recurrent_key not in forward_globals:
+            forward_globals[original_recurrent_key] = forward_globals.get(
+                "fused_recurrent_kda"
+            )
+
+        if backend == "torch":
+            from .kimi_kda import torch_recurrent_kda
+            forward_globals["chunk_kda"] = torch_recurrent_kda
+            forward_globals["fused_recurrent_kda"] = torch_recurrent_kda
+            # Both branches are patched; use chunk for compatibility with old
+            # Kimi remote-code versions that only recognize this mode.
+            attn.mode = "chunk"
+        else:
+            original_chunk = forward_globals.get(original_chunk_key)
+            original_recurrent = forward_globals.get(original_recurrent_key)
+            if original_chunk is not None:
+                forward_globals["chunk_kda"] = original_chunk
+            if original_recurrent is not None:
+                forward_globals["fused_recurrent_kda"] = original_recurrent
+            attn.mode = backend
+        if (getattr(self, "verbose", False)
+                and not getattr(self, "_kimi_kda_backend_logged", False)):
+            logger.info(
+                "[Kimi K3] KDA backend: %s%s",
+                backend,
+                " (auto-selected for Ascend NPU)"
+                if getattr(self, "kimi_kda_backend", "auto") == "auto" else "",
+            )
+            self._kimi_kda_backend_logged = True
+        return backend
+
     def _forward_single_dual_layer(self, ref_layer, quant_layer, ref_hidden, quant_hidden,
                                      ref_pos_ids, quant_pos_ids, ref_pe, quant_pe,
                                      ref_prev_topk, quant_prev_topk):
         """forward 单层 ref+quant，返回更新后的 hidden + prev_topk。"""
+        self._configure_kimi_kda_backend(ref_layer, ref_hidden)
+        self._configure_kimi_kda_backend(quant_layer, quant_hidden)
         ref_fwd_kwargs = {}
         if ref_pe is not None:
             ref_fwd_kwargs['position_embeddings'] = ref_pe

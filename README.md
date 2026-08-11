@@ -89,7 +89,7 @@ python3 run_accuracy_check.py --mode boundary \
 ## 支持范围
 
 - **模型**: GLM-5.1 (MLA + DSA + MoE, QuaRot) / Qwen3 / Qwen3MoE / Qwen3VL / Qwen3.5 MoE / **Qwen3.6** / **Kimi K3** / **DeepSpec、Speculators DSpark standalone draft（专用 L1）**
-  > Kimi K3 已支持 text backbone 的 KDA/MLA、Stable LatentMoE、AttnRes、SiTU 和嵌套 MXFP4 配置；官方模型代码依赖 `fla-core`，Ascend 环境仍需提供可在 NPU 上运行的 KDA kernel/backend。
+  > Kimi K3 已支持 text backbone 的 KDA/MLA、Stable LatentMoE、AttnRes、SiTU 和嵌套 MXFP4 配置。`--kimi_kda_backend auto` 在 Ascend 上使用原生 PyTorch/NPU KDA recurrence，避开 CANN 8.5.1 无法编译的 FLA `chunk_kda` Triton 路径；确认环境内核兼容后可显式选 `chunk` 或 `fused_recurrent`。
   > Kimi K3 官方 896-expert `ModuleList` 必须用 `--compare_mode grouped_dual` 跑 L1；MoE 层 L2 暂不物化全部专家，会明确拒绝并提示使用流式 replay/内部 packed 模型。该边界待内网 NPU 回归后继续收敛。
   > GLM-5.2 (head_dim=192, indexer_types) 需按 `reference_glm_version_identification` 自行校验结构和子图兼容性
 - **量化格式**: W8A8 / W4A8 / W4A4 / MXFP8 / MXFP4 / compressed-tensors (自动识别)

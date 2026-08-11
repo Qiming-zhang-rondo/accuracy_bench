@@ -116,6 +116,16 @@ def parse_args():
                         help="L1: quant 多卡设备 (如 'npu:2,npu:3')")
     parser.add_argument("--expert_chunk_size", type=int, default=None,
                         help="L1: MoE expert chunk size (grouped_dual 模式)")
+    parser.add_argument(
+        "--kimi_kda_backend",
+        type=str,
+        default="auto",
+        choices=["auto", "torch", "chunk", "fused_recurrent"],
+        help=(
+            "L1: Kimi K3 KDA backend. auto 在 Ascend NPU 上使用无 Triton "
+            "依赖的 torch recurrence，其他设备保留模型默认 chunk"
+        ),
+    )
     parser.add_argument("--output_dir", type=str, default=None,
                         help="报告输出目录")
     parser.add_argument("--model_type", type=str, default="auto",
@@ -363,6 +373,7 @@ def run_hf_l1(args, ref_device, target_device, dtype):
         ref_devices=_parse_dev_list(getattr(args, 'ref_devices', None)),
         quant_devices=_parse_dev_list(getattr(args, 'quant_devices', None)),
         expert_chunk_size=getattr(args, 'expert_chunk_size', None),
+        kimi_kda_backend=getattr(args, 'kimi_kda_backend', 'auto'),
     )
     prompt_text, input_ids = _resolve_input(args, tokenizer)
     logger.info(f"  输入: {prompt_text[:100]}")

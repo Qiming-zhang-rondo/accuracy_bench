@@ -9,6 +9,7 @@ import torch.nn as nn
 class FakeKdaAttention(nn.Module):
     def __init__(self):
         super().__init__()
+        self.mode = "chunk"
         self.q_proj = nn.Linear(8, 8, bias=False)
         self.k_proj = nn.Linear(8, 8, bias=False)
         self.v_proj = nn.Linear(8, 8, bias=False)
@@ -170,3 +171,62 @@ def test_cache_entry_preserves_attnres_state():
     })
     assert unpacked_hidden is hidden
     assert unpacked_state is state
+
+
+def test_kimi_npu_auto_backend_avoids_triton_kda():
+    """Ascend auto mode patches both remote-code KDA branches to eager torch."""
+    from accuracy_checker.kimi_kda import torch_recurrent_kda
+    from accuracy_checker.layer1_block_compare import ShardedBlockComparator
+
+    def original_chunk(x):
+        return x
+
+    def original_recurrent(x):
+        return x
+    namespace = {
+        "chunk_kda": original_chunk,
+        "fused_recurrent_kda": original_recurrent,
+    }
+    exec("def forward(self, x):\n    return chunk_kda(x)", namespace)
+    attention_type = type(
+        "BackendKdaAttention",
+        (FakeKdaAttention,),
+        {"forward": namespace["forward"]},
+    )
+    layer = FakeKimiLayer()
+    layer.self_attn = attention_type()
+    comparator = object.__new__(ShardedBlockComparator)
+    comparator.kimi_kda_backend = "torch"
+    comparator.verbose = False
+
+    assert comparator._resolve_kimi_kda_backend("auto", "npu:0") == "torch"
+    assert comparator._resolve_kimi_kda_backend("auto", "cuda:0") is None
+    assert comparator._configure_kimi_kda_backend(
+        layer, torch.zeros(1, 2, 8)
+    ) == "torch"
+    forward_globals = layer.self_attn.forward.__func__.__globals__
+    assert forward_globals["chunk_kda"] is torch_recurrent_kda
+    assert forward_globals["fused_recurrent_kda"] is torch_recurrent_kda
+
+    comparator.kimi_kda_backend = "chunk"
+    comparator._configure_kimi_kda_backend(layer, torch.zeros(1, 2, 8))
+    assert forward_globals["chunk_kda"] is original_chunk
+    assert forward_globals["fused_recurrent_kda"] is original_recurrent
+
+
+def test_torch_kda_recurrence_matches_one_dimensional_delta_rule():
+    """The portable KDA path performs decay, correction, update, then readout."""
+    from accuracy_checker.kimi_kda import torch_recurrent_kda
+
+    q = torch.ones(1, 2, 1, 1)
+    k = torch.ones_like(q)
+    v = torch.tensor([[[[1.0]], [[2.0]]]])
+    g = torch.zeros_like(q)
+    beta = torch.ones(1, 2, 1)
+
+    output, state = torch_recurrent_kda(
+        q, k, v, g, beta, output_final_state=True
+    )
+
+    assert torch.allclose(output.flatten(), torch.tensor([1.0, 2.0]))
+    assert torch.allclose(state.flatten(), torch.tensor([2.0]))
