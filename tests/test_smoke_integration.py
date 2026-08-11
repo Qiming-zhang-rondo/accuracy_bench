@@ -328,10 +328,17 @@ class TestLogitsCompare:
 # ===========================================================================
 
 class _MockNorm(nn.Module):
-    """Tiny RMSNorm-like stand-in: weight + simple layer_norm-style forward."""
+    """Tiny RMSNorm stand-in that records whether its real forward was used."""
     def __init__(self, hidden):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden))
+        self.calls = 0
+
+    def forward(self, hidden_states):
+        self.calls += 1
+        variance = hidden_states.float().pow(2).mean(dim=-1, keepdim=True)
+        normalized = hidden_states.float() * torch.rsqrt(variance + 1e-6)
+        return (normalized * self.weight.float()).to(hidden_states.dtype)
 
 
 class _MockLmHead(nn.Module):
@@ -346,6 +353,8 @@ class _MockModel(nn.Module):
     """Bare bones skeleton with norm + lm_head so get_norm_module/get_lm_head_module resolve."""
     def __init__(self, hidden, vocab):
         super().__init__()
+        self.layers = nn.ModuleList([nn.Identity()])
+        self.embed_tokens = nn.Embedding(vocab, hidden)
         self.norm = _MockNorm(hidden)
         self.lm_head = _MockLmHead(hidden, vocab)
 
@@ -441,6 +450,43 @@ class TestCollectFullLogits:
         # norm/lm_head unloaded back to meta after collection (consistent with topk_cpu)
         assert next(ref_model.norm.parameters()).device.type == 'meta'
         assert next(ref_model.lm_head.parameters()).device.type == 'meta'
+
+    def test_tied_lm_head_is_restored_from_embedding(self):
+        """Missing lm_head key must use this checkpoint's embedding, not an empty head."""
+        cmp = self._make_comparator(hidden=8, vocab=12)
+        model = _MockModel(8, 12)
+        model.lm_head.weight = model.embed_tokens.weight
+        expected = model.embed_tokens.weight.detach().clone()
+        weight_map = {"model.embed_tokens.weight": "model.safetensors"}
+
+        restored = cmp._restore_tied_lm_head(
+            model, weight_map, "quant", torch.device("cpu"))
+
+        assert restored is True
+        assert torch.allclose(model.lm_head.weight, expected)
+        assert model.lm_head.weight is not model.embed_tokens.weight
+        assert model.lm_head.weight.abs().max().item() > 0
+
+    def test_cpu_topk_uses_real_final_norm(self, monkeypatch):
+        """Qwen RMSNorm forward must run; generic F.layer_norm is not equivalent."""
+        import accuracy_checker.model_loader as ML
+        monkeypatch.setattr(ML, "load_layer_weights_indexed", lambda *a, **kw: None)
+        cmp = self._make_comparator(hidden=8, vocab=12)
+        ref_model = _MockModel(8, 12)
+        quant_model = _MockModel(8, 12)
+        ref_hs = torch.randn(1, 3, 8)
+        quant_hs = torch.randn(1, 3, 8)
+
+        cmp._compute_logits_topk_cpu(ref_model, quant_model, ref_hs, quant_hs)
+
+        assert ref_model.norm.calls == 1
+        assert quant_model.norm.calls == 1
+
+    def test_constant_logits_are_rejected(self):
+        """An empty output head must not become a misleading logits_cos_sim=0 report."""
+        cmp = self._make_comparator()
+        with pytest.raises(RuntimeError, match="logits are constant"):
+            cmp._validate_logits(torch.zeros(1, 12), "quant")
 
     def test_collect_full_logits_caps_to_seq_len(self, monkeypatch):
         """If seq_len < max_positions, only seq_len positions are captured."""

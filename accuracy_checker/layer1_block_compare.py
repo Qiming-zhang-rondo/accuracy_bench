@@ -539,6 +539,10 @@ class ShardedBlockComparator:
                 norm_mod.to(device)
             if head_mod is not None:
                 head_mod.to(device)
+        self._restore_tied_lm_head(
+            ref_model, self._ref_weight_map, "ref", ref_device)
+        self._restore_tied_lm_head(
+            quant_model, self._quant_weight_map, "quant", quant_device)
 
         ref_hidden = ref_hidden_states.to(ref_device)
         quant_hidden = quant_hidden_states.to(quant_device)
@@ -555,8 +559,14 @@ class ShardedBlockComparator:
             # lm_head
             ref_head = get_lm_head_module(ref_model)
             quant_head = get_lm_head_module(quant_model)
-            ref_logits = ref_head(ref_hidden) if ref_head is not None else ref_hidden
-            quant_logits = quant_head(quant_hidden) if quant_head is not None else quant_hidden
+            if ref_head is None or quant_head is None:
+                raise RuntimeError(
+                    "[L1 logits] output projection is missing; cannot compute token logits"
+                )
+            ref_logits = ref_head(ref_hidden)
+            quant_logits = quant_head(quant_hidden)
+            self._validate_logits(ref_logits, "ref")
+            self._validate_logits(quant_logits, "quant")
 
             # logits cos_sim (取最后一个 token)
             last_idx = -1
@@ -616,6 +626,115 @@ class ShardedBlockComparator:
             quant_topk_tokens=quant_topk_tokens,
         )
 
+    @staticmethod
+    def _has_explicit_lm_head(model, head_mod, weight_map) -> bool:
+        """Whether the checkpoint stores the resolved output module's weight.
+
+        Match the actual module path instead of any key ending in
+        ``output_proj.weight``; the latter can accidentally match a decoder
+        layer projection or DSpark's verifier head.
+        """
+        if not weight_map or head_mod is None:
+            return False
+        try:
+            named_modules = model.named_modules(remove_duplicate=False)
+        except TypeError:  # older torch
+            named_modules = model.named_modules()
+        module_names = [
+            f"{name}.weight" if name else "weight"
+            for name, module in named_modules if module is head_mod
+        ]
+        for key in weight_map:
+            key = str(key)
+            if any(key == name or key.endswith(f".{name}") for name in module_names):
+                return True
+        # Common top-level CausalLM layout; keep this exact so
+        # ``verifier_lm_head.weight`` is not treated as the target head.
+        return "lm_head.weight" in {str(key) for key in weight_map}
+
+    def _restore_tied_lm_head(self, model, weight_map, label: str, device) -> bool:
+        """Restore an omitted lm_head from this model's embedding table.
+
+        Hugging Face checkpoints may omit ``lm_head.weight`` when it is tied to
+        ``embed_tokens.weight``.  The sharded skeleton is materialized with
+        ``to_empty()``, so relying on the constructor-time alias leaves an empty
+        output head.  Create an explicit copy for the final logits pass instead.
+        """
+        from .utils import get_embed_module, get_lm_head_module
+        embed_mod = get_embed_module(model)
+        head_mod = get_lm_head_module(model)
+        if not weight_map or self._has_explicit_lm_head(model, head_mod, weight_map):
+            return False
+        if embed_mod is None or head_mod is None:
+            raise RuntimeError(
+                f"[L1 logits] {label} checkpoint has no explicit lm_head.weight "
+                "and its tied embedding/output modules could not be resolved"
+            )
+        if not hasattr(embed_mod, "weight") or not hasattr(head_mod, "weight"):
+            raise RuntimeError(
+                f"[L1 logits] {label} tied embedding/output module has no weight"
+            )
+        if tuple(embed_mod.weight.shape) != tuple(head_mod.weight.shape):
+            raise RuntimeError(
+                f"[L1 logits] {label} cannot tie lm_head to embedding: "
+                f"embed={tuple(embed_mod.weight.shape)}, head={tuple(head_mod.weight.shape)}"
+            )
+        if embed_mod.weight.is_meta:
+            raise RuntimeError(
+                f"[L1 logits] {label} embedding is meta; cannot restore tied lm_head"
+            )
+
+        copied = embed_mod.weight.detach().to(device=device, dtype=self.dtype).clone()
+        head_mod.weight = nn.Parameter(copied, requires_grad=False)
+        logger.info(
+            "[L1 logits] %s checkpoint omits lm_head.weight; using tied "
+            "embed_tokens.weight (%s)", label, tuple(copied.shape)
+        )
+        return True
+
+    @staticmethod
+    def _validated_lm_head_weight(model, label: str) -> Tensor:
+        """Return CPU fp32 lm_head weight, rejecting empty/meta placeholders."""
+        from .utils import get_lm_head_module
+        head_mod = get_lm_head_module(model)
+        if head_mod is None or not hasattr(head_mod, "weight"):
+            raise RuntimeError(f"[L1 logits] {label} lm_head module is missing")
+        weight = head_mod.weight
+        if weight.is_meta:
+            raise RuntimeError(f"[L1 logits] {label} lm_head.weight is still meta")
+        flat = weight.detach().reshape(-1)
+        step = max(1, flat.numel() // 4096)
+        sample = flat[::step][:4096].float().cpu()
+        if sample.numel() == 0 or not torch.isfinite(sample).all():
+            raise RuntimeError(f"[L1 logits] {label} lm_head.weight is empty or non-finite")
+        if sample.abs().max().item() == 0:
+            raise RuntimeError(
+                f"[L1 logits] {label} lm_head.weight is all-zero; refusing invalid logits"
+            )
+        return weight.detach().cpu().float()
+
+    @staticmethod
+    def _apply_real_final_norm(hidden_states: Tensor, norm_mod, dtype) -> Tensor:
+        """Run the model's real final norm (RMSNorm/LayerNorm), not a substitute."""
+        hidden = hidden_states.detach().cpu().to(dtype)
+        if norm_mod is not None:
+            hidden = norm_mod(hidden)
+        return hidden.float()
+
+    @staticmethod
+    def _validate_logits(logits: Tensor, label: str) -> None:
+        """Reject non-finite or constant logits instead of reporting cos_sim=0."""
+        values = logits.detach().float()
+        if not torch.isfinite(values).all():
+            raise RuntimeError(f"[L1 logits] {label} logits contain NaN/Inf")
+        if values.shape[-1] > 1:
+            spread = values.amax(dim=-1) - values.amin(dim=-1)
+            if spread.max().item() <= 1e-12:
+                raise RuntimeError(
+                    f"[L1 logits] {label} logits are constant (spread=0); "
+                    "lm_head was not loaded correctly"
+                )
+
     def _load_norm_and_head_to_cpu(self, ref_model, quant_model):
         """Load norm and lm_head modules to CPU."""
         from .model_loader import load_layer_weights_indexed
@@ -639,6 +758,8 @@ class ShardedBlockComparator:
                 norm_mod.to('cpu')
             if head_mod is not None:
                 head_mod.to('cpu')
+        self._restore_tied_lm_head(ref_model, self._ref_weight_map, "ref", 'cpu')
+        self._restore_tied_lm_head(quant_model, self._quant_weight_map, "quant", 'cpu')
 
     def _unload_norm_and_head(self, ref_model, quant_model):
         """Unload norm and lm_head modules back to meta device."""
@@ -666,30 +787,22 @@ class ShardedBlockComparator:
 
         ref_norm_mod = get_norm_module(ref_model)
         quant_norm_mod = get_norm_module(quant_model)
-        ref_head = get_lm_head_module(ref_model)
-        quant_head = get_lm_head_module(quant_model)
-
-        # 取权重到 CPU float32
-        ref_norm_w = ref_norm_mod.weight.data.float() if ref_norm_mod is not None else None
-        quant_norm_w = quant_norm_mod.weight.data.float() if quant_norm_mod is not None else None
-        ref_head_w = ref_head.weight.data.float() if ref_head is not None else None
-        quant_head_w = quant_head.weight.data.float() if quant_head is not None else None
+        ref_head_w = self._validated_lm_head_weight(ref_model, "ref")
+        quant_head_w = self._validated_lm_head_weight(quant_model, "quant")
 
         with torch.no_grad():
-            ref_h = ref_hidden_states.cpu().float()
-            quant_h = quant_hidden_states.cpu().float()
-
-            # LayerNorm (手动)
-            if ref_norm_w is not None:
-                ref_h = torch.nn.functional.layer_norm(ref_h, ref_h.shape[-1:], ref_norm_w)
-            if quant_norm_w is not None:
-                quant_h = torch.nn.functional.layer_norm(quant_h, quant_h.shape[-1:], quant_norm_w)
+            ref_h = self._apply_real_final_norm(
+                ref_hidden_states, ref_norm_mod, self.dtype)
+            quant_h = self._apply_real_final_norm(
+                quant_hidden_states, quant_norm_mod, self.dtype)
 
             # lm_head: 取 last token
             ref_last = ref_h[:, -1]
             quant_last = quant_h[:, -1]
-            ref_logits = torch.nn.functional.linear(ref_last, ref_head_w) if ref_head_w is not None else ref_last
-            quant_logits = torch.nn.functional.linear(quant_last, quant_head_w) if quant_head_w is not None else quant_last
+            ref_logits = torch.nn.functional.linear(ref_last, ref_head_w)
+            quant_logits = torch.nn.functional.linear(quant_last, quant_head_w)
+            self._validate_logits(ref_logits, "ref")
+            self._validate_logits(quant_logits, "quant")
 
             logits_cs = cos_sim(ref_logits, quant_logits, use_cpu=True)
 
@@ -767,41 +880,36 @@ class ShardedBlockComparator:
                 norm_mod.to('cpu')
             if head_mod is not None:
                 head_mod.to('cpu')
+        self._restore_tied_lm_head(ref_model, self._ref_weight_map, "ref", 'cpu')
+        self._restore_tied_lm_head(quant_model, self._quant_weight_map, "quant", 'cpu')
 
-    @staticmethod
-    def _get_norm_lm_head_weights(ref_model, quant_model):
-        """提取 norm+lm_head 权重到 CPU float32。"""
-        from .utils import get_norm_module, get_lm_head_module
+    def _get_norm_modules_and_lm_head_weights(self, ref_model, quant_model):
+        """提取真实 final norm 模块和已校验的 lm_head 权重。"""
+        from .utils import get_norm_module
         ref_norm_mod = get_norm_module(ref_model)
         quant_norm_mod = get_norm_module(quant_model)
-        ref_head = get_lm_head_module(ref_model)
-        quant_head = get_lm_head_module(quant_model)
-        ref_norm_w = ref_norm_mod.weight.data.float() if ref_norm_mod is not None else None
-        quant_norm_w = quant_norm_mod.weight.data.float() if quant_norm_mod is not None else None
-        ref_head_w = ref_head.weight.data.float() if ref_head is not None else None
-        quant_head_w = quant_head.weight.data.float() if quant_head is not None else None
-        return ref_norm_w, quant_norm_w, ref_head_w, quant_head_w
+        ref_head_w = self._validated_lm_head_weight(ref_model, "ref")
+        quant_head_w = self._validated_lm_head_weight(quant_model, "quant")
+        return ref_norm_mod, quant_norm_mod, ref_head_w, quant_head_w
 
-    @staticmethod
-    def _compute_logits_np(ref_hidden_states, quant_hidden_states,
-                            ref_norm_w, quant_norm_w, ref_head_w, quant_head_w, max_positions):
+    def _compute_logits_np(self, ref_hidden_states, quant_hidden_states,
+                           ref_norm_mod, quant_norm_mod,
+                           ref_head_w, quant_head_w, max_positions):
         """norm → slice last-N → lm_head → [N, vocab] fp32 CPU。"""
         with torch.no_grad():
-            ref_h = ref_hidden_states.cpu().float()
-            quant_h = quant_hidden_states.cpu().float()
-            if ref_norm_w is not None:
-                ref_h = torch.nn.functional.layer_norm(ref_h, ref_h.shape[-1:], ref_norm_w)
-            if quant_norm_w is not None:
-                quant_h = torch.nn.functional.layer_norm(quant_h, quant_h.shape[-1:], quant_norm_w)
+            ref_h = self._apply_real_final_norm(
+                ref_hidden_states, ref_norm_mod, self.dtype)
+            quant_h = self._apply_real_final_norm(
+                quant_hidden_states, quant_norm_mod, self.dtype)
             seq_len = ref_h.shape[1]
             N = min(max_positions, seq_len)
             ref_h_last = ref_h[:, -N:, :].contiguous()
             quant_h_last = quant_h[:, -N:, :].contiguous()
             del ref_h, quant_h
-            ref_logits_full = (torch.nn.functional.linear(ref_h_last, ref_head_w)
-                               if ref_head_w is not None else ref_h_last)
-            quant_logits_full = (torch.nn.functional.linear(quant_h_last, quant_head_w)
-                                 if quant_head_w is not None else quant_h_last)
+            ref_logits_full = torch.nn.functional.linear(ref_h_last, ref_head_w)
+            quant_logits_full = torch.nn.functional.linear(quant_h_last, quant_head_w)
+            self._validate_logits(ref_logits_full, "ref")
+            self._validate_logits(quant_logits_full, "quant")
             ref_logits_np = ref_logits_full.squeeze(0).to(torch.float32).contiguous()
             quant_logits_np = quant_logits_full.squeeze(0).to(torch.float32).contiguous()
             del ref_h_last, quant_h_last, ref_logits_full, quant_logits_full
@@ -849,13 +957,15 @@ class ShardedBlockComparator:
         from .logits_compare import LogitsCollection, compare_logits
 
         self._materialize_norm_lm_head(ref_model, quant_model)
-        ref_norm_w, quant_norm_w, ref_head_w, quant_head_w = self._get_norm_lm_head_weights(
-            ref_model, quant_model)
+        ref_norm_mod, quant_norm_mod, ref_head_w, quant_head_w = (
+            self._get_norm_modules_and_lm_head_weights(ref_model, quant_model)
+        )
 
         try:
             ref_logits_np, quant_logits_np, N = self._compute_logits_np(
                 ref_hidden_states, quant_hidden_states,
-                ref_norm_w, quant_norm_w, ref_head_w, quant_head_w, max_positions)
+                ref_norm_mod, quant_norm_mod,
+                ref_head_w, quant_head_w, max_positions)
             ref_c = LogitsCollection(token_positions=list(range(N)), logits=ref_logits_np)
             quant_c = LogitsCollection(token_positions=list(range(N)), logits=quant_logits_np)
             if self.verbose:

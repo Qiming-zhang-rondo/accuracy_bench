@@ -88,5 +88,13 @@ class TestCliGuide(unittest.TestCase):
         )
         self.assertIn("latest.html 左侧可切换当前与历史报告", self.html)
 
+    def test_report_visual_style_matches_cli_guide(self):
+        html_source = HTML_REPORT.read_text(encoding="utf-8")
+        for marker in (
+            "--paper:#F4F1EA", "--navy:#112B3A", "--mint:#96E6C3",
+            "report-kicker", "sidebar-brand", "ACC BENCH / ALIGNMENT REPORT",
+        ):
+            self.assertIn(marker, html_source)
+
 if __name__ == "__main__":
     unittest.main()
