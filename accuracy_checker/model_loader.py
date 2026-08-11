@@ -2124,7 +2124,12 @@ def move_layers_to_device(model: nn.Module, layer_indices: List[int], device: st
                 layer.to(device)
 
 
-def unload_layers_to_meta(model: nn.Module, layer_indices: List[int]):
+def unload_layers_to_meta(
+    model: nn.Module,
+    layer_indices: List[int],
+    *,
+    cleanup: bool = True,
+):
     """将指定 decoder layers 移回 meta device，释放 CPU + NPU 内存
 
     与 move_layers_to_device(layers, 'cpu') 不同，to_empty(device='meta') 会彻底释放
@@ -2136,6 +2141,8 @@ def unload_layers_to_meta(model: nn.Module, layer_indices: List[int]):
     Args:
         model: 模型
         layer_indices: 要卸载的层索引列表
+        cleanup: 是否立即执行 GC、设备缓存回收和 malloc_trim。连续卸载
+            ref/quant 两侧时，第一侧可传 False，由最后一侧统一回收。
     """
     import gc
     import ctypes
@@ -2152,11 +2159,12 @@ def unload_layers_to_meta(model: nn.Module, layer_indices: List[int]):
                     p.data = torch.empty(0, dtype=p.dtype, device=p.device)
                 layers[i] = old_layer.to_empty(device='meta')
             del old_layer
-    gc.collect()
-    if hasattr(torch, 'npu') and torch.npu.is_available():
-        torch.npu.empty_cache()
-    # 尝试归还内存给OS
-    try:
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except Exception as e:
-        logger.debug(f"malloc_trim failed: {e}")
+    if cleanup:
+        gc.collect()
+        if hasattr(torch, 'npu') and torch.npu.is_available():
+            torch.npu.empty_cache()
+        # 尝试归还内存给OS
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception as e:
+            logger.debug(f"malloc_trim failed: {e}")

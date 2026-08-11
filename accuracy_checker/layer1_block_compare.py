@@ -1213,11 +1213,8 @@ class ShardedBlockComparator:
                 # with 507014.  The process is terminating, so skip device
                 # cleanup and preserve the actionable root exception.
                 if shard_succeeded:
-                    unload_layers_to_meta(ref_model, layers)
+                    unload_layers_to_meta(ref_model, layers, cleanup=False)
                     unload_layers_to_meta(quant_model, layers)
-
-                    from .utils import clear_device_cache
-                    clear_device_cache()
 
             if self.verbose:
                 logger.info(f"  [RSS] after unload+gc: {self._get_rss_gb():.1f}GB")
@@ -1321,20 +1318,21 @@ class ShardedBlockComparator:
 
         for shard_idx, (layer_start, layer_end) in enumerate(shard_plans):
             layers = list(range(layer_start, layer_end))
+            shard_started = time.perf_counter()
+            load_elapsed = 0.0
+            forward_elapsed = 0.0
+            cleanup_elapsed = 0.0
 
             if self.verbose:
                 logger.info(f"\n[Sharded L1] 处理 shard {shard_idx+1}/{len(shard_plans)}: layers {layer_start}-{layer_end-1}")
                 logger.info(f"  [RSS] before load: {self._get_rss_gb():.1f}GB")
-
-            if shard_idx > 0:
-                from .utils import clear_device_cache
-                clear_device_cache(set(self.ref_devices + self.quant_devices))
 
             # materialize meta layers + 替换 3D routed expert params 为 placeholder
             self._materialize_and_replace_experts(ref_model, quant_model, layers)
 
             shard_succeeded = False
             try:
+                load_started = time.perf_counter()
                 # streaming 模式跳过 routed experts
                 load_layer_weights_indexed(ref_model, self.ref_model_path, layers, ref_device, self.dtype,
                                            ref_weight_map, ref_reader,
@@ -1351,6 +1349,7 @@ class ShardedBlockComparator:
 
                 move_layers_to_device(ref_model, layers, ref_device, clear_others=False)
                 move_layers_to_device(quant_model, layers, quant_device, clear_others=False)
+                load_elapsed = time.perf_counter() - load_started
 
                 if self.activation_quant:
                     self._register_activation_quant_hooks(ref_model, layers)
@@ -1359,6 +1358,7 @@ class ShardedBlockComparator:
                 if self.verbose:
                     logger.info(f"  [RSS] after load: {self._get_rss_gb():.1f}GB")
 
+                forward_started = time.perf_counter()
                 ref_hidden, quant_hidden, need_embed = self._prepare_embed_input(
                     input_ids, ref_model, quant_model, ref_device, quant_device,
                     need_embed, ref_hidden_states, quant_hidden_states, all_results)
@@ -1385,22 +1385,30 @@ class ShardedBlockComparator:
                     quant_output = quant_hidden
 
                 ref_hidden_states, quant_hidden_states = self._save_hidden_states_for_next_shard(ref_output, quant_output)
+                forward_elapsed = time.perf_counter() - forward_started
 
                 if self.verbose:
                     logger.info(f"  [RSS] after forward: {self._get_rss_gb():.1f}GB")
                 shard_succeeded = True
             finally:
+                cleanup_started = time.perf_counter()
                 self._clear_activation_quant_hooks()
 
                 if shard_succeeded:
-                    unload_layers_to_meta(ref_model, layers)
+                    unload_layers_to_meta(ref_model, layers, cleanup=False)
                     unload_layers_to_meta(quant_model, layers)
-
-                    from .utils import clear_device_cache
-                    clear_device_cache(set(self.ref_devices + self.quant_devices))
+                cleanup_elapsed = time.perf_counter() - cleanup_started
 
             if self.verbose:
                 logger.info(f"  [RSS] after unload+gc: {self._get_rss_gb():.1f}GB")
+                if shard_succeeded:
+                    total_elapsed = time.perf_counter() - shard_started
+                    logger.info(
+                        "  [TIMING] load=%.2fs forward=%.2fs cleanup=%.2fs "
+                        "total=%.2fs",
+                        load_elapsed, forward_elapsed, cleanup_elapsed,
+                        total_elapsed,
+                    )
 
         report = self._finalize_dual_report(
             ref_model, quant_model, ref_hidden_states, quant_hidden_states,
@@ -2364,13 +2372,15 @@ class ShardedBlockComparator:
 
     @staticmethod
     def _sync_chunk_device(chunk_device):
-        """同步 chunk 设备并清理缓存。"""
+        """Wait for a chunk without discarding reusable allocator blocks."""
         if hasattr(torch, 'npu') and torch.npu.is_available():
             torch.npu.synchronize(chunk_device)
-            torch.npu.empty_cache()
+            if os.getenv("ACC_STREAM_EMPTY_CACHE", "0") == "1":
+                torch.npu.empty_cache()
         elif torch.cuda.is_available():
             torch.cuda.synchronize(chunk_device)
-            torch.cuda.empty_cache()
+            if os.getenv("ACC_STREAM_EMPTY_CACHE", "0") == "1":
+                torch.cuda.empty_cache()
 
     def _finalize_moe_output(self, y, shared_output, hidden_states, layer_idx,
                               topk_scores, topk_indices, routed_scaling_factor):

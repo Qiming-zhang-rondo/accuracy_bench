@@ -454,3 +454,24 @@ def test_kimi_chunk_sizing_uses_real_expert_count():
     assert comparator._configured_num_experts() == 896
     assert comparator._auto_expert_chunk_size(896, 4) == 224
     assert comparator._auto_expert_chunk_size(896, 2) == 256
+
+
+def test_streaming_chunk_sync_reuses_allocator_cache_by_default(
+    monkeypatch,
+):
+    from unittest.mock import Mock
+
+    from accuracy_checker.layer1_block_compare import ShardedBlockComparator
+
+    fake_npu = SimpleNamespace(
+        is_available=lambda: True,
+        synchronize=Mock(),
+        empty_cache=Mock(),
+    )
+    monkeypatch.setattr(torch, "npu", fake_npu, raising=False)
+    monkeypatch.delenv("ACC_STREAM_EMPTY_CACHE", raising=False)
+
+    ShardedBlockComparator._sync_chunk_device("npu:3")
+
+    fake_npu.synchronize.assert_called_once_with("npu:3")
+    fake_npu.empty_cache.assert_not_called()
