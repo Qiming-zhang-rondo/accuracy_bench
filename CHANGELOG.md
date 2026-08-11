@@ -3,9 +3,11 @@
 ## 2026-08-11 — Kimi K3 Ascend KDA fallback
 
 - 新增 `--kimi_kda_backend auto|torch|chunk|fused_recurrent`；Ascend `auto` 默认使用无 Triton 依赖的 eager torch KDA recurrence
+- 修复 Kimi remote code 在模型创建前强制 import FLA 的时序问题；torch backend 预装 ShortConvolution、FusedRMSNormGated、KDA 与 mask utils 兼容 shim，不再要求环境安装 `fla-core`
 - torch fallback 对齐 FLA KDA 的 q/k L2Norm、gate、beta、delta-rule、GVA 与 state layout 契约
 - shard forward 失败后不再调用会同步设备的 `empty_cache()`，避免 NPU 异常 context 将原始错误覆盖成 507014 timeout
 - 参数页接入 KDA backend 推荐、预检状态和命令生成
+- 参数页仅对 Kimi K3 显示 KDA backend，并明确 DSpark verifier hidden-state 样本不是 checkpoint 自带文件
 
 ## 2026-08-06 — W8A8 streaming 修复 + CLI 命令生成器
 

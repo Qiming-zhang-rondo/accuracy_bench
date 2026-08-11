@@ -1,6 +1,7 @@
 """CPU-only structural tests for Kimi K3 support."""
 
 import json
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
@@ -230,3 +231,64 @@ def test_torch_kda_recurrence_matches_one_dimensional_delta_rule():
 
     assert torch.allclose(output.flatten(), torch.tensor([1.0, 2.0]))
     assert torch.allclose(state.flatten(), torch.tensor([2.0]))
+
+
+def test_kimi_torch_import_shim_replaces_complete_fla_surface():
+    """The portable path must satisfy remote imports before model creation."""
+    import sys
+    from accuracy_checker.kimi_fla_shim import (
+        PortableFusedRMSNormGated,
+        PortableShortConvolution,
+        ensure_kimi_torch_import_path,
+    )
+
+    with patch.dict(sys.modules):
+        assert ensure_kimi_torch_import_path(
+            requested_backend="auto",
+            devices=("npu:0", "npu:1"),
+            model_type="kimi_k3",
+            model_paths=(),
+        )
+        from fla.modules import FusedRMSNormGated, ShortConvolution
+        from fla.ops.kda import chunk_kda, fused_recurrent_kda
+        from fla.ops.utils.index import (
+            prepare_cu_seqlens_from_mask,
+            prepare_lens_from_mask,
+        )
+        from fla.utils import tensor_cache
+
+        assert FusedRMSNormGated is PortableFusedRMSNormGated
+        assert ShortConvolution is PortableShortConvolution
+        assert chunk_kda is fused_recurrent_kda
+        assert tensor_cache(lambda: None)() is None
+        mask = torch.tensor([[1, 1, 0], [1, 0, 0]], dtype=torch.bool)
+        assert torch.equal(prepare_lens_from_mask(mask), torch.tensor([2, 1]))
+        assert torch.equal(
+            prepare_cu_seqlens_from_mask(mask), torch.tensor([0, 2, 3])
+        )
+
+
+def test_portable_fla_modules_preserve_kimi_weight_contracts():
+    """Shim modules retain FLA parameter names and eager forward semantics."""
+    from accuracy_checker.kimi_fla_shim import (
+        PortableFusedRMSNormGated,
+        PortableShortConvolution,
+    )
+
+    convolution = PortableShortConvolution(2, 2, activation=None)
+    with torch.no_grad():
+        convolution.weight.fill_(1.0)
+    x = torch.tensor([[[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]]])
+    output, state = convolution(x, output_final_state=True)
+    assert torch.equal(
+        output,
+        torch.tensor([[[1.0, 10.0], [3.0, 30.0], [5.0, 50.0]]]),
+    )
+    assert tuple(state.shape) == (1, 2, 2)
+    assert set(convolution.state_dict()) == {"weight"}
+
+    norm = PortableFusedRMSNormGated(2, eps=0.0, activation="sigmoid")
+    normalized = norm(torch.tensor([[[3.0, 4.0]]]), torch.zeros(1, 1, 2))
+    expected = torch.tensor([[[0.6, 0.8]]]) * (2.0 ** 0.5) * 0.5
+    assert torch.allclose(normalized, expected)
+    assert set(norm.state_dict()) == {"weight"}

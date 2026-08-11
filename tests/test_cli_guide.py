@@ -52,7 +52,7 @@ class TestCliGuide(unittest.TestCase):
             "refDevices", "quantDevices", "commandOutput", "copyCommand",
             "modelSizeB", "perDeviceMemory", "rotationMatrix",
             "preflightSummary", "applyRecommendation",
-            "dsparkSample", "paramSearch", "paramRows",
+            "dsparkSample", "kimiKdaField", "paramSearch", "paramRows",
         }
         self.assertTrue(required.issubset(self.parser.ids))
 
@@ -63,6 +63,8 @@ class TestCliGuide(unittest.TestCase):
     def test_special_model_recommendations_are_present(self):
         for marker in ("qwen3_6_moe", "kimi_k3", "dspark", "grouped_dual"):
             self.assertIn(marker, self.html)
+        self.assertIn('kimiKdaField.classList.toggle("hidden", !kimi)', self.html)
+        self.assertIn("模型目录通常不自带", self.html)
 
     def test_preflight_blocks_invalid_commands_and_recommends_cards(self):
         for marker in (

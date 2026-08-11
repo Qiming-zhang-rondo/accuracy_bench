@@ -712,7 +712,7 @@
                 <option value="grouped_dual">grouped_dual · MoE 流式 expert</option>
               </select>
             </div>
-            <div>
+            <div id="kimiKdaField" class="hidden" aria-hidden="true">
               <label for="kimiKdaBackend">Kimi K3 KDA 后端</label>
               <select id="kimiKdaBackend">
                 <option value="auto">auto · Ascend 推荐</option>
@@ -720,7 +720,7 @@
                 <option value="fused_recurrent">fused_recurrent · 兼容路径</option>
                 <option value="chunk">chunk · 原模型默认</option>
               </select>
-              <span class="hint">auto 在 NPU 上使用原生 torch recurrence，完全避开当前无法编译的 Triton KDA；非 Kimi 模型会忽略。</span>
+              <span class="hint">auto 在 NPU 上于模型加载前启用纯 torch import shim，不要求 fla-core，并完全避开当前无法编译的 Triton KDA；非 Kimi 模型会忽略。</span>
             </div>
             <div>
               <label for="layersPerShard">每个 shard 层数</label>
@@ -769,7 +769,8 @@
           <div id="dsparkFields" class="grid-3 hidden" aria-hidden="true">
             <div class="wide">
               <label for="dsparkSample">Verifier hidden-state 样本</label>
-              <input id="dsparkSample" type="text" value="dspark_sample.pt" autocomplete="off">
+              <input id="dsparkSample" type="text" value="" autocomplete="off" placeholder="/path/to/verifier_hidden_states.pt">
+              <span class="hint">这不是 draft checkpoint 自带文件。它是 verifier/target 模型对一条真实输入执行 forward 时导出的中间激活，至少包含 <code>input_ids</code>、配置指定层的 <code>hidden_states</code> 和 <code>loss_mask</code>；Speculators 还需要 <code>verifier_last_hidden_states</code>。没有预先导出的 .pt 时，standalone DSpark L1 不能只靠 prompt 运行。</span>
             </div>
             <div>
               <label for="dsparkSeed">采样 seed</label>
@@ -900,7 +901,7 @@
             <tr><td><code>--ref_devices</code></td><td>空</td><td>grouped_dual 的 ref 多卡列表，例如 npu:0,1。</td></tr>
             <tr><td><code>--quant_devices</code></td><td>空</td><td>grouped_dual 的 quant 多卡列表，例如 npu:2,3。</td></tr>
             <tr><td><code>--expert_chunk_size</code></td><td>按卡数自动</td><td>grouped_dual 每批 expert 数；通常留空。</td></tr>
-            <tr><td><code>--kimi_kda_backend</code></td><td>auto</td><td>auto / torch / chunk / fused_recurrent；auto 在 Ascend 上使用等价的 torch KDA recurrence，完全避开 Triton KDA 编译失败。</td></tr>
+            <tr><td><code>--kimi_kda_backend</code></td><td>auto</td><td>auto / torch / chunk / fused_recurrent；auto 在 Ascend 上预装纯 torch import shim，无需 fla-core，并使用等价的 torch KDA recurrence。</td></tr>
             <tr><td><code>--output_dir</code></td><td>自动</td><td>单次报告目录；留空或填写 reports 时自动创建带时间戳目录。重复使用已有非空目录时自动创建同级归档，避免覆盖历史。</td></tr>
             <tr><td><code>--model_type</code></td><td>auto</td><td>支持 dense、moe、GLM、Qwen3 系列、Qwen3.6、Kimi K3 与 dspark。</td></tr>
             <tr><td><code>--dspark_sample</code></td><td>空（必需）</td><td>DSpark verifier hidden-state .pt；包含 input_ids、hidden_states、loss_mask 等。</td></tr>
@@ -947,6 +948,7 @@
       var applyRecommendation = document.getElementById("applyRecommendation");
       var dsparkFields = document.getElementById("dsparkFields");
       var promptField = document.getElementById("promptField");
+      var kimiKdaField = document.getElementById("kimiKdaField");
       var recommendedCardCount = 4;
 
       var modelLabels = {
@@ -1207,7 +1209,10 @@
         validation.warnings.forEach(function (message) { addStatus(message, ""); });
         if (!validation.errors.length) addStatus("参数格式、路径与设备映射预检通过", "ok");
         addStatus("推荐 " + recommendation.cards + " 张物理卡，layers_per_shard=" + recommendation.layers, "ok");
-        if (type === "dspark") addStatus("DSpark 已固定为 l1 + dual + dequantize", "ok");
+        if (type === "dspark") {
+          addStatus("DSpark 已固定为 l1 + dual + dequantize", "ok");
+          addStatus("verifier hidden-state .pt 需提前从 verifier forward 导出，模型目录通常不自带", "");
+        }
         if (isMoe(type) && type !== "dspark") addStatus("MoE 使用 grouped_dual 流式 expert", "ok");
         if (type === "kimi_k3") addStatus("KDA backend=" + el.kimiKdaBackend.value + "；auto 在 Ascend 上使用无 Triton 依赖的 torch recurrence", "ok");
         if (el.rotationMatrix.value.trim()) addStatus("已加入 rotation_matrix；请确认 ref/quant 旋转契约一致", "ok");
@@ -1254,6 +1259,9 @@
         dsparkFields.classList.toggle("hidden", !dspark);
         dsparkFields.setAttribute("aria-hidden", dspark ? "false" : "true");
         promptField.classList.toggle("hidden", dspark || mode === "screening");
+        var kimi = type === "kimi_k3";
+        kimiKdaField.classList.toggle("hidden", !kimi);
+        kimiKdaField.setAttribute("aria-hidden", kimi ? "false" : "true");
 
         commands.push("ASCEND_RT_VISIBLE_DEVICES=" + visible + " OMP_NUM_THREADS=8 \\");
         args.push("python3 run_accuracy_check.py --mode " + mode);

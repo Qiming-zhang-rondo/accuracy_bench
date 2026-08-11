@@ -160,6 +160,13 @@ class ShardedBlockComparator:
             )
         self.kimi_kda_backend = kimi_kda_backend
         self._kimi_kda_backend_logged = False
+        from .kimi_fla_shim import ensure_kimi_torch_import_path
+        ensure_kimi_torch_import_path(
+            requested_backend=kimi_kda_backend,
+            devices=(ref_device, quant_device),
+            model_type=None,
+            model_paths=(ref_model_path, quant_model_path),
+        )
         self.activation_quant = activation_quant
         self.activation_quant_type = activation_quant_type
         self.collect_full_logits = collect_full_logits

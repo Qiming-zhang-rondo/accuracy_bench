@@ -89,7 +89,7 @@ python3 run_accuracy_check.py --mode boundary \
 ## 支持范围
 
 - **模型**: GLM-5.1 (MLA + DSA + MoE, QuaRot) / Qwen3 / Qwen3MoE / Qwen3VL / Qwen3.5 MoE / **Qwen3.6** / **Kimi K3** / **DeepSpec、Speculators DSpark standalone draft（专用 L1）**
-  > Kimi K3 已支持 text backbone 的 KDA/MLA、Stable LatentMoE、AttnRes、SiTU 和嵌套 MXFP4 配置。`--kimi_kda_backend auto` 在 Ascend 上使用原生 PyTorch/NPU KDA recurrence，避开 CANN 8.5.1 无法编译的 FLA `chunk_kda` Triton 路径；确认环境内核兼容后可显式选 `chunk` 或 `fused_recurrent`。
+  > Kimi K3 已支持 text backbone 的 KDA/MLA、Stable LatentMoE、AttnRes、SiTU 和嵌套 MXFP4 配置。`--kimi_kda_backend auto` 在 Ascend 上会在加载 remote code 前安装纯 PyTorch import shim，并使用原生 PyTorch/NPU 短卷积、gated RMSNorm 和 KDA recurrence；该路径不要求安装 `fla-core`，也不会进入 CANN 8.5.1 无法编译的 FLA Triton 路径。确认环境内核兼容后可显式选 `chunk` 或 `fused_recurrent`。
   > Kimi K3 官方 896-expert `ModuleList` 必须用 `--compare_mode grouped_dual` 跑 L1；MoE 层 L2 暂不物化全部专家，会明确拒绝并提示使用流式 replay/内部 packed 模型。该边界待内网 NPU 回归后继续收敛。
   > GLM-5.2 (head_dim=192, indexer_types) 需按 `reference_glm_version_identification` 自行校验结构和子图兼容性
 - **量化格式**: W8A8 / W4A8 / W4A4 / MXFP8 / MXFP4 / compressed-tensors (自动识别)
@@ -106,7 +106,7 @@ DSpark 是 speculative decoding 的 draft/speculator，不是可独立 `generate
 
 `K3DSparkModel`（例如 Inferact/Kimi-K3-DSpark）、带 `_torchspec_version` 的 TorchSpec checkpoint，以及仅靠 `auto_map` 加载的 SpecForge checkpoint 会被识别，但不会被误当成上述两种格式运行。它们的 forward/runtime 契约不同：Kimi K3 原生格式依赖 vLLM MLA DSpark runtime，且 `block_size` 不在 checkpoint 中，而由部署参数 `speculative_config.num_speculative_tokens` 提供。acc_bench 当前会明确拒绝这类 standalone L1；部署定界请传 verifier/目标模型并提供 `--framework_bad_output`。截至本版本，vLLM Ascend 的 DSpark 仍处于 RFC/开发状态，不能把 CUDA/AMD 上可运行直接等同于 NPU 已可运行。
 
-先用对应 verifier/目标模型导出一条 `.pt` 样本。必需字段为 `input_ids`、`hidden_states`（别名 `target_hidden_states`）和 `loss_mask`；Speculators 格式还必须包含 `verifier_last_hidden_states`。`hidden_states` 可为 `[B,S,N,H]` 或 `[B,S,N*H]`，其中 `N` 必须等于配置中的目标层数量。
+先用对应 verifier/目标模型导出一条 `.pt` 样本。这个文件不是 DSpark checkpoint 的标准附件，也不会由 acc_bench 从 prompt 猜测生成；它记录 verifier 对一条真实输入执行 forward 时的中间激活。必需字段为 `input_ids`、`hidden_states`（别名 `target_hidden_states`）和 `loss_mask`；Speculators 格式还必须包含 `verifier_last_hidden_states`。`hidden_states` 可为 `[B,S,N,H]` 或 `[B,S,N*H]`，其中 `N` 必须等于配置中的目标层数量。
 
 ```python
 torch.save({
@@ -122,7 +122,7 @@ torch.save({
 ASCEND_RT_VISIBLE_DEVICES=0,1 \
 python3 run_accuracy_check.py --mode l1 --model_type dspark \
   --ref_model <BF16_DSPARK_DRAFT> --quant_model <QUANT_DSPARK_DRAFT> \
-  --dspark_sample dspark_sample.pt --dspark_seed 0 --dspark_max_anchors 8 \
+  --dspark_sample /path/to/dspark_sample.pt --dspark_seed 0 --dspark_max_anchors 8 \
   --ref_device npu:0 --quant_device npu:1 \
   --compare_mode dual --quant_method dequantize --dtype bfloat16
 ```
@@ -146,7 +146,7 @@ python3 run_accuracy_check.py --mode l1 --model_type dspark \
 > 
 > 当前与历史报告统一入口: 在项目根目录运行 `python3 -m http.server 8765 --bind 0.0.0.0`，桌面浏览器固定打开 `http://[your_ip]:8765/latest.html`；页面默认显示最新结果，左侧边栏可切换全部历史记录
 > 
-> 交互式命令生成器与完整参数表在项目根目录运行 `python3 -m http.server 8765 --bind 0.0.0.0`，桌面浏览器固定打开 `http://[your_ip]:8766/cli_params_guide.html`；也可运行 `python3 run_accuracy_check.py --help`
+> 交互式命令生成器与完整参数表在项目根目录运行 `python3 -m http.server 8765 --bind 0.0.0.0`，桌面浏览器固定打开 `http://[your_ip]:8765/cli_params_guide.html`；也可运行 `python3 run_accuracy_check.py --help`
 > 
 > 默认不打印 hidden norm / MoE L3 expert 等开发上下文；需要这些诊断时追加 `--debug`
 

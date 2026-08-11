@@ -344,6 +344,21 @@ def run_hf_l1(args, ref_device, target_device, dtype):
         )
         return comparator.compare()
 
+    # Kimi remote code imports FLA while the Python module is being loaded.
+    # Install the portable import surface before AutoTokenizer/model dynamic
+    # module resolution so --kimi_kda_backend=torch also works without FLA.
+    from accuracy_checker.kimi_fla_shim import ensure_kimi_torch_import_path
+    kimi_shim_active = ensure_kimi_torch_import_path(
+        requested_backend=getattr(args, "kimi_kda_backend", "auto"),
+        devices=(ref_device, target_device),
+        model_type=getattr(args, "model_type", "auto"),
+        model_paths=(args.ref_model, args.quant_model),
+    )
+    if kimi_shim_active:
+        logger.info(
+            "[Kimi K3] portable torch import path active; fla-core is not required"
+        )
+
     from transformers import AutoTokenizer
     from accuracy_checker import ShardedBlockComparator
 
