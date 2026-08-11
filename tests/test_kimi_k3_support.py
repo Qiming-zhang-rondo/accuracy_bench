@@ -372,3 +372,85 @@ def test_kimi_streaming_construction_collapses_only_expert_range():
 
     assert "range" not in fake_module.__dict__
     assert KimiFakeModel.post_init is original_post_init
+
+
+def test_grouped_dual_visits_only_router_selected_kimi_experts():
+    """896-expert Kimi layers must not scan every inactive expert."""
+    from types import MethodType
+
+    from accuracy_checker.layer1_block_compare import ShardedBlockComparator
+
+    comparator = object.__new__(ShardedBlockComparator)
+    visited = []
+    synchronized = []
+
+    def _record_expert(self, expert_id, *args):
+        visited.append(expert_id)
+        return None
+
+    comparator._forward_single_routed_expert = MethodType(
+        _record_expert, comparator
+    )
+    comparator._sync_chunk_device = synchronized.append
+    reader = SimpleNamespace(weight_map={
+        "model.layers.0.block_sparse_moe.experts.1.w1.weight": "part-1",
+    })
+    hidden = torch.zeros(1, 2, 4)
+    scores = torch.tensor([[[0.6, 0.4], [0.7, 0.3]]])
+    indices = torch.tensor([[[1, 300], [700, 300]]])
+
+    output = comparator._run_expert_chunks(
+        mlp=None,
+        experts_mod=None,
+        hidden_states=hidden,
+        devices=["npu:0", "npu:1"],
+        chunk_size=256,
+        layer_idx=0,
+        topk_scores=scores,
+        topk_indices=indices,
+        num_experts_per_tok=2,
+        num_experts=896,
+        is_packed=False,
+        is_module_list=True,
+        use_streaming=True,
+        sf_reader=reader,
+        quant_desc_str=None,
+        is_quant=False,
+        is_ct=False,
+        primary_device="npu:0",
+    )
+
+    assert visited == [1, 300, 700]
+    assert synchronized == ["npu:0", "npu:1", "npu:0"]
+    assert torch.equal(output, torch.zeros_like(hidden.view(-1, 4)).float())
+
+
+def test_kimi_expert_prefix_index_is_cached_per_reader():
+    from accuracy_checker.layer1_block_compare import ShardedBlockComparator
+
+    reader = SimpleNamespace(weight_map={
+        "model.layers.2.block_sparse_moe.experts.7.w1.weight": "part-1",
+        "model.layers.3.block_sparse_moe.experts.9.w1.weight": "part-2",
+    })
+
+    first = ShardedBlockComparator._expert_prefix_index(reader)
+    reader.weight_map.clear()
+    second = ShardedBlockComparator._expert_prefix_index(reader)
+
+    assert first is second
+    assert first[(2, "block_sparse_moe")] == (
+        "model.layers.2.block_sparse_moe.experts"
+    )
+
+
+def test_kimi_chunk_sizing_uses_real_expert_count():
+    from accuracy_checker.layer1_block_compare import ShardedBlockComparator
+
+    comparator = object.__new__(ShardedBlockComparator)
+    comparator._model_config = {
+        "text_config": {"num_experts": 896},
+    }
+
+    assert comparator._configured_num_experts() == 896
+    assert comparator._auto_expert_chunk_size(896, 4) == 224
+    assert comparator._auto_expert_chunk_size(896, 2) == 256

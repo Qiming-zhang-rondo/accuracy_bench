@@ -98,6 +98,28 @@ class _ExpertSliceReader:
             return tensor[self.expert_id]
         return tensor
 
+
+class _DeviceTensorReader:
+    """Reader view that copies quantization metadata to the target device.
+
+    Streaming experts used to expand quantized weights on CPU and then copy the
+    much larger BF16 tensor to the accelerator.  Keeping the reader interface
+    lets the existing dequantizers run unchanged while moving the compact
+    weight and its small scales first.
+    """
+
+    def __init__(self, reader, device: str):
+        self.reader = reader
+        self.device = device
+        self.weight_map = getattr(reader, "weight_map", {})
+
+    def get_tensor(self, key: str):
+        tensor = self.reader.get_tensor(key)
+        if tensor is None:
+            return None
+        return tensor.to(self.device, non_blocking=True)
+
+
 class ShardedBlockComparator:
     """
     多卡Block对比器
@@ -201,6 +223,7 @@ class ShardedBlockComparator:
         config_path = os.path.join(self.ref_model_path, "config.json")
         with open(config_path, 'r') as f:
             config = json.load(f)
+        self._model_config = config
         self.num_layers = config.get('num_hidden_layers', None)
         # 嵌套 config (如 Qwen3.5 MoE): num_hidden_layers 在 text_config 里
         if self.num_layers is None:
@@ -1230,6 +1253,15 @@ class ShardedBlockComparator:
         非 MoE 层正常 forward (和 _compare_dual_sharded 一样)，
         MoE 层路由到 _moe_forward_chunked 做 expert chunk 跨卡计算。
         """
+        # grouped_dual needs an expert range per device.  Use the checkpoint's
+        # real expert count (Kimi has 896, not the historical default 256).
+        if self.expert_chunk_size is None:
+            n_dev = max(len(self.ref_devices), len(self.quant_devices))
+            num_experts = self._configured_num_experts() or 256
+            self.expert_chunk_size = self._auto_expert_chunk_size(
+                num_experts, n_dev
+            )
+
         if self.verbose:
             logger.info(f"[Sharded L1] 开始 grouped dual 模式 (streaming expert)...")
             logger.info(f"  ref devices:   {self.ref_devices}")
@@ -1237,18 +1269,18 @@ class ShardedBlockComparator:
             logger.info(f"  expert chunk size: {self.expert_chunk_size}")
             logger.info(f"  每批层数: {layers_per_shard}")
             logger.info(f"  输入长度: {input_ids.shape[1]} tokens")
-            logger.info(f"  streaming: routed experts 从 safetensors 实时读取，不在 CPU 预构造 3D tensor")
+            logger.info("  streaming: routed experts 从 safetensors 实时读取，不在 CPU 预构造 3D tensor")
+            dequant_location = (
+                "CPU (compatibility override)"
+                if os.getenv("ACC_STREAM_DEQUANT_DEVICE", "target").lower()
+                == "cpu"
+                else "target device (compact weight transfer)"
+            )
+            logger.info(f"  streaming dequant: {dequant_location}")
             if self.activation_quant:
                 logger.info(f"  activation_quant: {self.activation_quant_type} 激活伪量化已启用 (ref+quant 双侧)")
 
         forward_kwargs.setdefault("use_cache", False)
-
-        # grouped_dual 需要 expert_chunk_size; None 时按卡数自动设默认
-        if self.expert_chunk_size is None:
-            n_dev = max(len(self.ref_devices), len(self.quant_devices))
-            self.expert_chunk_size = max(1, 256 // n_dev)  # 256 experts / n_dev
-            if self.verbose:
-                logger.info(f"  [grouped_dual] expert_chunk_size auto-set to {self.expert_chunk_size} (256/{n_dev})")
 
         from .utils import clear_device_cache
         clear_device_cache(set(self.ref_devices + self.quant_devices))
@@ -1745,7 +1777,13 @@ class ShardedBlockComparator:
     def _dequant_streaming_weight(self, sf_reader, weight_key, w_type, device,
                                     is_ct=False, expert_id=None,
                                     num_experts=None):
-        """Read/dequantize one expert weight from split or fused storage."""
+        """Read/dequantize one expert weight from split or fused storage.
+
+        Quantized tensors are copied in their compact representation and
+        dequantized on the target accelerator.  Set
+        ``ACC_STREAM_DEQUANT_DEVICE=cpu`` only as a compatibility escape hatch
+        for an accelerator runtime that lacks one of the required torch ops.
+        """
         from .model_loader import dequantize_weight_mx, _dequant_msslim_weight
         reader = (
             _ExpertSliceReader(sf_reader, expert_id, num_experts)
@@ -1758,13 +1796,23 @@ class ShardedBlockComparator:
             if weight_key.endswith(".weight")
             else weight_key
         )
+        dequant_on_target = (
+            str(device).split(':', 1)[0] != 'cpu'
+            and os.getenv("ACC_STREAM_DEQUANT_DEVICE", "target").lower()
+            != "cpu"
+        )
         if w is None and is_ct:
             packed = reader.get_tensor(f"{quant_name}.weight_packed")
             scale = reader.get_tensor(f"{quant_name}.weight_scale")
             if packed is not None and scale is not None:
+                if dequant_on_target:
+                    packed = packed.to(device, non_blocking=True)
+                    scale = scale.to(device, non_blocking=True)
                 fp = dequantize_weight_mx(
                     packed, scale, "W4A4_MXFP4", dtype=self.dtype,
-                ).to(device)
+                )
+                if not dequant_on_target:
+                    fp = fp.to(device)
                 del packed, scale
                 return fp
         if w is None:
@@ -1773,7 +1821,12 @@ class ShardedBlockComparator:
             if is_ct and not w.dtype.is_floating_point:
                 scale = reader.get_tensor(f"{quant_name}.weight_scale")
                 if scale is not None:
-                    fp = (w.to(self.dtype) * scale.to(self.dtype)).to(device)
+                    if dequant_on_target:
+                        w = w.to(device, non_blocking=True)
+                        scale = scale.to(device, non_blocking=True)
+                        fp = w.to(self.dtype) * scale.to(self.dtype)
+                    else:
+                        fp = (w.to(self.dtype) * scale.to(self.dtype)).to(device)
                     del w, scale
                     return fp
             if not w.dtype.is_floating_point:
@@ -1785,8 +1838,12 @@ class ShardedBlockComparator:
             del w
             return fp
 
+        dequant_reader = reader
+        if dequant_on_target:
+            w = w.to(device, non_blocking=True)
+            dequant_reader = _DeviceTensorReader(reader, device)
         fp, status = _dequant_msslim_weight(
-            w, w_type, quant_name, reader, self.dtype
+            w, w_type, quant_name, dequant_reader, self.dtype
         )
         del w
         if status == "unknown":
@@ -1799,7 +1856,7 @@ class ShardedBlockComparator:
                 "streaming expert is missing dequantization parameters: "
                 f"{w_type} ({weight_key})"
             )
-        return fp.to(device)
+        return fp if dequant_on_target else fp.to(device)
 
     def _dequant_streaming_proj(self, sf_reader, expert_prefix, expert_id, proj_name,
                                   w_type, device, is_ct=False):
@@ -1824,7 +1881,7 @@ class ShardedBlockComparator:
         """Streaming expert forward: 从 safetensors 读取权重，反量化后传 NPU 计算。
 
         每个 expert 的权重用完立即释放，不在 CPU 上构造完整 3D tensor。
-        对量化模型: CPU 反量化到目标 dtype，传 NPU 做 F.linear
+        对量化模型: 先传压缩权重，再在目标设备反量化并执行 F.linear
         对非量化模型: 直接读 BF16，传 NPU 做 F.linear
 
         Returns:
@@ -1859,7 +1916,7 @@ class ShardedBlockComparator:
             else:
                 g_type = u_type = d_type = "FLOAT"
 
-        # ---- gate/up/down proj: 读+反量化(CPU)→传NPU ----
+        # ---- gate/up/down proj: 读取压缩权重→目标设备反量化→F.linear ----
         if packed_keys is not None:
             gate_up_fp = self._dequant_streaming_weight(
                 sf_reader, gate_up_key, g_type, device, is_ct=is_ct,
@@ -2012,6 +2069,36 @@ class ShardedBlockComparator:
             num_experts_per_tok = 8
         return num_experts_per_tok
 
+    def _configured_num_experts(self) -> Optional[int]:
+        """Return routed expert count from root or nested HF config."""
+        config = getattr(self, "_model_config", {}) or {}
+        candidates = (
+            config,
+            config.get("text_config", {}),
+            config.get("moe", {}),
+            config.get("moe_config", {}),
+        )
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            for key in ("num_experts", "n_routed_experts"):
+                value = candidate.get(key)
+                if isinstance(value, int) and value > 0:
+                    return value
+        return None
+
+    @staticmethod
+    def _auto_expert_chunk_size(num_experts: int, num_devices: int) -> int:
+        """Balance expert id ranges while capping queued weight memory."""
+        if num_experts <= 0 or num_devices <= 0:
+            raise ValueError("num_experts and num_devices must be positive")
+        # At most 256 expert forwards stay queued between synchronizations.
+        # For 896 experts on four devices this gives four 224-id ranges instead
+        # of the previous fourteen 64-id ranges.
+        return max(
+            1, min(256, (num_experts + num_devices - 1) // num_devices)
+        )
+
     def _compute_sigmoid_routing(self, mlp, gate, router_logits, num_experts_per_tok):
         """GLM-5.1 / DeepSeek-V3 风格 sigmoid + noaux_tc + renorm + scaling 路由。"""
         n_routed_experts = router_logits.shape[-1]
@@ -2153,12 +2240,42 @@ class ShardedBlockComparator:
         return expert_out
 
     @staticmethod
-    def _resolve_expert_prefix(sf_reader, layer_idx: int, moe_attr: str) -> str:
+    def _expert_prefix_index(sf_reader) -> Dict[Tuple[int, str], str]:
+        """Build a one-pass layer/attribute index for routed expert prefixes."""
+        cached = getattr(sf_reader, "_acc_expert_prefix_index", None)
+        if cached is not None:
+            return cached
+
+        index = {}
+        layer_marker = ".layers."
+        candidate_attrs = ("block_sparse_moe", "mlp", "moe")
+        for key in getattr(sf_reader, "weight_map", {}):
+            if layer_marker not in key:
+                continue
+            root, tail = key.split(layer_marker, 1)
+            layer_text, separator, remainder = tail.partition(".")
+            if not separator or not layer_text.isdigit():
+                continue
+            for attr in candidate_attrs:
+                marker = f"{attr}.experts."
+                if remainder.startswith(marker):
+                    index.setdefault(
+                        (int(layer_text), attr),
+                        f"{root}{layer_marker}{layer_text}.{attr}.experts",
+                    )
+                    break
+        try:
+            sf_reader._acc_expert_prefix_index = index
+        except (AttributeError, TypeError):
+            pass
+        return index
+
+    @classmethod
+    def _resolve_expert_prefix(cls, sf_reader, layer_idx: int, moe_attr: str) -> str:
         """Resolve the checkpoint prefix for routed experts from its weight map."""
-        marker = f".layers.{layer_idx}.{moe_attr}.experts."
-        for key in getattr(sf_reader, 'weight_map', {}):
-            if marker in key:
-                return key.split(marker, 1)[0] + marker[:-1]
+        prefix = cls._expert_prefix_index(sf_reader).get((layer_idx, moe_attr))
+        if prefix is not None:
+            return prefix
         return f"model.layers.{layer_idx}.{moe_attr}.experts"
 
     def _run_expert_chunks(self, mlp, experts_mod, hidden_states, devices, chunk_size,
@@ -2175,24 +2292,33 @@ class ShardedBlockComparator:
         # both Qwen/GLM ``mlp.experts`` and Kimi ``block_sparse_moe.experts``.
         if sf_reader is not None:
             candidate_attrs = ('block_sparse_moe', 'mlp', 'moe')
-            expert_prefix = None
-            for attr in candidate_attrs:
-                prefix = self._resolve_expert_prefix(sf_reader, layer_idx, attr)
-                if any(
-                    key.startswith(prefix + '.')
-                    for key in getattr(sf_reader, 'weight_map', {})
-                ):
-                    expert_prefix = prefix
-                    break
+            prefix_index = self._expert_prefix_index(sf_reader)
+            expert_prefix = next(
+                (prefix_index[(layer_idx, attr)] for attr in candidate_attrs
+                 if (layer_idx, attr) in prefix_index),
+                None,
+            )
             if expert_prefix is None:
                 expert_prefix = self._resolve_expert_prefix(sf_reader, layer_idx, 'mlp')
         else:
             expert_prefix = f"model.layers.{layer_idx}.mlp.experts"
 
-        for chunk_start in range(0, num_experts, chunk_size):
-            chunk_end = min(chunk_start + chunk_size, num_experts)
-            chunk_ids = list(range(chunk_start, chunk_end))
-            chunk_idx = chunk_start // chunk_size
+        # One tiny device-to-host copy replaces up to ``num_experts`` scalar
+        # synchronizations.  Only router-selected experts are read/dequantized.
+        routed_ids = indices_flat.detach().to("cpu").reshape(-1).tolist()
+        invalid_ids = {int(eid) for eid in routed_ids
+                       if int(eid) < 0 or int(eid) >= num_experts}
+        if invalid_ids:
+            raise ValueError(
+                f"router returned expert ids outside [0, {num_experts}): "
+                f"{sorted(invalid_ids)[:8]}"
+            )
+        active_by_chunk = {}
+        for eid in sorted({int(eid) for eid in routed_ids}):
+            chunk_idx = eid // chunk_size
+            active_by_chunk.setdefault(chunk_idx, []).append(eid)
+
+        for chunk_idx, chunk_ids in active_by_chunk.items():
             chunk_device = devices[chunk_idx % len(devices)]
             for eid in chunk_ids:
                 expert_out = self._forward_single_routed_expert(
@@ -2213,8 +2339,6 @@ class ShardedBlockComparator:
         """处理单个 routed expert: 取 token mask → forward → 累积到 y。"""
         eid_mask = (indices_flat == eid)
         token_mask = eid_mask.any(dim=-1)
-        if not token_mask.any():
-            return None
         s_for_eid = (scores_flat * eid_mask.float()).sum(dim=-1)
         x_chunk = h_flat[token_mask].to(chunk_device, non_blocking=True)
         s_chunk = s_for_eid[token_mask].to(chunk_device, non_blocking=True)
