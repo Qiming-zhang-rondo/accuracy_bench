@@ -2,6 +2,8 @@
 
 ## 2026-08-12 — CLI guide activation quant
 
+- 修复 Qwen MoE shared expert 的 A4 packed 权重在量化描述漏标时被误当作 FLOAT、导致中间维度减半的问题；装载阶段按骨架形状和 scale 编码区分 Dynamic/LAOS dim-0 与 MXFP4 dim-1 解包，并在进入 NPU forward 前校验投影形状
+- 修复 activation fake-quant 连续注册 ref/quant 时清掉 ref hook 的问题，确保双侧配置对称
 - 参数页新增激活伪量化类型下拉框；选择类型后自动生成 `--activation_quant` 与 `--activation_quant_type`
 - 参数页按模式切换 L1/L2 字段；L2 改为单卡 ref/quant、L1 cache 目录、可选目标层自动发现和 MLA 诊断粒度，不再生成 L1 专用参数
 

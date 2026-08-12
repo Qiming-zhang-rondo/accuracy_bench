@@ -1,0 +1,136 @@
+"""Regression tests for packed shared-expert loading and activation hooks."""
+
+import pytest
+import torch
+import torch.nn as nn
+
+from accuracy_checker.layer1_block_compare import ShardedBlockComparator
+from accuracy_checker.model_loader import _load_msslim_quant_param
+
+
+class _Reader:
+    def __init__(self, tensors):
+        self.tensors = tensors
+
+    def get_tensor(self, name):
+        return self.tensors.get(name)
+
+
+def test_missing_split_descriptor_recovers_dim0_packed_w4_weight():
+    name = "model.model.layers.0.mlp.shared_expert.gate_proj.weight"
+    quant_name = name.rsplit(".", 1)[0]
+    packed = torch.tensor([
+        [0x21, 0x43, 0x65],
+        [0x12, 0x34, 0x56],
+    ], dtype=torch.int8)
+    reader = _Reader({
+        name: packed,
+        f"{quant_name}.weight_scale": torch.ones(4),
+    })
+    param = nn.Parameter(torch.empty(4, 3))
+    quant_desc = {
+        "model.model.layers.0.mlp.shared_expert.down_proj": "W4A4_LAOS",
+    }
+
+    loaded = _load_msslim_quant_param(
+        name, param, reader, quant_desc, torch.float32, False, False
+    )
+
+    assert loaded
+    assert tuple(param.shape) == (4, 3)
+    assert param.dtype == torch.float32
+
+
+def test_missing_split_descriptor_recovers_dim1_packed_mxfp4_weight():
+    name = "model.model.layers.0.mlp.shared_expert.down_proj.weight"
+    quant_name = name.rsplit(".", 1)[0]
+    reader = _Reader({
+        name: torch.zeros(2, 16, dtype=torch.uint8),
+        f"{quant_name}.weight_scale": torch.full(
+            (2, 1), 127, dtype=torch.uint8
+        ),
+    })
+    param = nn.Parameter(torch.empty(2, 32))
+
+    loaded = _load_msslim_quant_param(
+        name, param, reader, {}, torch.float32, False, False
+    )
+
+    assert loaded
+    assert tuple(param.shape) == (2, 32)
+    torch.testing.assert_close(param, torch.zeros_like(param))
+
+
+def test_integer_float_misclassification_fails_before_accelerator_forward():
+    name = "model.model.layers.0.mlp.shared_expert.gate_proj.weight"
+    reader = _Reader({name: torch.ones(2, 3, dtype=torch.int8)})
+    param = nn.Parameter(torch.empty(4, 3))
+
+    with pytest.raises(ValueError, match="classified as FLOAT"):
+        _load_msslim_quant_param(
+            name, param, reader, {}, torch.float32, False, False
+        )
+
+
+def test_explicit_quant_shape_mismatch_fails_during_loading():
+    name = "model.model.layers.0.mlp.shared_expert.down_proj.weight"
+    quant_name = name.rsplit(".", 1)[0]
+    reader = _Reader({
+        name: torch.ones(2, 3, dtype=torch.int8),
+        f"{quant_name}.weight_scale": torch.ones(4),
+    })
+    param = nn.Parameter(torch.empty(5, 3))
+
+    with pytest.raises(ValueError, match="quantized weight shape mismatch"):
+        _load_msslim_quant_param(
+            name, param, reader, {name: "W4A4_DYNAMIC"},
+            torch.float32, False, False,
+        )
+
+
+class _Layer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(4, 4, bias=False)
+
+
+class _Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([_Layer()])
+
+
+def test_activation_quant_hooks_remain_registered_on_both_models():
+    comparator = object.__new__(ShardedBlockComparator)
+    comparator.activation_quant = True
+    comparator.activation_quant_type = "W8A8_MXFP8"
+    comparator.verbose = False
+    comparator._activation_hooks = []
+    ref_model = _Model()
+    quant_model = _Model()
+
+    comparator._register_activation_quant_hooks(ref_model, [0])
+    comparator._register_activation_quant_hooks(quant_model, [0])
+
+    assert len(ref_model.model.layers[0].proj._forward_pre_hooks) == 1
+    assert len(quant_model.model.layers[0].proj._forward_pre_hooks) == 1
+    assert len(comparator._activation_hooks) == 2
+    comparator._clear_activation_quant_hooks()
+
+
+def test_shared_expert_shape_guard_reports_before_matmul():
+    class _SharedExpert(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_proj = nn.Linear(8, 2, bias=False)
+            self.up_proj = nn.Linear(8, 2, bias=False)
+            self.down_proj = nn.Linear(4, 8, bias=False)
+
+    mlp = nn.Module()
+    mlp.shared_expert = _SharedExpert()
+
+    with pytest.raises(RuntimeError, match="projection shapes are inconsistent"):
+        ShardedBlockComparator._forward_shared_expert(
+            mlp, torch.randn(1, 3, 8)
+        )

@@ -860,6 +860,96 @@ _KNOWN_QUANT_TYPES = (
 )
 
 
+def _assign_param_checked(name: str, param, value: Tensor, source: str) -> None:
+    """Assign a decoded tensor without silently changing the skeleton shape."""
+    expected = tuple(param.shape)
+    actual = tuple(value.shape)
+    if actual != expected:
+        raise ValueError(
+            f"quantized weight shape mismatch for {name}: model expects "
+            f"{expected}, but {source} produced {actual}. Check the checkpoint "
+            "config and quant_model_description.json."
+        )
+    param.data = value
+
+
+def _recover_misclassified_quant_weight(name: str, param, weight_data: Tensor,
+                                        sf_reader: ShardWeightReader,
+                                        quant_desc_str: dict,
+                                        dtype: torch.dtype) -> Tuple[Optional[Tensor], Optional[str]]:
+    """Recover a quantized tensor whose exact quant descriptor is absent.
+
+    Some msModelSlim Qwen MoE exports omit descriptors for split shared-expert
+    gate/up projections. Treating those tensors as FLOAT silently halves a
+    Linear dimension. Only accept a recovery whose decoded shape exactly
+    matches the model skeleton.
+    """
+    if weight_data.dim() != 2:
+        return None, None
+
+    weight_key = name if name.endswith(".weight") else f"{name}.weight"
+    quant_name = weight_key.rsplit('.', 1)[0]
+    expected = tuple(param.shape)
+    raw_shape = tuple(weight_data.shape)
+    candidates = []
+
+    weight_scale = sf_reader.get_tensor(f"{quant_name}.weight_scale")
+    deq_scale = sf_reader.get_tensor(f"{quant_name}.deq_scale")
+    scale_is_e8m0 = (
+        weight_scale is not None and weight_scale.dtype == torch.uint8
+    )
+
+    # Prefer a documented sibling projection when its scale representation is
+    # compatible with this tensor. MX formats use uint8 E8M0 scales; dynamic
+    # INT4/INT8 formats use ordinary floating-point scales.
+    parent = quant_name.rsplit('.', 1)[0]
+    for projection in ("gate_proj", "up_proj", "down_proj", "gate_up_proj"):
+        sibling_key = f"{parent}.{projection}.weight"
+        sibling_type = quant_desc_str.get(
+            sibling_key, quant_desc_str.get(parse_base_name(sibling_key))
+        )
+        sibling_is_mx = sibling_type in _MX_QUANT_TYPES
+        if (
+            sibling_type in _KNOWN_QUANT_TYPES
+            and sibling_is_mx == scale_is_e8m0
+            and sibling_type not in candidates
+        ):
+            candidates.append(sibling_type)
+
+    # Dynamic/LAOS INT4 is packed on out_features (dim 0); MXFP4 is packed on
+    # in_features (dim 1). These checks distinguish the two without guessing.
+    if weight_scale is not None:
+        if not scale_is_e8m0 and (raw_shape[0] * 2, raw_shape[1]) == expected:
+            candidates.append("W4A4_DYNAMIC")
+        if scale_is_e8m0 and (raw_shape[0], raw_shape[1] * 2) == expected:
+            candidates.append("W4A8_MXFP")
+        if not scale_is_e8m0 and raw_shape == expected:
+            candidates.append("W8A8_DYNAMIC")
+        if scale_is_e8m0 and raw_shape == expected:
+            candidates.append("W8A8_MXFP8")
+    if deq_scale is not None and raw_shape == expected:
+        candidates.append("W8A8")
+
+    tried = set()
+    for quant_type in candidates:
+        if quant_type in tried:
+            continue
+        tried.add(quant_type)
+        try:
+            decoded, status = _dequant_msslim_weight(
+                weight_data, quant_type, quant_name, sf_reader, dtype
+            )
+        except (RuntimeError, ValueError, IndexError):
+            continue
+        if (
+            status == "loaded"
+            and decoded is not None
+            and tuple(decoded.shape) == expected
+        ):
+            return decoded, quant_type
+    return None, None
+
+
 def _load_msslim_quant_param(name: str, param, sf_reader: ShardWeightReader,
                              quant_desc_str: dict, dtype: torch.dtype,
                              use_fake_quant: bool, verbose: bool) -> bool:
@@ -880,7 +970,33 @@ def _load_msslim_quant_param(name: str, param, sf_reader: ShardWeightReader,
         if weight_data is None:
             weight_data = sf_reader.get_tensor(weight_key)
         if weight_data is not None:
-            param.data = weight_data.to(dtype)
+            looks_quantized = (
+                not weight_data.dtype.is_floating_point
+                or str(weight_data.dtype).startswith("torch.float8")
+            )
+            if looks_quantized:
+                recovered, inferred_type = _recover_misclassified_quant_weight(
+                    name, param, weight_data, sf_reader, quant_desc_str, dtype
+                )
+                if recovered is None:
+                    raise ValueError(
+                        f"quantized checkpoint tensor {weight_key} was classified "
+                        "as FLOAT and its quantization format could not be "
+                        "inferred safely; fix quant_model_description.json"
+                    )
+                logger.warning(
+                    "quant descriptor missing for %s; inferred %s from "
+                    "checkpoint metadata and model shape",
+                    weight_key, inferred_type,
+                )
+                _assign_param_checked(
+                    name, param, recovered,
+                    f"inferred {inferred_type} dequantization",
+                )
+                return True
+            _assign_param_checked(
+                name, param, weight_data.to(dtype), "FLOAT checkpoint tensor"
+            )
             return True
         return False
 
@@ -903,7 +1019,7 @@ def _load_msslim_quant_param(name: str, param, sf_reader: ShardWeightReader,
     if w_fp is None:
         # 已知类型但缺少 scale/bias: 静默跳过 (与原 skipped_count += 1 一致)
         return False
-    param.data = w_fp
+    _assign_param_checked(name, param, w_fp, f"{quant_type} dequantization")
     return True
 
 

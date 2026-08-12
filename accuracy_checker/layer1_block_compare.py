@@ -1617,7 +1617,6 @@ class ShardedBlockComparator:
 
     def _register_activation_quant_hooks(self, model, layers: List[int]):
         """在指定层的所有 nn.Linear (除 router/gate 外) 上注册 MXFP8 激活伪量化 hook。"""
-        self._clear_activation_quant_hooks()
         if not self.activation_quant:
             return
         from .utils import get_decoder_layers
@@ -2228,6 +2227,25 @@ class ShardedBlockComparator:
         shared_expert = getattr(mlp, 'shared_experts', None) or getattr(mlp, 'shared_expert', None)
         if shared_expert is None:
             return None
+        gate_proj = getattr(shared_expert, 'gate_proj', None)
+        up_proj = getattr(shared_expert, 'up_proj', None)
+        down_proj = getattr(shared_expert, 'down_proj', None)
+        if all(isinstance(proj, nn.Linear) for proj in (gate_proj, up_proj, down_proj)):
+            gate_out = gate_proj.weight.shape[0]
+            up_out = up_proj.weight.shape[0]
+            down_in = down_proj.weight.shape[1]
+            if gate_out != up_out or gate_out != down_in:
+                raise RuntimeError(
+                    "shared expert projection shapes are inconsistent before "
+                    "forward: gate_proj=%s, up_proj=%s, down_proj=%s. This "
+                    "usually means a packed W4 weight was classified as FLOAT "
+                    "by quant_model_description.json."
+                    % (
+                        tuple(gate_proj.weight.shape),
+                        tuple(up_proj.weight.shape),
+                        tuple(down_proj.weight.shape),
+                    )
+                )
         with torch.no_grad():
             shared_out = shared_expert(hidden_states)
             return shared_out[0] if isinstance(shared_out, tuple) else shared_out
