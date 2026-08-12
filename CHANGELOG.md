@@ -2,6 +2,7 @@
 
 ## 2026-08-12 — CLI guide activation quant
 
+- 统一 msModelSlim `W4A4_INT4_DYNAMIC` checkpoint 标签为内部 `W4A4_DYNAMIC`，覆盖普通 Linear、3D expert、grouped-dual streaming expert、inference 与 L2 replay
 - 审计全部 activation fake-quant 路径并增加 shape/dtype/device 不变量检查；未知类型不再静默回退 MXFP8
 - 激活类型合并 `W4A4_LAOS` 与 `W4A4_DYNAMIC`：CLI/参数页只展示 `W4A4_DYNAMIC`，旧 LAOS 命令自动归一；checkpoint 权重格式仍分别识别
 - 修复 Qwen MoE shared expert 的 A4 packed 权重在量化描述漏标时被误当作 FLOAT、导致中间维度减半的问题；装载阶段按骨架形状和 scale 编码区分 Dynamic/LAOS dim-0 与 MXFP4 dim-1 解包，并在进入 NPU forward 前校验投影形状

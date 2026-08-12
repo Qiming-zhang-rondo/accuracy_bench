@@ -6,6 +6,7 @@ import torch.nn as nn
 
 from accuracy_checker.layer1_block_compare import ShardedBlockComparator
 from accuracy_checker.model_loader import _load_msslim_quant_param
+from accuracy_checker.utils import normalize_quant_desc_values, normalize_quant_type
 
 
 class _Reader:
@@ -39,6 +40,62 @@ def test_missing_split_descriptor_recovers_dim0_packed_w4_weight():
     assert loaded
     assert tuple(param.shape) == (4, 3)
     assert param.dtype == torch.float32
+
+
+def test_msmodelslim_int4_dynamic_alias_loads_normal_weight():
+    name = "model.language_model.layers.0.mlp.experts.0.gate_proj.weight"
+    quant_name = name.rsplit(".", 1)[0]
+    reader = _Reader({
+        name: torch.tensor([
+            [0x21, 0x43, 0x65],
+            [0x12, 0x34, 0x56],
+        ], dtype=torch.int8),
+        f"{quant_name}.weight_scale": torch.ones(4),
+    })
+    param = nn.Parameter(torch.empty(4, 3))
+
+    loaded = _load_msslim_quant_param(
+        name, param, reader, {name: "W4A4_INT4_DYNAMIC"},
+        torch.float32, False, False,
+    )
+
+    assert loaded
+    assert tuple(param.shape) == (4, 3)
+
+
+def test_msmodelslim_int4_dynamic_alias_loads_streaming_expert():
+    prefix = "model.language_model.layers.0.mlp.experts"
+    quant_name = f"{prefix}.0.gate_proj"
+    reader = _Reader({
+        f"{quant_name}.weight": torch.tensor([
+            [0x21, 0x43, 0x65],
+            [0x12, 0x34, 0x56],
+        ], dtype=torch.int8),
+        f"{quant_name}.weight_scale": torch.ones(4),
+    })
+    comparator = object.__new__(ShardedBlockComparator)
+    comparator.dtype = torch.float32
+
+    resolved = comparator._streaming_quant_type(
+        {f"{quant_name}.weight": "W4A4_INT4_DYNAMIC"},
+        f"{quant_name}.weight",
+    )
+    actual = comparator._dequant_streaming_proj(
+        reader, prefix, 0, "gate_proj", resolved, "cpu"
+    )
+
+    assert resolved == "W4A4_DYNAMIC"
+    assert tuple(actual.shape) == (4, 3)
+
+
+def test_quant_description_value_alias_is_canonicalized():
+    assert normalize_quant_type("W4A4_INT4_DYNAMIC") == "W4A4_DYNAMIC"
+    desc = normalize_quant_desc_values({
+        "layer.weight": "W4A4_INT4_DYNAMIC",
+        "metadata": {"version": 1},
+    })
+    assert desc["layer.weight"] == "W4A4_DYNAMIC"
+    assert desc["metadata"] == {"version": 1}
 
 
 def test_missing_split_descriptor_recovers_dim1_packed_mxfp4_weight():

@@ -39,7 +39,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from accuracy_checker.replay_provider import ReplayProvider
 from accuracy_checker.v2_metrics import rel_l2, recovery_ratio
 from accuracy_checker.operator_patcher import ReplacementHook, _resolve_path
-from accuracy_checker.utils import load_rotation_matrix, unrotate_hidden, rotate_hidden
+from accuracy_checker.utils import (
+    load_rotation_matrix,
+    normalize_quant_desc_values,
+    rotate_hidden,
+    unrotate_hidden,
+)
 from accuracy_checker.cache import (
     CACHE_FORMAT_VERSION,
     get_cache_dir,
@@ -510,7 +515,7 @@ def _load_quant_desc(quant_model_path: str) -> Optional[dict]:
     desc_path = os.path.join(quant_model_path, "quant_model_description.json")
     if os.path.exists(desc_path):
         with open(desc_path) as f:
-            return json.load(f)
+            return normalize_quant_desc_values(json.load(f))
     return None
 
 

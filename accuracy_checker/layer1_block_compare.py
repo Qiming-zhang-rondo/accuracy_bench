@@ -320,6 +320,7 @@ class ShardedBlockComparator:
         """Build weight index and reader for ref/quant models."""
         from .model_loader import (build_weight_index, ShardWeightReader,
                                    is_quantized_model, is_compressed_tensors_model)
+        from .utils import normalize_quant_desc_values
         import json as _json
 
         self._ref_is_quant = is_quantized_model(self.ref_model_path)
@@ -338,12 +339,16 @@ class ShardedBlockComparator:
             _desc_path = os.path.join(self.ref_model_path, "quant_model_description.json")
             if os.path.exists(_desc_path):
                 with open(_desc_path, 'r') as _f:
-                    self._ref_quant_desc = _json.load(_f)
+                    self._ref_quant_desc = normalize_quant_desc_values(
+                        _json.load(_f)
+                    )
         if self._quant_is_quant and not self._quant_is_ct:
             _desc_path = os.path.join(self.quant_model_path, "quant_model_description.json")
             if os.path.exists(_desc_path):
                 with open(_desc_path, 'r') as _f:
-                    self._quant_quant_desc = _json.load(_f)
+                    self._quant_quant_desc = normalize_quant_desc_values(
+                        _json.load(_f)
+                    )
 
     def _init_rotary_emb(self, model, device: str):
         """Initialize rotary embedding for a model."""
@@ -1829,7 +1834,7 @@ class ShardedBlockComparator:
         """Look up quant type for both Parameter and Linear-style keys."""
         if not quant_desc_str:
             return default
-        from .utils import parse_base_name
+        from .utils import parse_base_name, normalize_quant_type
         candidates = [weight_key, parse_base_name(weight_key)]
         if weight_key.endswith(".weight"):
             candidates.append(weight_key[:-len(".weight")])
@@ -1841,8 +1846,8 @@ class ShardedBlockComparator:
         for candidate in candidates:
             quant_type = quant_desc_str.get(candidate)
             if isinstance(quant_type, str):
-                return quant_type
-        return default
+                return normalize_quant_type(quant_type)
+        return normalize_quant_type(default)
 
     def _dequant_streaming_weight(self, sf_reader, weight_key, w_type, device,
                                     is_ct=False, expert_id=None,

@@ -27,7 +27,7 @@ from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING
 
-from .utils import parse_base_name, normalize_quant_desc_keys
+from .utils import parse_base_name, normalize_quant_desc_keys, normalize_quant_type
 import logging
 
 logger = logging.getLogger(__name__)
@@ -804,6 +804,7 @@ def _dequant_msslim_weight(weight_data: Tensor, quant_type: str, quant_name: str
 
     Extracted from load_layer_weights_indexed to reduce cyclomatic complexity.
     """
+    quant_type = normalize_quant_type(quant_type)
     if quant_type in ("W8A8_DYNAMIC", "W8A8_MIX"):
         weight_scale = sf_reader.get_tensor(f"{quant_name}.weight_scale")
         weight_offset = sf_reader.get_tensor(f"{quant_name}.weight_offset")
@@ -905,9 +906,9 @@ def _recover_misclassified_quant_weight(name: str, param, weight_data: Tensor,
     parent = quant_name.rsplit('.', 1)[0]
     for projection in ("gate_proj", "up_proj", "down_proj", "gate_up_proj"):
         sibling_key = f"{parent}.{projection}.weight"
-        sibling_type = quant_desc_str.get(
+        sibling_type = normalize_quant_type(quant_desc_str.get(
             sibling_key, quant_desc_str.get(parse_base_name(sibling_key))
-        )
+        ))
         sibling_is_mx = sibling_type in _MX_QUANT_TYPES
         if (
             sibling_type in _KNOWN_QUANT_TYPES
@@ -962,7 +963,9 @@ def _load_msslim_quant_param(name: str, param, sf_reader: ShardWeightReader,
     else:
         weight_key = f"{name}.weight"
     base_name = parse_base_name(weight_key)
-    quant_type = quant_desc_str.get(weight_key, quant_desc_str.get(base_name, "FLOAT"))
+    quant_type = normalize_quant_type(
+        quant_desc_str.get(weight_key, quant_desc_str.get(base_name, "FLOAT"))
+    )
 
     # FLOAT 或未知类型: 直接读 tensor 赋值 (与原 FLOAT/unknown 合并分支一致)
     if quant_type == "FLOAT" or quant_type not in _KNOWN_QUANT_TYPES:
@@ -1611,6 +1614,7 @@ def _load_3d_expert_nonquant_indexed(name, param, sf_reader, dtype):
 
 def _dequant_single_expert_indexed(weight_key, quant_type, sf_reader, dtype, use_fake_quant):
     """Dequantize a single expert weight using ShardWeightReader."""
+    quant_type = normalize_quant_type(quant_type)
     if quant_type == "FLOAT":
         weight_data = sf_reader.get_tensor(weight_key)
         if weight_data is not None:

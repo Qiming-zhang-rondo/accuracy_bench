@@ -34,7 +34,11 @@ from accuracy_checker.model_loader import (
     move_layers_to_device,
     unload_layers_to_meta,
 )
-from accuracy_checker.utils import get_decoder_layers, get_rotary_emb_module
+from accuracy_checker.utils import (
+    get_decoder_layers,
+    get_rotary_emb_module,
+    normalize_quant_desc_values,
+)
 from accuracy_checker.model_structure import (
     build_replay_attention_mask,
     get_layer_state_kwarg,
@@ -119,7 +123,7 @@ class ReplayProvider:
         if os.path.exists(desc_path):
             import json
             with open(desc_path) as f:
-                return json.load(f)
+                return normalize_quant_desc_values(json.load(f))
         return None
 
     def get_layer_handle(

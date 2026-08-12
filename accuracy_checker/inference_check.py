@@ -48,7 +48,12 @@ from .model_loader import (
     is_quantized_model,
     _MX_QUANT_TYPES,
 )
-from .utils import parse_base_name, normalize_quant_desc_keys, load_rotation_matrix
+from .utils import (
+    parse_base_name,
+    normalize_quant_desc_keys,
+    normalize_quant_desc_values,
+    load_rotation_matrix,
+)
 from .model_structure import get_model_components
 
 
@@ -1503,6 +1508,7 @@ def _hf_load_quant_weights(model: nn.Module, model_path: str, torch_dtype: torch
                  "kv_cache_type", "kv_quant_type", "model_quant_type"}
     quant_desc = {k: v for k, v in quant_desc_raw.items()
                   if k not in meta_keys and isinstance(v, str)}
+    quant_desc = normalize_quant_desc_values(quant_desc)
 
     if use_cpu_dequant:
         # 旧流程: CPU 全量反量化 → 再搬 NPU

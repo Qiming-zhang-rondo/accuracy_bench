@@ -95,6 +95,31 @@ def parse_base_name(weight_key: str) -> str:
     return weight_key
 
 
+_QUANT_TYPE_ALIASES = {
+    # msModelSlim A4 exports use both spellings for the same packed INT4
+    # dynamic format. Keep one internal name across indexed and streaming paths.
+    "W4A4_INT4_DYNAMIC": "W4A4_DYNAMIC",
+}
+
+
+def normalize_quant_type(quant_type: str) -> str:
+    """Return the canonical internal spelling for a checkpoint quant type."""
+    if not isinstance(quant_type, str):
+        return quant_type
+    normalized = quant_type.strip()
+    return _QUANT_TYPE_ALIASES.get(normalized.upper(), normalized)
+
+
+def normalize_quant_desc_values(quant_desc: dict) -> dict:
+    """Canonicalize string quant types while preserving metadata values."""
+    if not quant_desc:
+        return quant_desc
+    return {
+        key: normalize_quant_type(value) if isinstance(value, str) else value
+        for key, value in quant_desc.items()
+    }
+
+
 def normalize_quant_desc_keys(quant_desc: dict, model) -> dict:
     """修正 quant_desc key 与 model.named_modules() 的前缀不匹配
 
@@ -120,6 +145,7 @@ def normalize_quant_desc_keys(quant_desc: dict, model) -> dict:
         if not isinstance(value, str):
             new_desc[key] = value
             continue
+        value = normalize_quant_type(value)
 
         if has_nested_language_model and key.startswith("model.language_model."):
             new_key = "model.model." + key[len("model."):]
