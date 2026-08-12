@@ -3082,6 +3082,15 @@ class ShardedBlockComparator:
         quant_reader.close()
         self._cache_top_k_cleanup(layer_cos_sims, layer_inputs, self.cache_top_k, self.verbose)
         report = BlockCompareReport()
+        report.quant_method = self.quant_method
+        report.activation_quant_enabled = bool(self.activation_quant)
+        report.comparison_scope = (
+            "weight_plus_activation_qdq"
+            if self.activation_quant else "weight_only"
+        )
+        if self.activation_quant:
+            report.activation_quant_type = self.activation_quant_type
+            report.activation_quant_backend = self.activation_quant_backend
         report.results = all_results
         if self.l1_target_layers is not None:
             logger.info(f"\n[Sharded L1] 目标层 {sorted(self.l1_target_layers)} 已全部缓存完毕。")
@@ -3111,15 +3120,40 @@ class ShardedBlockComparator:
                 logger.warning(f"full logits 采集失败: {e}")
         return report
 
-    def compare(self, prompt: str, layers_per_shard: int = 8, **kwargs) -> 'BlockCompareReport':
+    def compare(
+        self,
+        prompt: str,
+        layers_per_shard: int = 8,
+        cache_prompt: Optional[str] = None,
+        **kwargs,
+    ) -> 'BlockCompareReport':
         tokenizer = self.tokenizer
         input_ids = tokenizer.encode(prompt, return_tensors="pt")
         if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
-        return self.compare_ids(input_ids, layers_per_shard=layers_per_shard, **kwargs)
+        return self.compare_ids(
+            input_ids,
+            layers_per_shard=layers_per_shard,
+            cache_prompt=prompt if cache_prompt is None else cache_prompt,
+            **kwargs,
+        )
 
-    def compare_ids(self, input_ids: Tensor, layers_per_shard: int = 8, **kwargs) -> 'BlockCompareReport':
-        self._prompt_text = str(input_ids.shape[1]) + "_tokens"
+    def compare_ids(
+        self,
+        input_ids: Tensor,
+        layers_per_shard: int = 8,
+        cache_prompt: Optional[str] = None,
+        **kwargs,
+    ) -> 'BlockCompareReport':
+        # Cache identity must describe the actual sample, not only its token
+        # count. Different prompts with the same length otherwise collide and
+        # L2 cannot reliably find the L1 cache. Direct compare_ids callers that
+        # do not know the source text retain the historical length fallback.
+        self._prompt_text = (
+            str(cache_prompt)
+            if cache_prompt is not None
+            else f"{input_ids.shape[1]}_tokens"
+        )
         if self.compare_mode == "grouped_dual":
             return self._compare_grouped_dual(input_ids, layers_per_shard=layers_per_shard, **kwargs)
         return self._compare_dual_sharded(input_ids, layers_per_shard=layers_per_shard, **kwargs)

@@ -173,11 +173,13 @@ def test_glm51_no_bias_matches_pure_sigmoid_topk():
         e_score_correction_bias=torch.zeros(256))
     assert torch.equal(idx_mine, idx_ref)
     assert torch.allclose(w_mine, w_ref, atol=1e-6)
-    # 与旧的 softmax 公式做负向校验 (确认 sigmoid ≠ softmax)
+    # sigmoid / softmax 对单个 logit 都是单调变换，因此 top-k 索引必然
+    # 相同；区别在归一化后的路由权重，而不是专家选择。
     softmax_scores = torch.nn.functional.softmax(router_logits.float(), dim=-1)
-    _, idx_softmax = softmax_scores.topk(8, dim=-1)
-    # 至少有一个 token 的 topk 选择不同 (sigmoid != softmax)
-    assert not torch.equal(idx_mine, idx_softmax)
+    softmax_topk, idx_softmax = softmax_scores.topk(8, dim=-1)
+    softmax_weights = softmax_topk / softmax_topk.sum(dim=-1, keepdim=True) * 2.5
+    assert torch.equal(idx_mine, idx_softmax)
+    assert not torch.allclose(w_mine, softmax_weights, atol=1e-6)
 
 
 def test_deepseekv3_ngroup8_matches_reference():

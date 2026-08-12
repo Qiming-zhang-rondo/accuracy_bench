@@ -98,7 +98,7 @@ def test_glm5_inference_check_script_exists():
     script = ROOT / "scripts" / "glm5_inference_check.py"
     assert script.exists(), f"缺少 {script}"
     # 语法检查
-    ast.parse(script.read_text())
+    ast.parse(script.read_text(encoding="utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -106,22 +106,21 @@ def test_glm5_inference_check_script_exists():
 # ---------------------------------------------------------------------------
 
 def test_cpu_fallback_raises_not_implemented():
-    """line 765 附近 use_cpu_dequant 分支必须 raise NotImplementedError
-    (dequantize_model 未在 clean 分支恢复)"""
-    src = INFERENCE_CHECK_PATH.read_text()
+    """量化权重加载 helper 的 CPU fallback 必须显式拒绝。"""
+    src = INFERENCE_CHECK_PATH.read_text(encoding="utf-8")
     tree = ast.parse(src)
 
-    # 找到 hf_inference_check 函数
-    hf_func = None
+    # CPU fallback 已拆到量化权重加载 helper，检查实际执行分支。
+    load_func = None
     for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "hf_inference_check":
-            hf_func = node
+        if isinstance(node, ast.FunctionDef) and node.name == "_hf_load_quant_weights":
+            load_func = node
             break
-    assert hf_func is not None, "未找到 hf_inference_check 函数"
+    assert load_func is not None, "未找到 _hf_load_quant_weights 函数"
 
     # 函数体内应存在 raise NotImplementedError 且消息含 'dequantize_model'
     found = False
-    for node in ast.walk(hf_func):
+    for node in ast.walk(load_func):
         if isinstance(node, ast.Raise) and node.exc is not None:
             exc = node.exc
             # raise NotImplementedError("...") 形式
@@ -138,7 +137,7 @@ def test_cpu_fallback_raises_not_implemented():
 def test_no_dangling_dequantize_model_import():
     """clean 分支不应再 import dequantize_model / dequantize_weight_compressed_tensors
     (model_loader.py 已无这两个函数)"""
-    src = INFERENCE_CHECK_PATH.read_text()
+    src = INFERENCE_CHECK_PATH.read_text(encoding="utf-8")
     tree = ast.parse(src)
     for node in tree.body:
         if isinstance(node, ast.ImportFrom) and node.module == ".model_loader":
@@ -152,7 +151,7 @@ def test_no_dangling_dequantize_model_import():
 def test_logging_not_swallowed_by_docstring():
     """回归: 之前 import logging / logger=... 被吞进 docstring 导致 logger 未定义。
     验证 logging 是真正的 module-level import。"""
-    src = INFERENCE_CHECK_PATH.read_text()
+    src = INFERENCE_CHECK_PATH.read_text(encoding="utf-8")
     tree = ast.parse(src)
     module_imports = [
         n.names[0].name for n in tree.body

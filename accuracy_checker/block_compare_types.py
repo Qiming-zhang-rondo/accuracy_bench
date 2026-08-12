@@ -146,6 +146,14 @@ class BlockCompareReport:
     # straight into assemble_report(logits_comparison=...) so the L1 panel and
     # the logits panel share one forward pass (no extra model reload).
     logits_data: Optional[LogitsData] = None
+    # Record how this forward was executed so text/HTML reports do not blur
+    # weight-only diagnosis with quant-side activation QDQ simulation.  Keep
+    # these after logits_data to preserve the historical positional fields.
+    comparison_scope: str = "unknown"
+    quant_method: str = ""
+    activation_quant_enabled: Optional[bool] = None
+    activation_quant_type: str = ""
+    activation_quant_backend: str = ""
     # 缓存的检测结果 (首次调用 _detect_bad_layers 后填充)
     _detection_cache: Optional[BadLayerDetection] = field(default=None, repr=False)
 
@@ -319,6 +327,24 @@ class BlockCompareReport:
 
     def summary(self) -> str:
         lines = [f"{'='*70}", "L1 逐Block对比", f"{'='*70}"]
+        if self.activation_quant_enabled is True:
+            lines.append("  对比口径: 权重 + 激活 QDQ 联合仿真")
+            lines.append(
+                "  Activation QDQ: 仅 Quant 侧启用"
+                f" (type={self.activation_quant_type or 'AUTO'}, "
+                f"backend={self.activation_quant_backend or 'auto'})"
+            )
+            lines.append(
+                "  解读: block output 包含累计权重误差与激活 QDQ 误差，"
+                "单次结果不能拆分两者贡献。"
+            )
+        elif self.activation_quant_enabled is False:
+            lines.append("  对比口径: 仅权重误差 (Activation QDQ 关闭)")
+        else:
+            lines.append("  对比口径: 未记录 (历史/外部构造报告)")
+        if self.quant_method:
+            lines.append(f"  Quant 权重执行: {self.quant_method}")
+        lines.append(f"{'-'*70}")
         for r in self.results:
             lines.append(f"  {r}")
         lines.append(f"{'='*70}")

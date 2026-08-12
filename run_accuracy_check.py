@@ -259,6 +259,26 @@ def _resolve_input(args, tokenizer=None):
     return args.prompt, None
 
 
+def _cache_input_identity(args) -> str:
+    """Return the canonical sample identity shared by L1 cache and L2 lookup."""
+    raw_messages = getattr(args, "messages", None)
+    if raw_messages:
+        try:
+            messages = json.loads(raw_messages)
+            payload = json.dumps(
+                messages,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            # Validation reports malformed JSON separately. Keep this fallback
+            # deterministic so it does not mask the primary input error.
+            payload = str(raw_messages)
+        return f"messages:{payload}"
+    return f"prompt:{getattr(args, 'prompt', None) or ''}"
+
+
 def _clean_l2_cache():
     from accuracy_checker.cache import get_cache_dir
     import glob
@@ -415,11 +435,20 @@ def run_hf_l1(args, ref_device, target_device, dtype):
         kimi_kda_backend=getattr(args, 'kimi_kda_backend', 'auto'),
     )
     prompt_text, input_ids = _resolve_input(args, tokenizer)
+    cache_prompt = _cache_input_identity(args)
     logger.info(f"  输入: {prompt_text[:100]}")
     if input_ids is not None:
-        l1_report = comparator.compare_ids(input_ids, layers_per_shard=args.layers_per_shard)
+        l1_report = comparator.compare_ids(
+            input_ids,
+            layers_per_shard=args.layers_per_shard,
+            cache_prompt=cache_prompt,
+        )
     else:
-        l1_report = comparator.compare(prompt_text, layers_per_shard=args.layers_per_shard)
+        l1_report = comparator.compare(
+            prompt_text,
+            layers_per_shard=args.layers_per_shard,
+            cache_prompt=cache_prompt,
+        )
     return l1_report
 
 
@@ -441,7 +470,7 @@ def run_hf_l2(args, ref_device, target_device, dtype, bad_layers):
     logger.info(f"  L2: Sub-graph 反事实诊断 - 检查层: {bad_layers}")
     logger.info("=" * 70)
 
-    prompt_text = args.messages if args.messages else args.prompt
+    prompt_text = _cache_input_identity(args)
     results = diagnose_layers(
         ref_model_path=args.ref_model,
         quant_model_path=args.quant_model,
@@ -668,7 +697,12 @@ def _write_stage_report_artifacts(args, report, mode):
         quant_model_path=args.quant_model or "",
         quant_format=args.quant_format or "",
         device_mode=str(device_mode or ""),
-        prompt=args.prompt or "",
+        prompt=(getattr(args, "messages", None) or args.prompt or ""),
+        input_mode="messages" if getattr(args, "messages", None) else "prompt",
+        quant_method=getattr(args, "quant_method", "") or "",
+        activation_quant_enabled=bool(getattr(args, "activation_quant", False)),
+        activation_quant_type=getattr(args, "activation_quant_type", "") or "",
+        activation_quant_backend=getattr(args, "activation_quant_backend", "") or "",
     )
     json_path = os.path.join(out_dir, "report_data.json")
     with open(json_path, "w", encoding="utf-8") as f:
@@ -711,7 +745,7 @@ def _mode_l2(args, l1_report=None):
         _cache_dir = get_cache_dir()
         if args.ref_model and os.path.exists(_cache_dir):
             ref_mh = model_hash(args.ref_model)
-            ph = prompt_hash(args.messages if args.messages else args.prompt)
+            ph = prompt_hash(_cache_input_identity(args))
             cached_layers = set()
             for fname in os.listdir(_cache_dir):
                 if f"{ref_mh}_{ph}" in fname and "_ref_" in fname:
@@ -749,8 +783,6 @@ def _build_inference_compare_from_boundary(boundary_dict, quant_model_path, prom
     if not ref_text and not quant_text:
         return None
 
-    from accuracy_checker.report_schema import InferenceCompareData
-
     # Tokenize for token-level comparison
     ref_tokens = []
     quant_tokens = []
@@ -763,55 +795,21 @@ def _build_inference_compare_from_boundary(boundary_dict, quant_model_path, prom
     except Exception as e:
         logger.info(f"  [inference_compare] tokenizer 加载失败, 仅做文本级对比: {e}")
 
-    exact_match = ref_text == quant_text
-    min_len = min(len(ref_tokens), len(quant_tokens))
-    first_div = None
-    for i in range(min_len):
-        if ref_tokens[i] != quant_tokens[i]:
-            first_div = i
-            break
-    if first_div is None and len(ref_tokens) != len(quant_tokens):
-        first_div = min_len
-    max_len = max(len(ref_tokens), len(quant_tokens))
-    matches = sum(1 for i in range(min_len) if ref_tokens[i] == quant_tokens[i])
-    rate = matches / max_len if max_len > 0 else (1.0 if exact_match else 0.0)
-
-    # Badcase 检测 (退化/乱码)
-    ref_garbled = False
-    quant_garbled = False
-    ref_repeat = False
-    quant_repeat = False
-    try:
-        from accuracy_checker.inference_check import detect_badcase
-        if ref_text:
-            d_ref = detect_badcase(ref_text)
-            ref_garbled = bool(d_ref.get("reproduced"))
-        if quant_text:
-            d_qt = detect_badcase(quant_text)
-            quant_garbled = bool(d_qt.get("reproduced"))
-    except Exception as e:
-        logger.debug(f"inference_compare detect_badcase failed: {e}")
+    from accuracy_checker.inference_compare import compare_inference
+    comparison = compare_inference(
+        ref_text,
+        quant_text,
+        ref_tokens,
+        quant_tokens,
+        prompt=prompt,
+    )
 
     logger.info(f"  [inference_compare] ref {len(ref_tokens)} tokens, "
                 f"quant {len(quant_tokens)} tokens, "
-                f"match={rate*100:.1f}%, exact={exact_match}, "
-                f"first_div={first_div}")
-
-    return InferenceCompareData(
-        prompt=prompt,
-        ref_output=ref_text,
-        quant_output=quant_text,
-        ref_tokens=ref_tokens,
-        quant_tokens=quant_tokens,
-        token_match_rate=rate,
-        exact_match=exact_match,
-        first_divergence_pos=first_div,
-        max_new_tokens=max(len(ref_tokens), len(quant_tokens)),
-        ref_garbled=ref_garbled,
-        quant_garbled=quant_garbled,
-        ref_repeat=ref_repeat,
-        quant_repeat=quant_repeat,
-    )
+                f"match={(comparison.token_match_rate or 0.0)*100:.1f}%, "
+                f"exact={comparison.exact_match}, "
+                f"first_div={comparison.first_divergence_pos}")
+    return comparison
 
 
 def _full_run_l0(args):
@@ -920,7 +918,12 @@ def _full_assemble_and_write(args, l1_report, l2_results, boundary_dict,
         quant_model_path=args.quant_model or "",
         quant_format=args.quant_format,
         device_mode=args.devices or args.device,
-        prompt=args.prompt,
+        prompt=(getattr(args, "messages", None) or args.prompt or ""),
+        input_mode="messages" if getattr(args, "messages", None) else "prompt",
+        quant_method=getattr(args, "quant_method", "") or "",
+        activation_quant_enabled=bool(getattr(args, "activation_quant", False)),
+        activation_quant_type=getattr(args, "activation_quant_type", "") or "",
+        activation_quant_backend=getattr(args, "activation_quant_backend", "") or "",
     )
     logger.info(f"  run_status = {report_data.run_status}")
 

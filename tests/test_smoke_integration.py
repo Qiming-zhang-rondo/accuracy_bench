@@ -130,6 +130,12 @@ class TestReportSchema:
         rd = ReportData(
             overview=OverviewData(model_name="glm-smoke",
                                   quant_format="W4A8_MXFP4",
+                                  input_mode="messages",
+                                  comparison_scope="weight_plus_activation_qdq",
+                                  quant_method="dequantize",
+                                  activation_quant_enabled=True,
+                                  activation_quant_type="W4A4_DYNAMIC",
+                                  activation_quant_backend="npu",
                                   first_divergence_layer=7,
                                   boundary_result="CLEAN"),
             l1_layers=[L1LayerData(layer_idx=7, layer_name="layer.7",
@@ -142,6 +148,10 @@ class TestReportSchema:
         rd2 = ReportData.from_dict(d)
         assert rd2.overview.model_name == "glm-smoke"
         assert rd2.overview.first_divergence_layer == 7
+        assert rd2.overview.input_mode == "messages"
+        assert rd2.overview.comparison_scope == "weight_plus_activation_qdq"
+        assert rd2.overview.activation_quant_enabled is True
+        assert rd2.overview.activation_quant_type == "W4A4_DYNAMIC"
         assert rd2.l1_layers[0].cos_sim == 0.42
         assert rd2.l1_layers[0].is_first_divergence is True
         assert rd2.l2_results[0].impact_boundary == "mlp"
@@ -236,6 +246,101 @@ class TestAssembleReport:
         assert rd.overview.model_name == ""
         assert len(rd.l1_layers) == 0
         assert rd.run_status in ("PARTIAL", "INCONCLUSIVE")
+
+    def test_assemble_records_activation_comparison_scope(self):
+        rd = assemble_report(
+            l1_report=_mock_l1(),
+            quant_method="dequantize",
+            activation_quant_enabled=True,
+            activation_quant_type="AUTO",
+            activation_quant_backend="npu",
+            input_mode="messages",
+        )
+        assert rd.overview.comparison_scope == "weight_plus_activation_qdq"
+        assert rd.overview.activation_quant_enabled is True
+        assert rd.overview.activation_quant_type == "AUTO"
+        assert rd.overview.activation_quant_backend == "npu"
+        assert rd.overview.input_mode == "messages"
+
+    def test_old_report_scope_stays_unknown(self):
+        rd = assemble_report(l1_report=_mock_l1())
+        assert rd.overview.comparison_scope == "unknown"
+        assert rd.overview.activation_quant_enabled is None
+
+
+class TestL1L2CacheIdentity:
+
+    def test_messages_identity_is_canonical_and_namespaced(self):
+        from run_accuracy_check import _cache_input_identity
+
+        left = types.SimpleNamespace(
+            messages='[{"role":"user","content":"你好"}]',
+            prompt=None,
+        )
+        right = types.SimpleNamespace(
+            messages='[ { "content": "你好", "role": "user" } ]',
+            prompt=None,
+        )
+        prompt = types.SimpleNamespace(messages=None, prompt="你好")
+
+        assert _cache_input_identity(left) == _cache_input_identity(right)
+        assert _cache_input_identity(left).startswith("messages:")
+        assert _cache_input_identity(prompt) == "prompt:你好"
+        assert _cache_input_identity(left) != _cache_input_identity(prompt)
+
+    def test_compare_uses_sample_identity_instead_of_only_token_count(self):
+        from accuracy_checker.layer1_block_compare import ShardedBlockComparator
+
+        class Tokenizer:
+            @staticmethod
+            def encode(prompt, return_tensors=None):
+                return torch.tensor([[1, 2, 3]])
+
+        comparator = object.__new__(ShardedBlockComparator)
+        comparator.tokenizer = Tokenizer()
+        comparator.compare_mode = "grouped_dual"
+
+        def capture_cache_prompt(self, input_ids, layers_per_shard=8, **kwargs):
+            return self._prompt_text
+
+        comparator._compare_grouped_dual = types.MethodType(
+            capture_cache_prompt, comparator
+        )
+
+        assert comparator.compare("hello") == "hello"
+        assert comparator.compare(
+            "hello", cache_prompt="prompt:hello"
+        ) == "prompt:hello"
+        assert comparator.compare_ids(
+            torch.tensor([[1, 2, 3]]), cache_prompt="messages:[]"
+        ) == "messages:[]"
+        assert comparator.compare_ids(torch.tensor([[1, 2, 3]])) == "3_tokens"
+
+    def test_ambiguous_cross_prompt_cache_is_rejected(self, tmp_path, monkeypatch):
+        from accuracy_checker.cache import CACHE_FORMAT_VERSION, INT4_UNPACK_VERSION
+        from accuracy_checker.subgraph_locate import _try_cache_match
+
+        model_hash = "deadbeef"
+        for prompt_hash in ("11111111", "22222222"):
+            name = (
+                f"{model_hash}_{prompt_hash}_s3_L7_ref_"
+                f"{CACHE_FORMAT_VERSION}_{INT4_UNPACK_VERSION}_dequantize.pt"
+            )
+            (tmp_path / name).touch()
+
+        loaded = []
+        monkeypatch.setattr(torch, "load", lambda *args, **kwargs: loaded.append(args))
+        result = _try_cache_match(
+            str(tmp_path) + os.sep,
+            model_hash,
+            "ffffffff",
+            7,
+            "ref",
+            "dequantize",
+            "cpu",
+        )
+        assert result is None
+        assert loaded == []
 
 
 # ===========================================================================
@@ -428,6 +533,17 @@ class TestCollectFullLogits:
         # summary() surfaces the new field when present
         s = r2.summary()
         assert "Full logits" in s and "2 positions" in s
+        assert "对比口径: 未记录" in s
+        joint = BlockCompareReport(
+            comparison_scope="weight_plus_activation_qdq",
+            quant_method="dequantize",
+            activation_quant_enabled=True,
+            activation_quant_type="AUTO",
+            activation_quant_backend="npu",
+        )
+        joint_summary = joint.summary()
+        assert "权重 + 激活 QDQ 联合仿真" in joint_summary
+        assert "仅 Quant 侧启用" in joint_summary
         # summary is also valid when absent (no KeyError)
         _ = BlockCompareReport().summary()
 

@@ -525,6 +525,40 @@ table.grid-tbl tr:hover td { background:var(--accent-soft); }
 /* Alert */
 .alert-invalid { background:#F8E3E0; border:1px solid var(--bad); color:#8B3838; padding:12px 16px; border-radius:10px;
   font-weight:500; margin-bottom:12px; }
+/* Comparison semantics: make the run contract impossible to miss. */
+.scope-banner { position:relative; overflow:hidden; margin-bottom:14px; padding:18px 20px; border:1px solid var(--border);
+  border-left:5px solid var(--na); border-radius:12px; background:#FAF8F3; }
+.scope-banner.weight { border-left-color:var(--accent); background:linear-gradient(135deg,#F4FBF7,#FAF8F3); }
+.scope-banner.joint { border-left-color:var(--warn); background:linear-gradient(135deg,#FFF7E7,#FAF8F3); }
+.scope-banner.unknown { border-left-color:var(--na); }
+.scope-kicker { color:var(--muted); font-family:var(--mono); font-size:10px; font-weight:800; letter-spacing:.09em;
+  text-transform:uppercase; }
+.scope-title { margin:3px 0 4px; color:var(--navy); font-size:19px; font-weight:800; letter-spacing:-.02em; }
+.scope-copy { max-width:900px; color:var(--muted); font-size:13px; line-height:1.55; }
+.scope-meta { display:flex; gap:7px; flex-wrap:wrap; margin-top:10px; }
+.scope-meta .pill { padding:3px 9px; font-family:var(--mono); font-size:10px; font-weight:750; }
+.scope-note, .context-note { margin-top:10px; padding:9px 12px; color:var(--muted); background:rgba(255,255,255,.58);
+  border:1px dashed var(--border-strong); border-radius:8px; font-size:12px; line-height:1.5; }
+.context-note { margin:0 0 12px; background:#F8F6F0; }
+.l2-metrics { margin-top:12px; max-height:360px; }
+.l2-metrics table.grid-tbl { width:100%; margin:0; }
+.metric-good { color:var(--good); font-weight:750; }
+.metric-warn { color:var(--warn); font-weight:750; }
+.metric-bad { color:var(--bad); font-weight:750; }
+.metric-na { color:var(--na); }
+.position-picker { display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; }
+.position-btn { min-width:34px; padding:4px 8px; color:var(--muted); background:#fff; border:1px solid var(--border);
+  border-radius:7px; font-family:var(--mono); font-size:10px; font-weight:750; cursor:pointer; }
+.position-btn:hover { color:var(--navy); border-color:var(--border-strong); }
+.position-btn.active { color:#fff; background:var(--accent); border-color:var(--accent); }
+/* End-to-end generation comparison */
+.output-box { margin:0; max-height:320px; overflow:auto; padding:13px 15px; color:var(--ink); background:#fff;
+  border:1px solid var(--border); border-radius:9px; white-space:pre-wrap; overflow-wrap:anywhere;
+  font-family:var(--mono); font-size:12px; line-height:1.65; }
+.health-row { display:flex; gap:7px; flex-wrap:wrap; margin:10px 0 0; }
+.token-cell { max-width:360px; white-space:pre-wrap; overflow-wrap:anywhere; font-family:var(--mono); }
+.token-match { color:var(--good); }
+.token-mismatch { color:var(--bad); font-weight:700; }
 /* Error samples */
 .err-sample { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:10px 14px; margin:8px 0; font-size:12px; }
 .err-sample pre { white-space:pre-wrap; word-break:break-word; margin:6px 0 0 0; background:var(--code-bg); padding:8px; border-radius:4px; font-size:11px; }
@@ -632,6 +666,31 @@ function axisLabels(){/*placeholder*/}
 // ====================================================================
 // Overview
 // ====================================================================
+function renderScopeBanner(o){
+  const scope=o.comparison_scope||"unknown";
+  const hasL1=(R.l1_layers||[]).length>0;
+  const hasL2=(R.l2_results||[]).length>0;
+  let cls="unknown",title="对比口径未记录",copy="这是历史报告或外部构造报告，无法确认运行时是否启用了 Activation QDQ。不要把它自动解释为仅权重对比。";
+  let activationBadge='<span class="pill muted">ACT QDQ UNKNOWN</span>';
+  if(scope==="weight_plus_activation_qdq"||o.activation_quant_enabled===true){
+    cls="joint";title="权重 + 激活 QDQ 联合仿真";
+    copy="Activation QDQ 只作用于 Quant 侧 descriptor 匹配算子。L1 的 block output 同时包含权重误差与激活 QDQ 误差的累计传播，单次结果不能拆分两者贡献。";
+    activationBadge='<span class="pill warn">ACT QDQ ON · QUANT SIDE</span>';
+  }else if(scope==="weight_only"||o.activation_quant_enabled===false){
+    cls="weight";title="仅权重误差定位";
+    copy="Activation QDQ 未启用。L1 比较 Ref 与 Quant checkpoint 权重路径的逐层 block output，用于观察权重映射、反量化及量化权重误差的累计传播。";
+    activationBadge='<span class="pill ok">ACT QDQ OFF</span>';
+  }
+  const tags=[activationBadge];
+  if(o.quant_method)tags.push('<span class="pill muted">WEIGHT · '+esc(o.quant_method)+'</span>');
+  if(o.activation_quant_enabled===true&&o.activation_quant_type)tags.push('<span class="pill warn">TYPE · '+esc(o.activation_quant_type)+'</span>');
+  if(o.activation_quant_enabled===true&&o.activation_quant_backend)tags.push('<span class="pill muted">BACKEND · '+esc(o.activation_quant_backend)+'</span>');
+  let l2Note="";
+  if(hasL2)l2Note='<div class="scope-note"><b>L2 口径独立：</b>子图反事实诊断基于 checkpoint 权重路径，不重放 L1 的 Activation QDQ hooks。</div>';
+  const prefix=hasL1?"L1 COMPARISON SCOPE":"DIAGNOSTIC SCOPE";
+  return '<div class="scope-banner '+cls+'"><div class="scope-kicker">'+prefix+'</div><div class="scope-title">'+title+'</div>'+
+    '<div class="scope-copy">'+copy+'</div><div class="scope-meta">'+tags.join("")+'</div>'+l2Note+'</div>';
+}
 function renderOverview(){
   const o=R.overview||{};const root=el("overview");
   const st=R.run_status||"PARTIAL";
@@ -644,17 +703,20 @@ function renderOverview(){
   let gtHit="";
   if(o.ground_truth_hit===true)gtHit='<span class="pill ok">GT 命中</span>';
   else if(o.ground_truth_hit===false)gtHit='<span class="pill bad">GT 未命中</span>';
-  let conf=num(o.confidence);
-  let confBar = conf===null?"":('<div class="conf-wrap"><div class="conf-bar" style="width:'+clamp(conf*100,0,100).toFixed(0)+'%"></div></div>'
+  const conf=num(o.confidence);
+  const confBar = conf===null?'<div class="val">—</div><div class="tip">无对应 L2 定位证据</div>':
+    ('<div class="conf-wrap"><div class="conf-bar" style="width:'+clamp(conf*100,0,100).toFixed(0)+'%"></div></div>'
     +'<div class="tip">可信度 '+pct(conf,0)+'</div>');
-  // INVALID_RUN 告警
+  const inputMode=o.input_mode==="messages"?"Chat messages · apply_chat_template":(o.input_mode==="prompt"?"Raw prompt":(o.input_mode||"—"));
+  const activationText=o.activation_quant_enabled===true?("ON · "+(o.activation_quant_type||"AUTO")+" · "+(o.activation_quant_backend||"auto")):
+    (o.activation_quant_enabled===false?"OFF":"未记录");
   let alert="";
   if(st==="INVALID_RUN"){alert='<div class="alert-invalid">输入无效 (模型加载/forward 失败或全 NaN)。以下排名仅供参考, 不可作为定论。'+hIcon("baseline_l2")+'</div>';}
   if(st==="INCONCLUSIVE"){alert='<div class="alert-invalid">结论存疑: L1 逐层对齐结果与生成定界不一致, 需人工复核 (可能 framework 层误差/截断/采样差异)。'+hIcon("cos_sim")+'</div>';}
-  root.innerHTML = alert+
+  root.innerHTML = alert+renderScopeBanner(o)+
     '<div class="grid cols-3">'+
       '<div class="card"><h3>定界结论'+hIcon("baseline_l2")+'</h3><div class="pill '+bndClass+'">'+bndTxt+'</div><div class="sub">'+esc(o.boundary_result||"—")+'</div></div>'+
-      '<div class="card"><h3>首次发散层'+hIcon("cos_sim")+'</h3><div class="val">'+(o.first_divergence_layer==null?"—":("layer "+o.first_divergence_layer))+'</div><div class="sub">L1 first bad block</div></div>'+
+      '<div class="card"><h3>L1 首个诊断候选层'+hIcon("cos_sim")+'</h3><div class="val">'+(o.first_divergence_layer==null?"—":("layer "+o.first_divergence_layer))+'</div><div class="sub">delta/MAD 优先，阈值回退</div></div>'+
       '<div class="card"><h3>运行状态</h3><div class="pill '+statusPill+'">'+statusLabel+'</div><div class="sub">'+st+'</div></div>'+
     '</div>'+
     '<div class="grid cols-3" style="margin-top:12px">'+
@@ -665,13 +727,16 @@ function renderOverview(){
     '<div class="grid cols-2" style="margin-top:12px">'+
       '<div class="card"><h3>问题链路</h3><div class="val" style="font-size:15px">'+esc(o.problem_path||"—")+'</div>'+
         (gtHit?('<div style="margin-top:6px">'+gtHit+'</div>'):"")+'</div>'+
-      '<div class="card"><h3>模型/量化</h3><div class="kv">'+
+      '<div class="card"><h3>模型 / 运行口径</h3><div class="kv">'+
         '<span class="k">模型</span><span class="v">'+esc(o.model_name||"—")+'</span>'+
         '<span class="k">量化格式</span><span class="v">'+esc(o.quant_format||"—")+'</span>'+
+        '<span class="k">权重执行</span><span class="v">'+esc(o.quant_method||"—")+'</span>'+
+        '<span class="k">Activation</span><span class="v">'+esc(activationText)+'</span>'+
+        '<span class="k">输入方式</span><span class="v">'+esc(inputMode)+'</span>'+
         '<span class="k">设备</span><span class="v">'+esc(o.device_mode||"—")+'</span>'+
         '<span class="k">Ref</span><span class="v" style="font-size:11px">'+esc(o.ref_model_path||"—")+'</span>'+
         '<span class="k">Quant</span><span class="v" style="font-size:11px">'+esc(o.quant_model_path||"—")+'</span>'+
-        '<span class="k">Prompt</span><span class="v" style="font-size:11px">'+esc((o.prompt||"").slice(0,80))+'</span>'+
+        '<span class="k">输入</span><span class="v" style="font-size:11px">'+esc((o.prompt||"").slice(0,160))+'</span>'+
       '</div></div>'+
     '</div>';
 }
@@ -717,7 +782,7 @@ function renderL1(){
       +'⚠ 辅助告警: layer '+tL.layer_idx+' 首次 cos_sim &lt; 0.99 (累计缓慢下降, 非根因)</div>';
   }
   let html='<div class="card" style="border-left:3px solid '+C.bad+';background:rgba(194,85,85,0.05);padding:16px 18px">'
-    +'<h3 style="margin:0 0 8px 0;color:'+C.bad+'">首个发散层: Layer '+L.layer_idx+'</h3>'
+    +'<h3 style="margin:0 0 8px 0;color:'+C.bad+'">L1 诊断候选层: Layer '+L.layer_idx+'</h3>'
     +'<div class="l1-metrics">'
     +'<div><div style="font-size:11px;color:var(--muted);margin-bottom:2px">cos_sim'+hIcon("cos_sim")+'</div><div style="font-size:18px;font-weight:700;color:'+tier+';display:flex;align-items:center;gap:6px"><span class="legend-chip" style="background:'+tier+'"></span>'+fix(L.cos_sim,4)+'</div></div>'
     +'<div><div style="font-size:11px;color:var(--muted);margin-bottom:2px">rel_l2'+hIcon("rel_l2")+'</div><div style="font-size:16px;font-weight:600">'+fix(L.rel_l2,4)+'</div></div>'
@@ -763,6 +828,30 @@ function renderL1Table(){
 // L2 diagnosis
 // ====================================================================
 function recColor(v){return recTier(v);}
+function metricClass(v,kind){
+  const n=num(v);if(n===null)return "metric-na";
+  if(kind==="recovery")return n>=0.8?"metric-good":(n>=0.3?"metric-warn":"metric-bad");
+  if(kind==="self")return n<0.02?"metric-good":(n<0.10?"metric-warn":"metric-bad");
+  return n<0.05?"metric-good":(n<0.15?"metric-warn":"metric-bad");
+}
+function l2MetricsTable(subs){
+  let h='<div class="table-scroll l2-metrics"><table class="grid-tbl"><thead><tr>'+
+    '<th>Subgraph</th><th>Quant type</th><th>Patch Recovery'+hIcon("patch_recovery")+'</th>'+
+    '<th>SelfRotErr'+hIcon("self_rot_err")+'</th><th>RotBErr'+hIcon("rot_b_err")+'</th><th>定位标记</th></tr></thead><tbody>';
+  subs.forEach(sg=>{
+    const roles=[];
+    if(sg.is_repair_point)roles.push('<span class="tag fd">误差边界</span>');
+    if(sg.is_source_candidate)roles.push('<span class="tag max">根因嫌疑</span>');
+    const nameCls=(sg.is_repair_point?" repair":"")+(sg.is_source_candidate?" source":"");
+    const pr=num(sg.patch_recovery),se=num(sg.self_rot_err),rb=num(sg.rot_b_err);
+    h+='<tr><td class="'+nameCls.trim()+'">'+esc(sg.name||"—")+'</td><td>'+esc(sg.quant_type||"—")+'</td>'+
+      '<td class="'+metricClass(pr,"recovery")+'">'+(pr===null?"—":pct(pr))+'</td>'+
+      '<td class="'+metricClass(se,"self")+'">'+(se===null?"—":fix(se,4))+'</td>'+
+      '<td class="'+metricClass(rb,"rot")+'">'+(rb===null?"—":fix(rb,4))+'</td>'+
+      '<td>'+(roles.join("")||"—")+'</td></tr>';
+  });
+  return h+'</tbody></table></div>';
+}
 function renderL2(){
   const root=el("l2");const Ls=R.l2_results||[];
   if(!Ls.length){root.innerHTML='<div class="empty"><div class="empty-icon">—</div><div class="empty-text">未运行 L2 subgraph 反事实诊断</div><div class="empty-hint">运行 --mode l2 采集子图 patch_recovery</div></div>';return;}
@@ -786,37 +875,29 @@ function renderL2(){
       const t=E("text",{x:x,y:mT+ph+14,"text-anchor":"middle",class:"axis"});t.textContent=(v*100).toFixed(0)+"%";s.appendChild(t);}
     subs.forEach((sg,i)=>{
       const pr=num(sg.patch_recovery);
-      const se=num(sg.self_rot_err);
       const y=Y(i);
       const shortName=sg.name.length>28?sg.name.slice(0,26)+"…":sg.name;
       const lbl=E("text",{x:mL-8,y:y+bw/2+3,"text-anchor":"end",class:"axis"});lbl.textContent=shortName;s.appendChild(lbl);
       const qt=E("text",{x:mL-8,y:y+bw/2+13,"text-anchor":"end","font-size":"8",fill:C.muted});qt.textContent=sg.quant_type;s.appendChild(qt);
-      // patch recovery bar (绿, 高=好); self_rot_err bar (红, 高=坏) when recovery unavailable
+      // The chart contains recovery only.  Error metrics use a separate table
+      // because their direction and scale are different.
       if(pr!==null){
         const rcol=isDegradedQuantType(sg.quant_type)?C.deg:recColor(pr);
         const xv=X(pr);
         if(pr>=0){s.appendChild(E("rect",{x:mL,y:y,width:Math.max(xv-mL,1),height:bw,fill:rcol,opacity:0.85,rx:2}));}
         else{s.appendChild(E("rect",{x:xv,y:y,width:Math.max(mL-xv,1),height:bw,fill:rcol,opacity:0.85,rx:2}));}
         const tx=E("text",{x:(pr>=0?xv+4:mL+4),y:y+bw/2+3,"text-anchor":"start",class:"axis"});tx.textContent="rec "+pct(pr);s.appendChild(tx);
-      } else if(se!==null){
-        const seClamp=Math.min(se,1.0);
-        const xv=X(seClamp);
-        s.appendChild(E("rect",{x:mL,y:y,width:Math.max(xv-mL,1),height:bw,fill:C.bad,opacity:0.75,rx:2}));
-        const tx=E("text",{x:xv+4,y:y+bw/2+3,"text-anchor":"start",class:"axis",fill:C.bad});tx.textContent="SErr "+pct(se,1);s.appendChild(tx);
       } else {
-        const tx=E("text",{x:mL+4,y:y+bw/2+3,class:"axis",fill:C.na});tx.textContent="—";s.appendChild(tx);
+        const tx=E("text",{x:mL+4,y:y+bw/2+3,class:"axis",fill:C.na});tx.textContent="未执行 patch";s.appendChild(tx);
       }
       // border for repair/source: concentric (green outer, red inner) so both visible
       if(sg.is_repair_point){s.appendChild(E("rect",{x:mL-4,y:y-4,width:pw+8,height:bw+8,fill:"none",stroke:C.good,"stroke-width":2,rx:3}));}
       if(sg.is_source_candidate){s.appendChild(E("rect",{x:mL-1,y:y-1,width:pw+2,height:bw+2,fill:"none",stroke:C.bad,"stroke-width":2,rx:2}));}
     });
-    const ax=E("line",{x1:mL,x2:mL,y1:mT,x2:mL,y2:mT+ph,stroke:C.border});s.appendChild(ax);
-    html+='<div class="tip" style="margin-bottom:4px"><span style="color:'+C.good+'">■</span> Recovery (patch恢复率, 高=好) · <span style="color:'+C.bad+'">■</span> SelfRotErr (自量化误差, 高=坏) · — = 不可patch/无数据</div>';
+    const ax=E("line",{x1:mL,x2:mL,y1:mT,y2:mT+ph,stroke:C.border});s.appendChild(ax);
+    html+='<div class="tip" style="margin-bottom:4px"><span style="color:'+C.good+'">■</span> Patch Recovery（高=好）· 橙色=W4 降级量化 · 空值=未执行/不可 patch</div>';
     html+=svgOuter(s);
-    // metrics: rot_b_err with severity colors + reason annotations
-    html+='<div class="tip" style="margin-top:6px;word-break:break-all;line-height:1.8">'
-      +'<b style="color:'+C.ink+'">rot_b_err</b>'+hIcon("rot_b_err")+rotBErrMetrics(subs)
-      +'</div>';
+    html+=l2MetricsTable(subs);
     // interpretation line
     const interp=interpretRotBErr(subs);
     if(interp){html+='<div class="tip" style="margin-top:4px;color:'+C.muted+';font-style:italic">'+interp+'</div>'}
@@ -826,24 +907,6 @@ function renderL2(){
     html+='</div>';
   });
   root.innerHTML=html;
-}
-function subMetrics(subs,key){const v=subs.filter(s=>s[key]!==null).map(s=>{const n=s.name.replace("self_attn.","sa.").replace("mlp.","m.");return ' '+n+'=<b>'+fix(s[key],3)+'</b>';}).join(" · ");return v||"—";}
-function rotBErrMetrics(subs){
-  return subs.map(function(s){
-    const n=s.name.replace("self_attn.","sa.").replace("mlp.","m.");
-    const v=s.rot_b_err;
-    if(v===null||v===undefined){
-      // annotate reason for missing value
-      let reason="—";
-      if(s.quant_type==="FLOAT")reason="FLOAT";
-      else if(s.name.indexOf("indexer")>=0)reason="indexer内部";
-      else if(s.name.indexOf("experts")>=0)reason="不可patch";
-      return ' '+n+'=<span style="color:'+C.na+'">'+reason+'</span>';
-    }
-    // severity color: >=0.15 red, >=0.05 yellow, <0.05 green
-    const col=v>=0.15?C.bad:(v>=0.05?C.warn:C.good);
-    return ' '+n+'=<b style="color:'+col+'">'+fix(v,3)+'</b>';
-  }).join(" · ");
 }
 function interpretRotBErr(subs){
   const vals=subs.filter(s=>s.rot_b_err!==null&&s.rot_b_err!==undefined);
@@ -881,7 +944,11 @@ function renderLogits(){
   if(curPos<0||curPos>=L.token_positions.length){
     curPos=L.position_mode==="prompt_prefill"?L.token_positions.length-1:0;
   }
-  root.innerHTML='<div class="grid" style="grid-template-columns:1fr"><div id="logits_scatter"></div>'
+  let modeNote="采集位置语义未记录；请结合生成方式人工确认 position 含义。";
+  if(L.position_mode==="prompt_prefill")modeNote="这里展示 Prompt prefill 各位置的 next-token 预测；只有最后一行对应首个 Decode Token，页面已默认选中最后一行。前面的 position 不是生成序列。";
+  else if(L.position_mode==="generation")modeNote="这里展示自回归生成的 Decode step；Position 0 对应首个 Decode Token。";
+  root.innerHTML='<div class="context-note"><b>Position 口径：</b>'+modeNote+' 散点与直方图为已采集位置的聚合视图。</div>'+
+    '<div class="grid" style="grid-template-columns:1fr"><div id="logits_scatter"></div>'
     +'<div id="logits_topk"></div><div id="logits_lines"></div><div id="logits_hist"></div></div>';
   renderScatter();renderLines();renderHist();renderTopK(curPos);
 }
@@ -924,12 +991,23 @@ function renderLines(){
     s.appendChild(E("path",{d:d,stroke:col,"stroke-width":1.8,fill:"none"}));
   });
   // clickable position markers
-  ps.forEach((p,i)=>{const mk=E("circle",{cx:X(i),cy:Y(0.5),r:5,fill:curPos===i?C.bad:C.muted,opacity:0.6,cursor:"pointer"});
-    mk.setAttribute("onclick","__selPos("+i+")");s.appendChild(mk);
+  ps.forEach((p,i)=>{const mk=E("circle",{cx:X(i),cy:Y(0.5),r:5,fill:curPos===i?C.bad:C.muted,opacity:0.6,cursor:"pointer",
+      role:"button",tabindex:"0","aria-label":"选择 Position "+p});
+    const choose=()=>window.__selPos(i);
+    mk.addEventListener("click",choose);
+    mk.addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();choose();}});
+    s.appendChild(mk);
     const tx=E("text",{x:X(i),y:H-m+14,"text-anchor":"middle",class:"axis","font-size":"8"});tx.textContent=p;s.appendChild(tx);});
   s.appendChild(E("line",{x1:m,y1:H-m,x2:W-m,y2:H-m,stroke:C.border}));s.appendChild(E("line",{x1:m,y1:m,x2:m,y2:H-m,stroke:C.border}));
   const tt=E("text",{x:W/2,y:H-2,"text-anchor":"middle",class:"axis"});tt.textContent=L.position_mode==="prompt_prefill"?"Prompt token position":"Decode step";s.appendChild(tt);
-  root.innerHTML='<div class="card"><h3>Token-wise 指标折线 '+hIcon("token_wise_cos")+hIcon("topk_overlap")+hIcon("token_wise_kl")+'</h3></div>';
+  root.innerHTML="";
+  const header=document.createElement("div");header.className="card";
+  header.innerHTML='<h3>Token-wise 指标折线 '+hIcon("token_wise_cos")+hIcon("topk_overlap")+hIcon("token_wise_kl")+'</h3>';
+  const picker=document.createElement("div");picker.className="position-picker";picker.setAttribute("aria-label","Logits position selector");
+  ps.forEach((p,i)=>{const b=document.createElement("button");b.type="button";b.className="position-btn"+(curPos===i?" active":"");
+    b.textContent=String(p)+(L.position_mode==="prompt_prefill"&&i===ps.length-1?" · decode":"");
+    b.setAttribute("aria-label","Position "+p);b.addEventListener("click",()=>window.__selPos(i));picker.appendChild(b);});
+  header.appendChild(picker);root.appendChild(header);
   appendChart(root,s);
   const lg=document.createElement("div");lg.className="tip";lg.innerHTML=
     '<span class="legend-chip" style="background:'+C.ref+'"></span>cos(ref,quant logits) '
@@ -941,10 +1019,13 @@ function renderLines(){
   if(Lk.length){
     const kw=W,kh=120,m2=30;const x2=i=>m2+(kw-2*m2)*(ps.length<=1?0.5:i/(ps.length-1||1));let maxk=Math.max(...Lk.map(x=>num(x)||0),0.01);
     const Y2=v=>kh-m2-(kh-2*m2)*(v/maxk);const sk=svgBox(kw,kh);
-    let path="";let bars="";
     Lk.forEach((v,i)=>{const n=num(v);if(n===null)return;const x=x2(i);const y=Y2(n);
-      bars+=('<rect x="'+(x-2)+'" y="'+y+'" width="4" height="'+(kh-m2-y)+'" fill="'+C.quant+'" opacity="0.7" onclick="__selPos('+i+')" style="cursor:pointer"/>').toString();
-      sk.appendChild(E("rect",{x:x-2,y:y,width:4,height:kh-m2-y,fill:C.quant,opacity:0.7}));});
+      const bar=E("rect",{x:x-2,y:y,width:4,height:kh-m2-y,fill:C.quant,opacity:0.7,cursor:"pointer",
+        role:"button",tabindex:"0","aria-label":"选择 Position "+ps[i]});
+      const choose=()=>window.__selPos(i);
+      bar.addEventListener("click",choose);
+      bar.addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();choose();}});
+      sk.appendChild(bar);});
     for(let g=0;g<=2;g++){const v=maxk*g/2;const y=Y2(v);const t=E("text",{x:m2-6,y:y+3,"text-anchor":"end",class:"axis"});t.textContent=v.toFixed(3);sk.appendChild(t);sk.appendChild(E("line",{x1:m2,x2:kw-m2,y1:y,y2:y,class:"gridline"}));}
     sk.appendChild(E("line",{x1:m2,y1:kh-m2,x2:kw-m2,y2:kh-m2,stroke:C.border}));
     const tk=E("text",{x:kw/2,y:kh-2,"text-anchor":"middle",class:"axis"});tk.textContent="KL(quant‖ref) per position";sk.appendChild(tk);
@@ -991,7 +1072,7 @@ function renderTopK(i){
   const card=document.createElement("div");
   card.className="card";
   card.innerHTML='<h3>Top-K 概率并排 '+hIcon("top1_match")+' <span class="'+summaryCls+'">'+summaryBadge+'</span></h3>'
-    +'<div class="tip">Position '+pos+' · '+role+' — 当前: '+matchBadge+' · 蓝(粗)=ref 概率 · 橙(细)=quant 概率 · 点击折线节点切换</div>';
+    +'<div class="tip">Position '+pos+' · '+role+' — 当前: '+matchBadge+' · 蓝(粗)=ref 概率 · 橙(细)=quant 概率 · 使用 Position 选择器或折线节点切换</div>';
   root.innerHTML="";
   root.appendChild(card);
   appendChart(card,s);
@@ -1021,10 +1102,56 @@ function renderHist(){
   root.appendChild(lg);
 }
 
+// ====================================================================
+// End-to-end generation / bad-case comparison
+// ====================================================================
+function renderBadcase(){
+  const root=el("badcase");if(!root)return;
+  const I=R.inference_compare;
+  if(!I){
+    root.innerHTML='<div class="empty"><div class="empty-icon">—</div><div class="empty-text">未运行生成输出对比</div>'+
+      '<div class="empty-hint">full / boundary 流程可记录 Ref 与 Quant 的实际生成结果</div></div>';
+    return;
+  }
+  const rate=num(I.token_match_rate);
+  const exact=I.exact_match===true;
+  const first=I.first_divergence_pos;
+  const flags=[];
+  if(I.ref_garbled)flags.push('<span class="pill bad">REF 乱码</span>');
+  if(I.quant_garbled)flags.push('<span class="pill bad">QUANT 乱码</span>');
+  if(I.ref_repeat)flags.push('<span class="pill warn">REF 复读</span>');
+  if(I.quant_repeat)flags.push('<span class="pill warn">QUANT 复读</span>');
+  if(I.logits_nan_inf)flags.push('<span class="pill bad">LOGITS NaN/Inf</span>');
+  if(!flags.length)flags.push('<span class="pill ok">未发现退化信号</span>');
+  let h='<div class="grid cols-3">'+
+    '<div class="card"><h3>生成文本完全一致</h3><div class="pill '+(exact?'ok':'warn')+'">'+(exact?'YES':'NO')+'</div></div>'+
+    '<div class="card"><h3>逐 Token 匹配率</h3><div class="val">'+pct(rate,1)+'</div></div>'+
+    '<div class="card"><h3>首个分歧位置</h3><div class="val">'+(first==null?'—':esc(first))+'</div><div class="sub">max_new_tokens '+esc(I.max_new_tokens||0)+'</div></div>'+
+    '</div><div class="health-row">'+flags.join('')+'</div>';
+  h+='<div class="card" style="margin-top:12px"><h3>输入</h3><pre class="output-box">'+esc(I.prompt||R.overview?.prompt||'')+'</pre></div>';
+  h+='<div class="grid cols-2" style="margin-top:12px">'+
+    '<div class="card"><h3>REF OUTPUT</h3><pre class="output-box">'+esc(I.ref_output||'')+'</pre></div>'+
+    '<div class="card"><h3>QUANT OUTPUT</h3><pre class="output-box">'+esc(I.quant_output||'')+'</pre></div></div>';
+
+  const rt=I.ref_tokens||[],qt=I.quant_tokens||[];
+  if(rt.length||qt.length){
+    const total=Math.max(rt.length,qt.length),limit=Math.min(total,160);
+    h+='<div class="table-scroll" style="margin-top:12px"><table class="grid-tbl"><thead><tr><th>Pos</th><th>Ref token</th><th>Quant token</th><th>状态</th></tr></thead><tbody>';
+    for(let i=0;i<limit;i++){
+      const a=rt[i],b=qt[i],same=(a!==undefined&&b!==undefined&&a===b);
+      h+='<tr><td>'+i+'</td><td class="token-cell">'+esc(a===undefined?'—':a)+'</td><td class="token-cell">'+esc(b===undefined?'—':b)+'</td>'+
+        '<td class="'+(same?'token-match':'token-mismatch')+'">'+(same?'MATCH':'DIFF')+'</td></tr>';
+    }
+    h+='</tbody></table></div>';
+    if(total>limit)h+='<div class="tip">Token 明细仅展示前 '+limit+' / '+total+' 个位置。</div>';
+  }
+  root.innerHTML=h;
+}
+
 // ---- nav helpers ----
 function goto(id){const e=el(id);if(e){e.scrollIntoView({behavior:"smooth",block:"start"});}}
 window.__selectL2=function(idx){const root=el("l2");if(!root)return;const c=root.querySelector('.l2layer[data-layer="'+idx+'"]');
-  if(!c){goto("l2");return;}c.scrollIntoView({behavior:"smooth",block:"start"});c.classList.add("jump-target");
+  if(!c){goto("l2-section");return;}c.scrollIntoView({behavior:"smooth",block:"start"});c.classList.add("jump-target");
   window.setTimeout(()=>c.classList.remove("jump-target"),1400);}
 window.__selPos=function(i){renderTopK(i);renderLines();}
 // scroll-spy: highlight nav based on visible section
@@ -1045,7 +1172,7 @@ function initScrollSpy(){
 // __accInitDone guard: scroll-spy + modal listener register ONLY once per page
 // (multi-report index.html re-runs boot() on each sidebar switch)
 function boot(){
-  renderOverview();renderL1();renderL1Table();renderL2();renderLogits();
+  renderOverview();renderL1();renderL1Table();renderL2();renderLogits();renderBadcase();
   if(!window.__accInitDone){
     window.__accInitDone=true;
     initScrollSpy();
@@ -1092,11 +1219,12 @@ _SIDEBAR_CSS = """
 .main-area .wrap { max-width:1120px; margin:0 auto; padding:42px 34px 140px; }
 @media (max-width:720px){
   .layout { display:block; }
-  .sidebar { width:100%; height:auto; position:sticky; top:0; bottom:auto; border-right:none;
-             border-bottom:1px solid rgba(255,255,255,.08); padding:9px 0; max-height:40vh; }
+  .sidebar { width:100%; height:auto; position:relative; top:auto; bottom:auto; border-right:none;
+             border-bottom:1px solid rgba(255,255,255,.08); padding:9px 0 11px; max-height:none; overflow:visible; }
   .sidebar-brand { display:none; }
   .sidebar h2 { padding:0 12px; margin:0 0 5px; }
-  .sidebar-item { padding:8px 11px; margin:2px 7px; }
+  #sidebar-list { display:flex; gap:4px; padding:0 5px 2px; overflow-x:auto; scrollbar-width:thin; }
+  .sidebar-item { flex:0 0 min(78vw,280px); padding:8px 11px; margin:2px; }
   .main-area { margin-left:0; }
   .main-area .wrap { padding:24px 16px 80px; }
   .nav { flex-wrap:wrap; gap:8px; }
@@ -1113,6 +1241,7 @@ def _extract_report_meta(rd, raw: dict) -> dict:
         "run_status": rd.run_status or "—",
         "first_div": rd.overview.first_divergence_layer,
         "boundary": rd.overview.boundary_result or "—",
+        "scope": rd.overview.comparison_scope or "unknown",
         "token_rate": ic.token_match_rate if ic else None,
         "exact": ic.exact_match if ic else None,
         "logits_positions": len(lg.token_positions) if lg else 0,
@@ -1256,28 +1385,32 @@ def generate_product_html_report(
         f'<span class="ts">{html.escape(ov.model_name or "")} · {ts}</span>'
         '<div class="accent-line"></div></div>'
         '<div class="nav">'
-        '<a href="#overview" data-target="overview">概览</a>'
-        '<a href="#l1" data-target="l1">L1 逐层</a>'
-        '<a href="#l2" data-target="l2">L2 子图</a>'
-        '<a href="#logits" data-target="logits">Logits</a>'
+        '<a href="#overview-section" data-target="overview-section">概览</a>'
+        '<a href="#l1-section" data-target="l1-section">L1 逐层</a>'
+        '<a href="#l2-section" data-target="l2-section">L2 子图</a>'
+        '<a href="#logits-section" data-target="logits-section">Logits</a>'
+        '<a href="#badcase-section" data-target="badcase-section">生成对比</a>'
         '</div>'
-        '<section><h2>① 概览 — 一屏结论<span class="section-hint">点击 ❓ 图标看指标解释/公式</span></h2>'
-        '<p class="sec-desc">模型/量化/设备/定界结论/首次发散层/误差边界/根因算子/可信度。</p>'
+        '<section id="overview-section"><h2>① 概览 — 一屏结论<span class="section-hint">点击 ❓ 图标看指标解释/公式</span></h2>'
+        '<p class="sec-desc">先确认本次比较口径，再查看模型/设备、定界结论、L1 候选层、L2 误差边界与根因嫌疑。</p>'
         '<div id="overview"></div></section>'
-        '<section><h2>② L1 逐层对比</h2>'
-        '<p class="sec-desc">默认显示首个发散层 (delta+MAD 检测的显著突降层); 点击 "展开全部" 查看逐层 cos_sim / rel_l2 / SNR。'
+        '<section id="l1-section"><h2>② L1 逐层对比</h2>'
+        '<p class="sec-desc">比较每个 decoder block 的输出 hidden state；数值包含截至该层的累计误差，并不等于该层权重自身误差。默认显示首个诊断候选层；点击 "展开全部" 查看逐层 cos_sim / rel_l2 / SNR。'
         '绿≥0.99 / 黄0.95~0.99 / 红&lt;0.95, 行点击跳转 L2 该层。'
         '⚠ 黄色辅助告警 = 首次 cos_sim &lt; 0.99 的层 (累计缓慢下降, 非根因)。</p><div id="l1"></div><div id="l1legend"></div>'
         '<div id="l1table" style="margin-top:12px"></div></section>'
-        '<section><h2>③ L2 subgraph 反事实诊断</h2>'
-        '<p class="sec-desc">每子图 patch_recovery 柱状图; <b style="color:var(--good)">绿框=误差边界 (best_repair_point, coarse 子图)</b>'
+        '<section id="l2-section"><h2>③ L2 subgraph 反事实诊断</h2>'
+        '<p class="sec-desc">柱状图只展示 Patch Recovery（高=好）；SelfRotErr / RotBErr 使用独立表格与各自阈值，避免把方向不同的指标混在同一比例尺。<b style="color:var(--good)">绿框=误差边界 (best_repair_point, coarse 子图)</b>'
         ' · <b style="color:var(--bad)">红框=根因算子 (source_candidate, fine 定位)</b>'
         ' · <span class="legend-chip" style="background:var(--deg)"></span>橙色=W4 降级量化 (W4A8_DYNAMIC/W4A4_DYNAMIC 等);'
-        ' 下方 rot_b_err 按严重程度着色, 可点击 ❓ 查看解读。</p>'
+        ' 可点击 ❓ 查看公式与解读。</p>'
         '<div id="l2"></div></section>'
-        '<section><h2>④ Logits 对比可视化</h2>'
-        '<p class="sec-desc">散点 (ref vs quant) · top-k 并排柱 (点击折线节点切换 position) · token-wise 折线+KL · 分布直方图。</p>'
+        '<section id="logits-section"><h2>④ Logits 对比可视化</h2>'
+        '<p class="sec-desc">散点 (ref vs quant) · top-k 并排柱 (Position 选择器切换) · token-wise 折线+KL · 分布直方图。Prompt prefill 与真实 decode step 会明确分开标注。</p>'
         '<div id="logits"></div></section>'
+        '<section id="badcase-section"><h2>⑤ 生成输出对比</h2>'
+        '<p class="sec-desc">同一输入下 Ref / Quant 的端到端生成结果、逐 Token 匹配率、首个分歧位置以及乱码/复读/NaN 信号。该区块回答最终行为是否已经分叉。</p>'
+        '<div id="badcase"></div></section>'
         '<div class="legend-row">'
         '<span><span class="legend-chip" style="background:var(--ref)"></span>ref</span>'
         '<span><span class="legend-chip" style="background:var(--quant)"></span>quant</span>'
@@ -1312,7 +1445,9 @@ def generate_product_html_report(
             'var st=r.run_status||"—";'
             'var bc=st.indexOf("SUCCESS")>=0?"good":st.indexOf("INVALID")>=0?"bad":(st.indexOf("PARTIAL")>=0||st.indexOf("INCONCLUSIVE")>=0)?"warn":"na";'
             'var m="";'
-            'if(r.first_div!==null&&r.first_div!==undefined)m+="<span>首发散 L"+r.first_div+"</span>";'
+            'if(r.first_div!==null&&r.first_div!==undefined)m+="<span>候选 L"+r.first_div+"</span>";'
+            'if(r.scope==="weight_plus_activation_qdq")m+="<span>W + ACT</span>";'
+            'else if(r.scope==="weight_only")m+="<span>WEIGHT</span>";'
             'if(r.token_rate!==null&&r.token_rate!==undefined)m+="<span>"+(r.token_rate*100).toFixed(0)+"% match</span>";'
             'if(r.logits_positions>0)m+="<span>"+r.logits_positions+" logits</span>";'
             'h+="<div class=\\"sidebar-item\\" data-idx=\\""+i+"\\" onclick=\\"__switchReport("+i+")\\">"'
@@ -1421,6 +1556,7 @@ def generate_index_html(reports_dir: str, output_path: Optional[str] = None) -> 
                 "run_status": rd.run_status or "—",
                 "first_div": ov.first_divergence_layer,
                 "boundary": ov.boundary_result or "—",
+                "scope": ov.comparison_scope or "unknown",
                 "token_rate": ic.token_match_rate if ic else None,
                 "exact": ic.exact_match if ic else None,
                 "logits_positions": len(lg.token_positions) if lg else 0,
@@ -1475,7 +1611,9 @@ def generate_index_html(reports_dir: str, output_path: Optional[str] = None) -> 
         'var st=r.run_status||"—";'
         'var bc=st.indexOf("SUCCESS")>=0?"good":st.indexOf("INVALID")>=0?"bad":(st.indexOf("PARTIAL")>=0||st.indexOf("INCONCLUSIVE")>=0)?"warn":"na";'
         'var metrics="";'
-        'if(r.first_div!==null&&r.first_div!==undefined)metrics+="<span>首发散 L"+esc(r.first_div)+"</span>";'
+        'if(r.first_div!==null&&r.first_div!==undefined)metrics+="<span>候选 L"+esc(r.first_div)+"</span>";'
+        'if(r.scope==="weight_plus_activation_qdq")metrics+="<span>W + ACT</span>";'
+        'else if(r.scope==="weight_only")metrics+="<span>WEIGHT</span>";'
         'if(r.token_rate!==null&&r.token_rate!==undefined)metrics+="<span>"+esc((r.token_rate*100).toFixed(0))+"% match</span>";'
         'if(r.logits_positions>0)metrics+="<span>"+esc(r.logits_positions)+" logits</span>";'
         'html+="<div class=\\"sidebar-item\\" data-idx=\\""+i+"\\" onclick=\\"__switchReport("+i+")\\">"'
@@ -1501,24 +1639,28 @@ def generate_index_html(reports_dir: str, output_path: Optional[str] = None) -> 
         '<span class="ts" id="run-ts" style="margin-left:8px"></span>'
         '<div class="accent-line"></div></div>'
         '<div class="nav">'
-        '<a href="#overview" data-target="overview">概览</a>'
-        '<a href="#l1" data-target="l1">L1 逐层</a>'
-        '<a href="#l2" data-target="l2">L2 子图</a>'
-        '<a href="#logits" data-target="logits">Logits</a>'
+        '<a href="#overview-section" data-target="overview-section">概览</a>'
+        '<a href="#l1-section" data-target="l1-section">L1 逐层</a>'
+        '<a href="#l2-section" data-target="l2-section">L2 子图</a>'
+        '<a href="#logits-section" data-target="logits-section">Logits</a>'
+        '<a href="#badcase-section" data-target="badcase-section">生成对比</a>'
         '</div>'
-        '<section><h2>① 概览 — 一屏结论</h2>'
-        '<p class="sec-desc">模型/量化/设备/定界结论/首次发散层/误差边界/根因算子/可信度。</p>'
+        '<section id="overview-section"><h2>① 概览 — 一屏结论</h2>'
+        '<p class="sec-desc">先确认本次比较口径，再查看模型/设备、定界结论、L1 候选层、L2 误差边界与根因嫌疑。</p>'
         '<div id="overview"></div></section>'
-        '<section><h2>② L1 逐层对比</h2>'
-        '<p class="sec-desc">默认只显示首个发散层; 点击 "展开全部" 查看逐层 cos_sim。绿≥0.99 / 黄0.95~0.99 / 红&lt;0.95。</p>'
+        '<section id="l1-section"><h2>② L1 逐层对比</h2>'
+        '<p class="sec-desc">比较每个 decoder block 的输出 hidden state；数值包含截至该层的累计误差，并不等于该层权重自身误差。默认显示首个诊断候选层。</p>'
         '<div id="l1"></div><div id="l1legend"></div>'
         '<div id="l1table" style="margin-top:12px"></div></section>'
-        '<section><h2>③ L2 subgraph 反事实诊断</h2>'
-        '<p class="sec-desc">每子图 patch_recovery 柱状图; 绿框=修复点, 红框=嫌疑, 橙色=DYNAMIC 降级量化。</p>'
+        '<section id="l2-section"><h2>③ L2 subgraph 反事实诊断</h2>'
+        '<p class="sec-desc">柱状图仅展示 Patch Recovery；SelfRotErr / RotBErr 使用独立指标表。</p>'
         '<div id="l2"></div></section>'
-        '<section><h2>④ Logits 对比可视化</h2>'
-        '<p class="sec-desc">散点 · top-k 并排柱 · token-wise 折线+KL · 分布直方图。</p>'
+        '<section id="logits-section"><h2>④ Logits 对比可视化</h2>'
+        '<p class="sec-desc">散点 · top-k 并排柱 · token-wise 折线+KL · 分布直方图；Prompt prefill 与 decode step 分开标注。</p>'
         '<div id="logits"></div></section>'
+        '<section id="badcase-section"><h2>⑤ 生成输出对比</h2>'
+        '<p class="sec-desc">同一输入下 Ref / Quant 的端到端生成结果、Token 分歧和退化信号。</p>'
+        '<div id="badcase"></div></section>'
         '<div class="legend-row">'
         '<span><span class="legend-chip" style="background:var(--ref)"></span>ref</span>'
         '<span><span class="legend-chip" style="background:var(--quant)"></span>quant</span>'

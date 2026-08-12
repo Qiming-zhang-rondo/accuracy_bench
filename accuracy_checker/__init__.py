@@ -48,6 +48,7 @@ from .logits_compare import (
     LogitsCollection, LogitsComparison,
     collect_logits, collect_last_logits, compare_logits,
 )
+from .inference_compare import compare_inference, detect_repeat, detect_garbled
 
 # ---- HTML 报告 (standalone, v1 + v2) ----
 from .html_report import (
@@ -102,6 +103,7 @@ __all__ = [
     # logits 对比
     "LogitsCollection", "LogitsComparison",
     "collect_logits", "collect_last_logits", "compare_logits",
+    "compare_inference", "detect_repeat", "detect_garbled",
     # HTML 报告
     "generate_html_report", "generate_product_html_report", "generate_index_html", "assemble_report",
     # bad case

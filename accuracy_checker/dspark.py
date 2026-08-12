@@ -786,7 +786,11 @@ class DSparkComparator:
                 f"missing_ref={missing_ref}, missing_quant={missing_quant}"
             )
 
-        report = BlockCompareReport()
+        report = BlockCompareReport(
+            comparison_scope="weight_only",
+            quant_method=self.quant_method,
+            activation_quant_enabled=False,
+        )
         for name, ref_value in ref_outputs.items():
             quant_value = quant_outputs[name]
             if ref_value.shape != quant_value.shape:

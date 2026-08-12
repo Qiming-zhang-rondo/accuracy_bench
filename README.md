@@ -46,6 +46,10 @@ python3 run_accuracy_check.py --l2 --target_layers 11 20 33 \
 
 W4A4_DYNAMIC 在 NPU 上默认通过 `torch_npu.npu_dynamic_quant(..., dst_type=torch.quint4x2)` 复现部署算子的 INT4 舍入和打包，再做 QDQ 对比；`--activation_quant_backend torch` 仅用于 CPU 自检或算子差异诊断，不建议作为 NPU 精度结论。
 
+报告顶部会明确标记本次 L1 是“仅权重误差”还是“权重 + 激活 QDQ 联合仿真”，并记录 `quant_method`、activation type/backend。联合仿真的逐层 block output 是权重误差与 Quant 侧激活 QDQ 误差的累计结果，单次运行不能把两者的贡献拆开；若要判断激活 QDQ 的增量影响，请用同一输入分别跑一份关闭/开启 `--activation_quant` 的报告。L2 的子图反事实诊断口径独立，不重放 L1 的 activation hooks。
+
+Chat/Instruct 模型建议使用 `--messages '[{"role":"user","content":"你好"}]'`，工具会调用 tokenizer 的 `apply_chat_template(..., add_generation_prompt=True)`；裸 `--prompt` 不会自动补 chat template。报告会记录输入方式，Prompt prefill 的最后一个 position 才是首个 Decode Token。
+
 ## 定界使用实例
 
 定界回答的是“坏输出来自量化权重，还是来自部署框架”。`--quant_model` 运行 Transformers 反量化基线；提供 `--ref_model` 后还会增加 BF16/FP16 基线，用于区分量化回归与 base 模型本身行为。
@@ -81,7 +85,7 @@ python3 run_accuracy_check.py --mode boundary \
 | **L1** | 逐 decoder block 比 hidden_states, 找 cos_sim 最低层 | ✅ |
 | **定界** | 反量化 (BF16 round-trip, 非无损) → generate, 区分"量化坏" vs "推理框架坏" | ✅ |
 | **L2** | 子图反事实替换, 测 Recovery Ratio, 输出 RootSuspect (假设: 候选子图为误差**充足原因**, 不作必要性主张) | ✅ |
-| **HTML 报告** | 定界 banner + subgraph 表, 自包含, XSS 转义 | ✅ |
+| **HTML 报告** | 比较口径 + L1/L2/Logits + 历史侧边栏，自包含 | ✅ |
 | **A4 激活量化** | MXFP4 (E2M1) + INT4 per-token, W4A4 全链路 | ✅ |
 | **Bad Case 工作流** | manifest + 单点 clip + GT 对比 | ✅ |
 
@@ -152,7 +156,7 @@ python3 run_accuracy_check.py --mode l1 --model_type dspark \
 6. **L1 对 MoE router/DSA 层有已知 false-positive** (router softmax 附近 cos_sim 常偏低, 不一定是量化真正出错), 建议配 `v2_metrics` 的 `router_flip_risk` 信号交叉筛
 7. **DSpark 必须提供 verifier hidden-state 样本**: 不接受随机 hidden 或仅 prompt；`grouped_dual` 对 dense draft 无意义，使用专用 dual-device 路径
 
-> Cache 机制: 默认 `./.acc_cache/`, 可 `--cache_dir` 或 `ACC_CACHE_DIR` 环境变量覆盖
+> Cache 机制: 默认 `./.acc_cache/`, 可 `--cache_dir` 或 `ACC_CACHE_DIR` 环境变量覆盖。L1/L2 使用规范化后的输入样本标识（区分 raw prompt 与 chat messages）；同一模型存在多个 prompt 缓存时，L2 不会再回退并任取一个不匹配的缓存。
 > 
 > HTML 报告: `l1` / `l2` / `full` 成功后都会生成 `report_data.json` 与 `product_report.html`，并按运行独立归档；未指定 `--output_dir` 时写入带时间戳的 `reports/<model>_<mode>_<time>/`。即使重复指定同一非空目录，也会自动使用带时间戳的同级目录，避免覆盖历史
 > 

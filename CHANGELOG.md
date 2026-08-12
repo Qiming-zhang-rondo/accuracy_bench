@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-08-12 — Qwen3.5/3.6 replay correctness + report semantics
+
+- 修复 grouped-dual 手工 MoE replay 漏掉 `sigmoid(shared_expert_gate(x))` 的问题，恢复 Qwen3.5/3.6 原生 shared expert 门控公式，避免 ref/quant 同时走错路径却看似相互对齐。
+- L1 full-logits 保留 Prompt 内绝对 token position；Prompt prefill 报告默认选择最后一行，并明确标记它才是首个 Decode Token，不再把 Prompt position 0 当生成第一个 token。
+- JSON、终端与 HTML 报告记录并醒目标注“仅权重误差”或“权重 + Quant 侧激活 QDQ 联合仿真”，同时保留 `quant_method`、activation type/backend 与 `prompt/messages` 输入方式。
+- L2 柱图只展示 Patch Recovery；SelfRotErr / RotBErr 改为独立阈值表，避免把方向和比例尺不同的指标混画。桌面历史侧边栏保留，移动端改为可横向滚动且随页面滚走的历史条。
+- Logits 增加键盘/鼠标均可用的 Position 选择器；Prompt prefill 与 autoregressive decode 的位置语义分别说明。
+- 产品报告恢复“生成输出对比”区块，集中展示 Ref/Quant 文本、逐 Token 匹配、首个分歧位置以及乱码、复读和 NaN/Inf 信号。
+- 生成对比逻辑收敛到可复用模块，并恢复 `collect_logits_streaming.py` / `scripts/glm5_inference_check.py` 兼容入口，补齐开源包中测试仍引用但文件缺失的问题。
+- L1/L2 cache 改用规范化且带输入类型命名空间的样本标识，修复 L1 仅按 token 数落盘、L2 按原始输入查找导致的 miss；多个同模型 prompt 缓存不再任取第一个，避免跨样本 hidden state 串用。
+
 ## 2026-08-12 — Ascend-native W4A4 activation QDQ
 
 - W4A4 dynamic activation QDQ now uses `torch_npu.npu_dynamic_quant(..., dst_type=torch.quint4x2)` for NPU tensors, then unpacks the operator result in the official low/high-nibble order before dequantization.

@@ -11,7 +11,9 @@
         inference_compare_data=None, # InferenceCompareData 或 dict
         model_name="",
         ref_model_path="", quant_model_path="",
-        quant_format="", device_mode="", prompt="",
+        quant_format="", device_mode="", prompt="", input_mode="",
+        quant_method="", activation_quant_enabled=None,
+        activation_quant_type="", activation_quant_backend="",
     ) -> ReportData
 
 字段映射 (per-field 真实结构 -> schema):
@@ -357,6 +359,14 @@ def _coerce_inference_compare(obj) -> Optional[InferenceCompareData]:
             exact_match=bool(obj.get("exact_match", False)),
             first_divergence_pos=obj.get("first_divergence_pos"),
             max_new_tokens=int(obj.get("max_new_tokens", 0)),
+            ref_garbled=bool(obj.get("ref_garbled", False)),
+            quant_garbled=bool(obj.get("quant_garbled", False)),
+            ref_repeat=bool(obj.get("ref_repeat", False)),
+            quant_repeat=bool(obj.get("quant_repeat", False)),
+            logits_cos_sim=_safe_float(obj.get("logits_cos_sim")),
+            logits_kl=_safe_float(obj.get("logits_kl")),
+            topk_overlap=_safe_float(obj.get("topk_overlap")),
+            logits_nan_inf=bool(obj.get("logits_nan_inf", False)),
         )
     return None
 
@@ -373,6 +383,12 @@ def assemble_report(
     quant_format: str = "",
     device_mode: str = "",
     prompt: str = "",
+    input_mode: str = "",
+    comparison_scope: str = "",
+    quant_method: str = "",
+    activation_quant_enabled: Optional[bool] = None,
+    activation_quant_type: str = "",
+    activation_quant_backend: str = "",
 ) -> ReportData:
     """从各模块收集结果, 组装成统一 ReportData JSON。
 
@@ -396,6 +412,44 @@ def assemble_report(
     source_cand = l2_at_fd.root_suspect if l2_at_fd else None
     problem_path = _problem_path(first_div_idx, l2_at_fd)
 
+    # --- comparison semantics ---
+    # Prefer explicit runner metadata, then fall back to the L1 artifact.  Old
+    # JSON/reports remain ``unknown`` instead of being silently classified as
+    # weight-only.
+    report_scope = getattr(l1_report, "comparison_scope", "") if l1_report is not None else ""
+    report_aq_enabled = (
+        getattr(l1_report, "activation_quant_enabled", None)
+        if l1_report is not None else None
+    )
+    resolved_aq_enabled = activation_quant_enabled
+    if resolved_aq_enabled is None:
+        resolved_aq_enabled = report_aq_enabled
+    resolved_scope = comparison_scope or report_scope
+    if not resolved_scope or resolved_scope == "unknown":
+        if resolved_aq_enabled is True:
+            resolved_scope = "weight_plus_activation_qdq"
+        elif resolved_aq_enabled is False or (l2_layers and not l1_layers):
+            resolved_scope = "weight_only"
+        else:
+            resolved_scope = "unknown"
+    if resolved_aq_enabled is None:
+        if resolved_scope == "weight_plus_activation_qdq":
+            resolved_aq_enabled = True
+        elif resolved_scope == "weight_only":
+            resolved_aq_enabled = False
+    resolved_quant_method = quant_method or (
+        getattr(l1_report, "quant_method", "") if l1_report is not None else ""
+    )
+    resolved_aq_type = activation_quant_type or (
+        getattr(l1_report, "activation_quant_type", "") if l1_report is not None else ""
+    )
+    resolved_aq_backend = activation_quant_backend or (
+        getattr(l1_report, "activation_quant_backend", "") if l1_report is not None else ""
+    )
+    if resolved_aq_enabled is not True:
+        resolved_aq_type = ""
+        resolved_aq_backend = ""
+
     # --- inference compare ---
     inference_compare = _coerce_inference_compare(inference_compare_data)
 
@@ -406,6 +460,12 @@ def assemble_report(
         quant_format=quant_format,
         device_mode=device_mode,
         prompt=use_prompt,
+        input_mode=input_mode,
+        comparison_scope=resolved_scope,
+        quant_method=resolved_quant_method,
+        activation_quant_enabled=resolved_aq_enabled,
+        activation_quant_type=resolved_aq_type,
+        activation_quant_backend=resolved_aq_backend,
         boundary_result=boundary_verdict,
         first_divergence_layer=first_div_idx,
         first_threshold_crossing_layer=first_threshold_idx,

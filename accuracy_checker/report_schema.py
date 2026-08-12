@@ -74,6 +74,15 @@ class OverviewData:
     source_candidate: Optional[str] = None  # = L2 root_suspect (主要嫌疑)
     confidence: Optional[float] = None      # 0-1, 定位结论的可信度
     ground_truth_hit: Optional[bool] = None # badcase 注入模块 == 工具定位模块?
+    # Appended after historical fields to keep positional construction stable.
+    input_mode: str = ""                    # prompt / messages (chat template)
+    # L1 comparison semantics.  ``unknown`` keeps old report JSON honest:
+    # historical artifacts did not record whether activation QDQ was enabled.
+    comparison_scope: str = "unknown"       # weight_only / weight_plus_activation_qdq / unknown
+    quant_method: str = ""                  # dequantize / fake_quant / ...
+    activation_quant_enabled: Optional[bool] = None
+    activation_quant_type: str = ""          # AUTO / W4A4_DYNAMIC / ...
+    activation_quant_backend: str = ""       # auto / npu / torch
 
 
 @dataclass
@@ -215,6 +224,9 @@ class ReportData:
 # ---------------------------------------------------------------------------
 
 def _build_overview(d: Dict[str, Any]) -> OverviewData:
+    activation_quant_enabled = d.get("activation_quant_enabled")
+    if activation_quant_enabled is not None:
+        activation_quant_enabled = bool(activation_quant_enabled)
     return OverviewData(
         model_name=d.get("model_name", ""),
         ref_model_path=d.get("ref_model_path", ""),
@@ -222,6 +234,12 @@ def _build_overview(d: Dict[str, Any]) -> OverviewData:
         quant_format=d.get("quant_format", ""),
         device_mode=d.get("device_mode", ""),
         prompt=d.get("prompt", ""),
+        input_mode=d.get("input_mode", ""),
+        comparison_scope=d.get("comparison_scope", "unknown") or "unknown",
+        quant_method=d.get("quant_method", ""),
+        activation_quant_enabled=activation_quant_enabled,
+        activation_quant_type=d.get("activation_quant_type", ""),
+        activation_quant_backend=d.get("activation_quant_backend", ""),
         boundary_result=d.get("boundary_result"),
         first_divergence_layer=d.get("first_divergence_layer"),
         first_threshold_crossing_layer=d.get("first_threshold_crossing_layer"),

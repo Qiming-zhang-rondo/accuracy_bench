@@ -201,9 +201,9 @@ def test_subgraph_docstring_no_python_m():
     if not tree.body:
         return
     first = tree.body[0]
-    if not isinstance(first, ast.Expr) or not isinstance(first.value, (ast.Constant, ast.Str)):
+    if not isinstance(first, ast.Expr) or not isinstance(first.value, ast.Constant):
         return
-    docstring = first.value.value if isinstance(first.value, ast.Constant) else first.value.s
+    docstring = first.value.value
     assert "python3 -m accuracy_checker.subgraph_locate" not in docstring, \
         "docstring 不应有 python -m 示例 (应改为库 API 调用)"
 

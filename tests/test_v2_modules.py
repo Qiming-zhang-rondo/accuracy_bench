@@ -146,6 +146,12 @@ class TestHtmlReportV2:
                 model_name="test-model",
                 quant_format="W8A8",
                 prompt="hello",
+                input_mode="messages",
+                comparison_scope="weight_plus_activation_qdq",
+                quant_method="dequantize",
+                activation_quant_enabled=True,
+                activation_quant_type="AUTO",
+                activation_quant_backend="npu",
             ),
             l1_layers=[
                 L1LayerData(layer_idx=5, cos_sim=0.95, rel_l2=0.1, snr=20.0),
@@ -164,7 +170,7 @@ class TestHtmlReportV2:
         out = str(tmp_path / "report.html")
         generate_product_html_report(rd, out)
         assert os.path.getsize(out) > 5000
-        with open(out) as f:
+        with open(out, encoding="utf-8") as f:
             html = f.read()
         assert "test-model" in html
         assert "q_proj" in html
@@ -179,6 +185,14 @@ class TestHtmlReportV2:
         assert "let curPos=-1" in html
         assert 'L.position_mode==="prompt_prefill"' in html
         assert "首个 Decode Token" in html
+        assert "权重 + 激活 QDQ 联合仿真" in html
+        assert "ACT QDQ ON · QUANT SIDE" in html
+        assert "L2 口径独立" in html
+        assert "Prompt prefill 各位置" in html
+        assert "l2MetricsTable" in html
+        assert "position-btn" in html
+        assert 'id="overview-section"' in html
+        assert 'id="badcase-section"' in html
         # Metric help is keyboard-focusable rather than a click-only span.
         assert "<button type='button' class='help'" in html
         assert 'aria-label="指标说明"' in html

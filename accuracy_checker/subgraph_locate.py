@@ -432,18 +432,26 @@ def _try_cache_match(
                   f"using first: {os.path.basename(matches[0])}")
         return torch.load(matches[0], weights_only=True, map_location=device)
 
-    # Strategy 2: model_hash + layer + side + method (prompt hash may differ)
+    # Strategy 2: compatibility with one legacy cache whose prompt identity
+    # was only "N_tokens". Never choose arbitrarily when multiple samples are
+    # present: that can silently replay another prompt's hidden states.
     pattern = (
         f"{mh}_*_s*_L{target_layer}_{side}_"
         f"{CACHE_FORMAT_VERSION}_*_{quant_method}.pt"
     )
     matches = glob.glob(base + pattern)
-    if matches:
-        if len(matches) > 1:
-            logger.info(f"  [CACHE] Multiple matches (model-only) for L{target_layer} {side}, "
-                  f"using first: {os.path.basename(matches[0])}")
-        logger.info(f"  [CACHE] Prompt hash mismatch, matched by model hash")
+    if len(matches) == 1:
+        logger.warning(
+            f"  [CACHE] Exact sample key not found; using sole legacy/model-only "
+            f"cache for L{target_layer} {side}: {os.path.basename(matches[0])}"
+        )
         return torch.load(matches[0], weights_only=True, map_location=device)
+    if len(matches) > 1:
+        logger.warning(
+            f"  [CACHE] {len(matches)} model-only matches for L{target_layer} {side}; "
+            "refusing an ambiguous cross-prompt cache match"
+        )
+        return None
 
     # Strategy 3: layer + side + method only (loosest)
     pattern = (
