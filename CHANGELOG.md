@@ -3,6 +3,7 @@
 ## 2026-08-12 — CLI guide activation quant
 
 - 参数页新增激活伪量化类型下拉框；选择类型后自动生成 `--activation_quant` 与 `--activation_quant_type`
+- 参数页按模式切换 L1/L2 字段；L2 改为单卡 ref/quant、L1 cache 目录、可选目标层自动发现和 MLA 诊断粒度，不再生成 L1 专用参数
 
 ## 2026-08-11 — Kimi K3 Ascend KDA fallback
 

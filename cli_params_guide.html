@@ -311,6 +311,16 @@
       font-size: 11px;
       line-height: 1.4;
     }
+    .mode-note {
+      padding: 12px 14px;
+      color: #28433f;
+      background: #e7f6ee;
+      border: 1px solid #b7ddca;
+      border-radius: 10px;
+      font-size: 12px;
+      line-height: 1.55;
+    }
+    .mode-note strong { color: var(--navy); }
 
     .advanced {
       margin-top: 20px;
@@ -631,6 +641,7 @@
 
         <div class="preset-row" aria-label="快速场景">
           <button class="preset" type="button" data-preset="qwen36">Qwen3.6 MoE · 4 卡</button>
+          <button class="preset" type="button" data-preset="l2">L2 cache 诊断 · 2 卡</button>
           <button class="preset" type="button" data-preset="kimi">Kimi K3 · 8 卡</button>
           <button class="preset" type="button" data-preset="dspark">DSpark · 2 卡</button>
           <button class="preset" type="button" data-preset="boundary">部署定界</button>
@@ -692,20 +703,22 @@
               <input id="modelSizeB" type="number" min="0.1" step="0.1" autocomplete="off" placeholder="例如 35">
               <span class="hint">MoE 填总参数量，不填时从 35B-A3B 等路径名称推断。</span>
             </div>
-            <div>
+            <div id="perDeviceMemoryField">
               <label for="perDeviceMemory">每卡可用显存（GB）</label>
               <input id="perDeviceMemory" type="number" min="8" max="256" step="1" value="64">
               <span class="hint">按约 80% 安全水位估算 ref/quant 两侧起步卡数。</span>
             </div>
             <div>
-              <label for="refDevices">Ref 逻辑设备</label>
+              <label for="refDevices" id="refDevicesLabel">Ref 逻辑设备</label>
               <input id="refDevices" type="text" value="npu:0,1" autocomplete="off">
+              <span class="hint" id="refDevicesHint">L1 grouped_dual 可填写多张逻辑卡。</span>
             </div>
             <div>
-              <label for="quantDevices">Quant 逻辑设备</label>
+              <label for="quantDevices" id="quantDevicesLabel">Quant 逻辑设备</label>
               <input id="quantDevices" type="text" value="npu:2,3" autocomplete="off">
+              <span class="hint" id="quantDevicesHint">L1 grouped_dual 可填写多张逻辑卡。</span>
             </div>
-            <div>
+            <div id="compareModeField">
               <label for="compareMode">比较模式</label>
               <select id="compareMode">
                 <option value="dual">dual · 普通双侧分片</option>
@@ -722,7 +735,7 @@
               </select>
               <span class="hint">auto 在 NPU 上于模型加载前启用纯 torch import shim，不要求 fla-core，并完全避开当前无法编译的 Triton KDA；非 Kimi 模型会忽略。</span>
             </div>
-            <div>
+            <div id="layersPerShardField">
               <label for="layersPerShard">每个 shard 层数</label>
               <input id="layersPerShard" type="number" min="1" value="2">
             </div>
@@ -732,7 +745,11 @@
         <div class="form-section">
           <h3><span class="step">3</span>对齐输入</h3>
           <div class="grid-2">
-            <div>
+            <div class="wide mode-note hidden" id="l2WorkflowNote" aria-hidden="true">
+              <strong>L2 使用 L1 缓存做目标层反事实诊断。</strong>
+              每侧只使用一张设备卡；目标层可手动填写，也可留空后按 ref 模型、Prompt 和 cache 目录自动发现。Prompt 必须与生成缓存时完全一致。
+            </div>
+            <div id="quantMethodField">
               <label for="quantMethod">量化加载</label>
               <select id="quantMethod">
                 <option value="dequantize">dequantize · 推荐</option>
@@ -746,7 +763,7 @@
                 <option value="float16">float16</option>
               </select>
             </div>
-            <div>
+            <div id="activationQuantField">
               <label for="activationQuantType">激活伪量化类型 <span class="optional">L1 / full</span></label>
               <select id="activationQuantType">
                 <option value="">关闭 · 不做激活伪量化</option>
@@ -758,12 +775,29 @@
               </select>
               <span class="hint">选择具体类型后会自动同时加入 <code>--activation_quant</code> 与 <code>--activation_quant_type</code>。</span>
             </div>
-            <div class="wide">
+            <div id="targetLayersField" class="hidden" aria-hidden="true">
+              <label for="targetLayers">L2 目标层 <span class="optional">逗号分隔；留空自动扫描 cache</span></label>
+              <input id="targetLayers" type="text" autocomplete="off" placeholder="例如 27,31,38；或留空">
+              <span class="hint">这些层必须已有 L1 hidden-state cache；留空时自动发现当前模型与 Prompt 可用的缓存层。</span>
+            </div>
+            <div id="mlaFineField" class="hidden" aria-hidden="true">
+              <label for="mlaFine">MLA attention 诊断粒度</label>
+              <select id="mlaFine">
+                <option value="fine">细粒度 · 默认，输出大小子图</option>
+                <option value="coarse">粗粒度 · 仅 self_attn</option>
+              </select>
+            </div>
+            <div id="cacheDirField">
+              <label for="cacheDir">L1 / L2 cache 目录 <span class="optional">留空使用 ./.acc_cache</span></label>
+              <input id="cacheDir" type="text" autocomplete="off" placeholder="例如 /path/to/.acc_cache">
+              <span class="hint">L1 写入、L2 读取必须指向同一目录。</span>
+            </div>
+            <div class="wide" id="rotationMatrixField">
               <label for="rotationMatrix">旋转矩阵 <span class="optional">常用参数；仅 QuaRot 等旋转量化且 R 未融合时填写</span></label>
               <input id="rotationMatrix" type="text" autocomplete="off" placeholder="/path/to/rotation.safetensors">
               <span class="hint">普通非旋转 W8A8 留空。若提供，ref 与 quant 必须使用同一旋转契约。</span>
             </div>
-            <div>
+            <div id="cacheTopKField">
               <label for="cacheTopK">L2 缓存 Top-K</label>
               <input id="cacheTopK" type="number" min="0" value="5">
             </div>
@@ -794,18 +828,14 @@
             </div>
           </div>
 
-          <details class="advanced">
+          <details class="advanced" id="advancedOptions">
             <summary>高级参数</summary>
             <div class="advanced-body grid-2">
-              <div>
-                <label for="targetLayers">L2 目标层 <span class="optional">逗号分隔</span></label>
-                <input id="targetLayers" type="text" autocomplete="off" placeholder="11,20,33">
-              </div>
-              <div>
+              <div id="expertChunkField">
                 <label for="expertChunkSize">Expert chunk size <span class="optional">留空自动</span></label>
                 <input id="expertChunkSize" type="number" min="1" placeholder="auto">
               </div>
-              <div class="wide">
+              <div class="wide" id="frameworkBadOutputField">
                 <label for="frameworkBadOutput">部署框架坏输出 <span class="optional">boundary 模式</span></label>
                 <textarea id="frameworkBadOutput" placeholder="从 vLLM / MindIE 服务复制的完整坏输出"></textarea>
               </div>
@@ -898,7 +928,7 @@
             <tr><td><code>--quant_device</code></td><td>继承 device</td><td>dual / DSpark 的量化模型设备。</td></tr>
             <tr><td><code>--dtype</code></td><td>bfloat16</td><td>bfloat16 / float16；Ascend NPU 推荐 bfloat16。</td></tr>
             <tr><td><code>--clean_cache</code></td><td>false</td><td>清除 L2 cache 后退出。</td></tr>
-            <tr><td><code>--cache_dir</code></td><td>./.acc_cache</td><td>L2 cache 路径；也可用 ACC_CACHE_DIR 环境变量。</td></tr>
+            <tr><td><code>--cache_dir</code></td><td>./.acc_cache</td><td>L1 写入、L2 读取的 cache 路径；也可用 ACC_CACHE_DIR 环境变量。</td></tr>
             <tr><td><code>--debug</code></td><td>false</td><td>输出 hidden norm、MoE L3 expert、设备与 NaN 等开发诊断；默认关闭以避免 NPU 同步和日志刷屏。</td></tr>
             <tr><td><code>--per_device_memory</code></td><td>64 GB</td><td>每卡显存预算。</td></tr>
             <tr><td><code>--quant_method</code></td><td>dequantize</td><td>dequantize / fake_quant；standalone DSpark 只支持 dequantize。</td></tr>
@@ -945,7 +975,8 @@
         "refModel", "quantModel", "mode", "modelType", "visibleDevices",
         "modelSizeB", "perDeviceMemory", "refDevices", "quantDevices",
         "compareMode", "kimiKdaBackend", "layersPerShard",
-        "quantMethod", "dtype", "activationQuantType", "cacheTopK", "outputDir", "prompt",
+        "quantMethod", "dtype", "activationQuantType", "cacheTopK", "cacheDir", "mlaFine",
+        "outputDir", "prompt",
         "dsparkSample", "dsparkSeed", "dsparkAnchors", "rotationMatrix",
         "targetLayers", "expertChunkSize", "frameworkBadOutput"
       ];
@@ -961,6 +992,10 @@
       var dsparkFields = document.getElementById("dsparkFields");
       var promptField = document.getElementById("promptField");
       var kimiKdaField = document.getElementById("kimiKdaField");
+      var refDevicesLabel = document.getElementById("refDevicesLabel");
+      var quantDevicesLabel = document.getElementById("quantDevicesLabel");
+      var refDevicesHint = document.getElementById("refDevicesHint");
+      var quantDevicesHint = document.getElementById("quantDevicesHint");
       var recommendedCardCount = 4;
 
       var modelLabels = {
@@ -1019,11 +1054,11 @@
         return rounded % 2 === 0 ? rounded : rounded + 1;
       }
 
-      function recommendedConfig(type) {
+      function recommendedConfig(type, mode) {
         var memory = Number(el.perDeviceMemory.value) || 64;
         var sizeInfo = inferredModelSizeB();
         var cards;
-        if (type === "dspark") {
+        if (mode === "l2" || type === "dspark") {
           cards = 2;
         } else if (isMoe(type)) {
           var familyBase = (type === "kimi_k3" || type === "glm_moe_dsa") ? 8 : 4;
@@ -1037,7 +1072,9 @@
           cards = evenAtLeastTwo(2 * 64 / memory);
         }
         cards = Math.min(cards, 32);
-        var layers = isMoe(type) ? (memory < 48 ? 1 : 2) : (memory < 32 ? 1 : 2);
+        var layers = mode === "l2"
+          ? null
+          : (isMoe(type) ? (memory < 48 ? 1 : 2) : (memory < 32 ? 1 : 2));
         return { cards: cards, layers: layers, memory: memory, sizeInfo: sizeInfo };
       }
 
@@ -1076,6 +1113,43 @@
         var clean = (value || "").replace(/^npu:/, "");
         var first = clean.split(",")[0].trim();
         return first ? "npu:" + first.replace(/^npu:/, "") : fallback;
+      }
+
+      function setFieldVisibility(id, visible) {
+        var node = document.getElementById(id);
+        if (!node) return;
+        node.classList.toggle("hidden", !visible);
+        node.setAttribute("aria-hidden", visible ? "false" : "true");
+      }
+
+      function updateModeFields(type, mode, compare, dspark) {
+        var l1Flow = ["l1", "full"].indexOf(mode) !== -1;
+        var l2Flow = mode === "l2";
+        var grouped = compare === "grouped_dual";
+        setFieldVisibility("compareModeField", l1Flow && !dspark);
+        setFieldVisibility("layersPerShardField", l1Flow && !dspark);
+        setFieldVisibility("perDeviceMemoryField", l1Flow && !dspark);
+        setFieldVisibility("quantMethodField", l1Flow || l2Flow);
+        setFieldVisibility("activationQuantField", l1Flow && !dspark);
+        setFieldVisibility("cacheTopKField", l1Flow && !dspark);
+        setFieldVisibility("cacheDirField", (l1Flow || l2Flow) && !dspark);
+        setFieldVisibility("targetLayersField", l2Flow);
+        setFieldVisibility("mlaFineField", l2Flow);
+        setFieldVisibility("l2WorkflowNote", l2Flow);
+        setFieldVisibility("rotationMatrixField", (l1Flow || l2Flow) && !dspark);
+        setFieldVisibility("expertChunkField", l1Flow && grouped && !dspark);
+        setFieldVisibility("frameworkBadOutputField", mode === "boundary");
+        setFieldVisibility("advancedOptions", mode === "boundary" || (l1Flow && grouped && !dspark));
+        var kimiL1 = type === "kimi_k3" && l1Flow;
+        setFieldVisibility("kimiKdaField", kimiL1);
+        refDevicesLabel.textContent = l2Flow ? "Ref 设备（L2 单卡）" : "Ref 逻辑设备";
+        quantDevicesLabel.textContent = l2Flow ? "Quant 设备（L2 单卡）" : "Quant 逻辑设备";
+        refDevicesHint.textContent = l2Flow
+          ? "L2 只使用列表中的第一张卡。"
+          : "L1 grouped_dual 可填写多张逻辑卡。";
+        quantDevicesHint.textContent = l2Flow
+          ? "L2 只使用列表中的第一张卡。"
+          : "L1 grouped_dual 可填写多张逻辑卡。";
       }
 
       function addStatus(text, kind) {
@@ -1124,6 +1198,7 @@
         resetValidationUi();
         var errors = [];
         var warnings = [];
+        var dspark = type === "dspark";
         var ref = el.refModel.value.trim();
         var quant = el.quantModel.value.trim();
         var refRequired = ["l1", "l2", "full", "screening"].indexOf(mode) !== -1 || type === "dspark";
@@ -1140,7 +1215,7 @@
         if (!physical) addIssue(errors, "visibleDevices", "格式应为逗号分隔的物理卡号，例如 8,9,10,11");
         if (physical && physical.length < 2) addIssue(errors, "visibleDevices", "ref/quant 对比至少需要 2 张物理卡");
         if (physical && hasDuplicates(physical)) addIssue(errors, "visibleDevices", "物理卡号不能重复");
-        if (physical && compare === "grouped_dual" && physical.length % 2 !== 0) {
+        if (physical && ["l1", "full"].indexOf(mode) !== -1 && compare === "grouped_dual" && physical.length % 2 !== 0) {
           addIssue(errors, "visibleDevices", "grouped_dual 要求偶数张卡，供 ref/quant 等分");
         }
 
@@ -1160,33 +1235,49 @@
           if (physical && quantLogical && quantLogical.some(function (id) { return id >= physical.length; })) {
             addIssue(errors, "quantDevices", "逻辑设备编号超出可见物理卡映射范围");
           }
-          if (compare === "grouped_dual" && refLogical && quantLogical && refLogical.length !== quantLogical.length) {
+          if (["l1", "full"].indexOf(mode) !== -1 && compare === "grouped_dual" && refLogical && quantLogical && refLogical.length !== quantLogical.length) {
             addIssue(errors, "quantDevices", "grouped_dual 的 ref/quant 设备数量必须相同");
+          }
+          if (mode === "l2" && refLogical && refLogical.length > 1) {
+            warnings.push("L2 的 ref 侧只使用第一个逻辑设备 " + firstDevice(el.refDevices.value, "npu:0"));
+          }
+          if (mode === "l2" && quantLogical && quantLogical.length > 1) {
+            warnings.push("L2 的 quant 侧只使用第一个逻辑设备 " + firstDevice(el.quantDevices.value, "npu:1"));
           }
         }
 
         var memory = Number(el.perDeviceMemory.value);
-        if (!Number.isFinite(memory) || memory < 8 || memory > 256) {
+        if (!dspark && ["l1", "full"].indexOf(mode) !== -1 && (!Number.isFinite(memory) || memory < 8 || memory > 256)) {
           addIssue(errors, "perDeviceMemory", "每卡可用显存必须在 8–256 GB 之间");
         }
         if (el.modelSizeB.value.trim()) {
           var size = Number(el.modelSizeB.value);
           if (!Number.isFinite(size) || size <= 0) addIssue(errors, "modelSizeB", "模型规模必须是大于 0 的数字");
         }
-        if (!/^\d+$/.test(el.layersPerShard.value) || Number(el.layersPerShard.value) < 1) {
+        if (!dspark && ["l1", "full"].indexOf(mode) !== -1 && (!/^\d+$/.test(el.layersPerShard.value) || Number(el.layersPerShard.value) < 1)) {
           addIssue(errors, "layersPerShard", "layers_per_shard 必须是大于 0 的整数");
         }
-        if (!/^\d+$/.test(el.cacheTopK.value) || Number(el.cacheTopK.value) < 0) {
+        if (!dspark && ["l1", "full"].indexOf(mode) !== -1 && (!/^\d+$/.test(el.cacheTopK.value) || Number(el.cacheTopK.value) < 0)) {
           addIssue(errors, "cacheTopK", "cache_top_k 必须是非负整数");
         }
-        if (el.expertChunkSize.value && (!/^\d+$/.test(el.expertChunkSize.value) || Number(el.expertChunkSize.value) < 1)) {
+        if (!dspark && ["l1", "full"].indexOf(mode) !== -1 && compare === "grouped_dual" && el.expertChunkSize.value && (!/^\d+$/.test(el.expertChunkSize.value) || Number(el.expertChunkSize.value) < 1)) {
           addIssue(errors, "expertChunkSize", "expert_chunk_size 必须是大于 0 的整数");
         }
-        if (type === "kimi_k3" && ["chunk", "fused_recurrent"].indexOf(el.kimiKdaBackend.value) !== -1) {
+        if (["l1", "full"].indexOf(mode) !== -1 && type === "kimi_k3" && ["chunk", "fused_recurrent"].indexOf(el.kimiKdaBackend.value) !== -1) {
           warnings.push("所选 KDA backend 仍依赖 FLA/Triton；CANN 8.5.1 环境建议使用 auto 或 torch");
         }
-        if (mode === "l2" && !/^\d+(?:[\s,]+\d+)*$/.test(el.targetLayers.value.trim())) {
-          addIssue(errors, "targetLayers", "L2 目标层必填，例如 27 或 27,31,38");
+        if (mode === "l2" && el.targetLayers.value.trim() && !/^\d+(?:[\s,]+\d+)*$/.test(el.targetLayers.value.trim())) {
+          addIssue(errors, "targetLayers", "L2 目标层格式应为 27 或 27,31,38；也可留空自动扫描 cache");
+        }
+        var cacheDir = el.cacheDir.value.trim();
+        if (!dspark && ["l1", "l2", "full"].indexOf(mode) !== -1 && cacheDir && (/^[\-]/.test(cacheDir) || /[\u0000\r\n<>]/.test(cacheDir))) {
+          addIssue(errors, "cacheDir", "cache 目录不能以 - 开头，也不能包含换行或占位符");
+        }
+        if (mode === "l2" && isMoe(type)) {
+          warnings.push("L2 不使用 grouped_dual；完整目标层必须能放入单张 ref 卡和单张 quant 卡");
+        }
+        if (mode === "l2" && type === "kimi_k3") {
+          warnings.push("Kimi K3 官方 896-expert ModuleList 暂不支持 L2 完整层物化；仅内部 packed expert checkpoint 可能可用");
         }
         if (type === "dspark") {
           var sample = el.dsparkSample.value.trim();
@@ -1195,11 +1286,8 @@
           }
         }
         var rotation = el.rotationMatrix.value.trim();
-        if (rotation && !isAbsoluteLinuxPath(rotation)) {
+        if (!dspark && ["l1", "l2", "full"].indexOf(mode) !== -1 && rotation && !isAbsoluteLinuxPath(rotation)) {
           addIssue(errors, "rotationMatrix", "旋转矩阵必须是以 / 开头的 Linux 绝对路径");
-        }
-        if (rotation && ["l1", "l2", "full"].indexOf(mode) === -1) {
-          warnings.push("当前模式不会使用 rotation_matrix");
         }
         if (mode !== "screening" && type !== "dspark" && !el.prompt.value.trim()) {
           addIssue(errors, "prompt", "该模式需要非空 Prompt");
@@ -1216,23 +1304,38 @@
       }
 
       function renderStatus(type, compare, mode, validation, recommendation) {
+        var dspark = type === "dspark";
         statusList.innerHTML = "";
         validation.errors.forEach(function (item) { addStatus(item.message, "error"); });
         validation.warnings.forEach(function (message) { addStatus(message, ""); });
         if (!validation.errors.length) addStatus("参数格式、路径与设备映射预检通过", "ok");
-        addStatus("推荐 " + recommendation.cards + " 张物理卡，layers_per_shard=" + recommendation.layers, "ok");
+        if (mode === "l2") {
+          addStatus("L2 推荐 2 张物理卡：ref/quant 各使用 1 张", "ok");
+          addStatus(
+            el.targetLayers.value.trim()
+              ? "将诊断目标层：" + el.targetLayers.value.trim()
+              : "目标层留空：将从 cache 自动发现可诊断层",
+            "ok"
+          );
+          addStatus("cache 目录：" + (el.cacheDir.value.trim() || "./.acc_cache"), "ok");
+          addStatus("MLA 诊断：" + (el.mlaFine.value === "fine" ? "细粒度" : "粗粒度"), "ok");
+        } else if (type === "dspark") {
+          addStatus("DSpark 推荐 2 张物理卡：ref/quant 各使用 1 张", "ok");
+        } else {
+          addStatus("推荐 " + recommendation.cards + " 张物理卡，layers_per_shard=" + recommendation.layers, "ok");
+        }
         if (type === "dspark") {
           addStatus("DSpark 已固定为 l1 + dual + dequantize", "ok");
           addStatus("verifier hidden-state .pt 需提前从 verifier forward 导出，模型目录通常不自带", "");
         }
-        if (isMoe(type) && type !== "dspark") {
+        if (["l1", "full"].indexOf(mode) !== -1 && isMoe(type) && type !== "dspark") {
           addStatus("MoE 使用 grouped_dual 流式 expert；ref/quant 独立卡组会并发 forward", "ok");
         }
-        if (type === "kimi_k3") addStatus("KDA backend=" + el.kimiKdaBackend.value + "；auto 在 Ascend 上使用无 Triton 依赖的 torch recurrence", "ok");
+        if (["l1", "full"].indexOf(mode) !== -1 && type === "kimi_k3") addStatus("KDA backend=" + el.kimiKdaBackend.value + "；auto 在 Ascend 上使用无 Triton 依赖的 torch recurrence", "ok");
         if (el.activationQuantType.value && ["l1", "full"].indexOf(mode) !== -1 && type !== "dspark") {
           addStatus("已启用激活伪量化：" + el.activationQuantType.value, "ok");
         }
-        if (el.rotationMatrix.value.trim()) addStatus("已加入 rotation_matrix；请确认 ref/quant 旋转契约一致", "ok");
+        if (!dspark && ["l1", "l2", "full"].indexOf(mode) !== -1 && el.rotationMatrix.value.trim()) addStatus("已加入 rotation_matrix；请确认 ref/quant 旋转契约一致", "ok");
         else if (["l1", "l2", "full"].indexOf(mode) !== -1) addStatus("未使用旋转矩阵：适用于非旋转量化或 R 已融合 checkpoint", "");
         if (["l1", "l2", "full"].indexOf(mode) !== -1) {
           addStatus("运行成功后自动归档 JSON + HTML；latest.html 左侧可切换当前与历史报告", "ok");
@@ -1262,7 +1365,7 @@
         var refPath = shellQuote(el.refModel.value, "<REF_MODEL_PATH>");
         var quantPath = shellQuote(el.quantModel.value, "<QUANT_MODEL_PATH>");
         var visible = el.visibleDevices.value.trim() || "0,1";
-        var recommendation = recommendedConfig(type);
+        var recommendation = recommendedConfig(type, mode);
         recommendedCardCount = recommendation.cards;
 
         el.mode.disabled = dspark;
@@ -1277,9 +1380,7 @@
         dsparkFields.classList.toggle("hidden", !dspark);
         dsparkFields.setAttribute("aria-hidden", dspark ? "false" : "true");
         promptField.classList.toggle("hidden", dspark || mode === "screening");
-        var kimi = type === "kimi_k3";
-        kimiKdaField.classList.toggle("hidden", !kimi);
-        kimiKdaField.setAttribute("aria-hidden", kimi ? "false" : "true");
+        updateModeFields(type, mode, compare, dspark);
 
         commands.push("ASCEND_RT_VISIBLE_DEVICES=" + visible + " OMP_NUM_THREADS=8 \\");
         args.push("python3 run_accuracy_check.py --mode " + mode);
@@ -1289,32 +1390,41 @@
         if (["l1", "l2", "full"].indexOf(mode) !== -1) args.push(line("--model_type", type));
 
         if (mode === "l1" || mode === "full") {
-          if (compare === "grouped_dual") {
-            args.push(line("--ref_devices", el.refDevices.value.trim() || "npu:0"));
-            args.push(line("--quant_devices", el.quantDevices.value.trim() || "npu:1"));
-          } else {
+          if (dspark) {
             args.push(line("--ref_device", firstDevice(el.refDevices.value, "npu:0")));
             args.push(line("--quant_device", firstDevice(el.quantDevices.value, "npu:1")));
+            args.push(line("--quant_method", quantMethod));
+            args.push(line("--dtype", el.dtype.value));
+          } else {
+            if (compare === "grouped_dual") {
+              args.push(line("--ref_devices", el.refDevices.value.trim() || "npu:0"));
+              args.push(line("--quant_devices", el.quantDevices.value.trim() || "npu:1"));
+            } else {
+              args.push(line("--ref_device", firstDevice(el.refDevices.value, "npu:0")));
+              args.push(line("--quant_device", firstDevice(el.quantDevices.value, "npu:1")));
+            }
+            args.push(line("--compare_mode", compare));
+            args.push(line("--layers_per_shard", el.layersPerShard.value || "2"));
+            args.push(line("--cache_top_k", el.cacheTopK.value || "0"));
+            args.push(line("--quant_method", quantMethod));
+            args.push(line("--dtype", el.dtype.value));
+            args.push(line("--per_device_memory", el.perDeviceMemory.value || "64"));
+            if (el.activationQuantType.value) {
+              args.push(line("--activation_quant"));
+              args.push(line("--activation_quant_type", el.activationQuantType.value));
+            }
+            if (el.expertChunkSize.value) args.push(line("--expert_chunk_size", el.expertChunkSize.value));
+            if (type === "kimi_k3") args.push(line("--kimi_kda_backend", el.kimiKdaBackend.value));
           }
-          args.push(line("--compare_mode", compare));
-          args.push(line("--layers_per_shard", el.layersPerShard.value || "2"));
-          args.push(line("--cache_top_k", el.cacheTopK.value || "0"));
-          args.push(line("--quant_method", quantMethod));
-          args.push(line("--dtype", el.dtype.value));
-          args.push(line("--per_device_memory", el.perDeviceMemory.value || "64"));
-          if (!dspark && el.activationQuantType.value) {
-            args.push(line("--activation_quant"));
-            args.push(line("--activation_quant_type", el.activationQuantType.value));
-          }
-          if (el.expertChunkSize.value) args.push(line("--expert_chunk_size", el.expertChunkSize.value));
-          if (type === "kimi_k3") args.push(line("--kimi_kda_backend", el.kimiKdaBackend.value));
         } else if (mode === "l2") {
-          args.push(line("--ref_devices", el.refDevices.value.trim() || "npu:0"));
-          args.push(line("--quant_devices", el.quantDevices.value.trim() || "npu:1"));
-          args.push(line("--compare_mode", compare));
-          args.push(line("--target_layers", el.targetLayers.value.trim() || "<LAYER_IDS>"));
+          args.push(line("--ref_device", firstDevice(el.refDevices.value, "npu:0")));
+          args.push(line("--quant_device", firstDevice(el.quantDevices.value, "npu:1")));
+          if (el.targetLayers.value.trim()) {
+            args.push(line("--target_layers", el.targetLayers.value.trim()));
+          }
           args.push(line("--quant_method", quantMethod));
           args.push(line("--dtype", el.dtype.value));
+          if (el.mlaFine.value === "coarse") args.push(line("--no_mla_fine"));
         } else if (mode === "boundary") {
           var deviceText = (el.refDevices.value + "," + el.quantDevices.value).replace(/npu:/g, "");
           args.push(line("--devices", "npu:" + deviceText));
@@ -1333,8 +1443,11 @@
           args.push(line("--prompt", shellQuote(el.prompt.value, "<PROMPT>")));
         }
 
-        if (el.rotationMatrix.value.trim() && ["l1", "l2", "full"].indexOf(mode) !== -1) {
+        if (!dspark && el.rotationMatrix.value.trim() && ["l1", "l2", "full"].indexOf(mode) !== -1) {
           args.push(line("--rotation_matrix", shellQuote(el.rotationMatrix.value, "")));
+        }
+        if (!dspark && el.cacheDir.value.trim() && ["l1", "l2", "full"].indexOf(mode) !== -1) {
+          args.push(line("--cache_dir", shellQuote(el.cacheDir.value, "")));
         }
         if (el.outputDir.value.trim()) args.push(line("--output_dir", shellQuote(el.outputDir.value, "")));
 
@@ -1348,7 +1461,9 @@
           : "未识别模型规模";
         recommendTitle.textContent = (modelLabels[type] || type) + " · 推荐 " + recommendation.cards + " 卡";
         applyRecommendation.textContent = "应用推荐 " + recommendation.cards + " 卡";
-        if (dspark) {
+        if (mode === "l2") {
+          recommendReason.textContent = "L2 只加载目标层并读取 L1 hidden-state cache；ref/quant 各使用一张卡，不使用 grouped_dual 或 layers_per_shard。";
+        } else if (dspark) {
           recommendReason.textContent = "standalone draft 使用专用双设备 L1；ref/quant 参数契约会在加载权重前校验。";
         } else if (isMoe(type)) {
           recommendReason.textContent = sizeText + "，按每卡 " + recommendation.memory + "GB 和流式 expert 估算；ref/quant 两侧等分，layers_per_shard=" + recommendation.layers + " 起步。";
@@ -1375,6 +1490,11 @@
           el.layersPerShard.value = "2";
           el.cacheTopK.value = "5";
           el.prompt.value = "Write a poem in the style of a limerick about a programmer debugging at 3 AM.";
+        } else if (name === "l2") {
+          el.mode.value = "l2";
+          if (el.modelType.value === "dspark") el.modelType.value = "auto";
+          el.visibleDevices.value = "0,1";
+          el.targetLayers.value = "";
         } else if (name === "kimi") {
           el.mode.value = "l1";
           el.modelType.value = "kimi_k3";
@@ -1421,7 +1541,11 @@
           physical.push(start + index);
         }
         el.visibleDevices.value = physical.join(",");
-        el.layersPerShard.value = String(recommendedConfig(inferModelType()).layers);
+        var modeForRecommendation = inferModelType() === "dspark" ? "l1" : el.mode.value;
+        var appliedRecommendation = recommendedConfig(inferModelType(), modeForRecommendation);
+        if (appliedRecommendation.layers !== null) {
+          el.layersPerShard.value = String(appliedRecommendation.layers);
+        }
         syncDevices();
         buildCommand();
       });
