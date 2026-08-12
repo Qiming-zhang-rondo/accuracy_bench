@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-08-12 — CLI guide activation quant
+
+- 参数页新增激活伪量化类型下拉框；选择类型后自动生成 `--activation_quant` 与 `--activation_quant_type`
+
 ## 2026-08-11 — Kimi K3 Ascend KDA fallback
 
 - `grouped_dual` 在 ref/quant 设备组互不重叠时并发执行两侧 layer forward；重叠设备、DEBUG 或 `ACC_DUAL_FORWARD_SERIAL=1` 自动回退串行

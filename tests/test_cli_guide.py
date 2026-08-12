@@ -52,7 +52,8 @@ class TestCliGuide(unittest.TestCase):
             "refDevices", "quantDevices", "commandOutput", "copyCommand",
             "modelSizeB", "perDeviceMemory", "rotationMatrix",
             "preflightSummary", "applyRecommendation",
-            "dsparkSample", "kimiKdaField", "paramSearch", "paramRows",
+            "dsparkSample", "kimiKdaField", "activationQuantType",
+            "paramSearch", "paramRows",
         }
         self.assertTrue(required.issubset(self.parser.ids))
 
@@ -72,6 +73,18 @@ class TestCliGuide(unittest.TestCase):
             "recommendedConfig", "应用推荐", "isAbsoluteLinuxPath",
         ):
             self.assertIn(marker, self.html)
+
+    def test_activation_quant_type_is_selectable_and_generates_both_flags(self):
+        for quant_type in (
+            "W8A8_MXFP8", "W4A8_MXFP", "W4A4_MXFP4",
+            "W4A4_DYNAMIC", "W4A4_LAOS",
+        ):
+            self.assertIn(f'value="{quant_type}"', self.html)
+        self.assertIn('args.push(line("--activation_quant"))', self.html)
+        self.assertIn(
+            'args.push(line("--activation_quant_type", el.activationQuantType.value))',
+            self.html,
+        )
 
     def test_l1_standalone_run_writes_product_report(self):
         source = RUN_SCRIPT.read_text(encoding="utf-8")

@@ -746,6 +746,18 @@
                 <option value="float16">float16</option>
               </select>
             </div>
+            <div>
+              <label for="activationQuantType">激活伪量化类型 <span class="optional">L1 / full</span></label>
+              <select id="activationQuantType">
+                <option value="">关闭 · 不做激活伪量化</option>
+                <option value="W8A8_MXFP8">W8A8_MXFP8 · MXFP8 per-block</option>
+                <option value="W4A8_MXFP">W4A8_MXFP · MXFP8 per-block</option>
+                <option value="W4A4_MXFP4">W4A4_MXFP4 · MXFP4 E2M1 per-block</option>
+                <option value="W4A4_DYNAMIC">W4A4_DYNAMIC · INT4 per-token</option>
+                <option value="W4A4_LAOS">W4A4_LAOS · INT4 per-token</option>
+              </select>
+              <span class="hint">选择具体类型后会自动同时加入 <code>--activation_quant</code> 与 <code>--activation_quant_type</code>。</span>
+            </div>
             <div class="wide">
               <label for="rotationMatrix">旋转矩阵 <span class="optional">常用参数；仅 QuaRot 等旋转量化且 R 未融合时填写</span></label>
               <input id="rotationMatrix" type="text" autocomplete="off" placeholder="/path/to/rotation.safetensors">
@@ -933,7 +945,7 @@
         "refModel", "quantModel", "mode", "modelType", "visibleDevices",
         "modelSizeB", "perDeviceMemory", "refDevices", "quantDevices",
         "compareMode", "kimiKdaBackend", "layersPerShard",
-        "quantMethod", "dtype", "cacheTopK", "outputDir", "prompt",
+        "quantMethod", "dtype", "activationQuantType", "cacheTopK", "outputDir", "prompt",
         "dsparkSample", "dsparkSeed", "dsparkAnchors", "rotationMatrix",
         "targetLayers", "expertChunkSize", "frameworkBadOutput"
       ];
@@ -1217,6 +1229,9 @@
           addStatus("MoE 使用 grouped_dual 流式 expert；ref/quant 独立卡组会并发 forward", "ok");
         }
         if (type === "kimi_k3") addStatus("KDA backend=" + el.kimiKdaBackend.value + "；auto 在 Ascend 上使用无 Triton 依赖的 torch recurrence", "ok");
+        if (el.activationQuantType.value && ["l1", "full"].indexOf(mode) !== -1 && type !== "dspark") {
+          addStatus("已启用激活伪量化：" + el.activationQuantType.value, "ok");
+        }
         if (el.rotationMatrix.value.trim()) addStatus("已加入 rotation_matrix；请确认 ref/quant 旋转契约一致", "ok");
         else if (["l1", "l2", "full"].indexOf(mode) !== -1) addStatus("未使用旋转矩阵：适用于非旋转量化或 R 已融合 checkpoint", "");
         if (["l1", "l2", "full"].indexOf(mode) !== -1) {
@@ -1253,6 +1268,7 @@
         el.mode.disabled = dspark;
         el.compareMode.disabled = dspark;
         el.quantMethod.disabled = dspark;
+        el.activationQuantType.disabled = dspark || ["l1", "full"].indexOf(mode) === -1;
         if (dspark) {
           el.mode.value = "l1";
           el.compareMode.value = "dual";
@@ -1286,6 +1302,10 @@
           args.push(line("--quant_method", quantMethod));
           args.push(line("--dtype", el.dtype.value));
           args.push(line("--per_device_memory", el.perDeviceMemory.value || "64"));
+          if (!dspark && el.activationQuantType.value) {
+            args.push(line("--activation_quant"));
+            args.push(line("--activation_quant_type", el.activationQuantType.value));
+          }
           if (el.expertChunkSize.value) args.push(line("--expert_chunk_size", el.expertChunkSize.value));
           if (type === "kimi_k3") args.push(line("--kimi_kda_backend", el.kimiKdaBackend.value));
         } else if (mode === "l2") {
