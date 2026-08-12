@@ -187,6 +187,44 @@ def test_qwen36_packed_bf16_expert_streams_one_slice():
     assert (down_key, 1) in reader.sliced
 
 
+def test_streaming_activation_fake_quant_is_applied_on_quant_side_only():
+    prefix = "model.language_model.layers.0.mlp.experts"
+    gate_up_key = f"{prefix}.gate_up_proj"
+    down_key = f"{prefix}.down_proj"
+    gate_up = torch.tensor([[[
+        1.0, 0.2, -0.1,
+    ], [
+        0.1, 1.0, 0.3,
+    ], [
+        0.4, -0.2, 1.0,
+    ], [
+        -0.3, 0.5, 0.8,
+    ]]])
+    down = torch.tensor([[[1.0, 0.2], [-0.4, 0.7], [0.3, 1.1]]])
+    reader = _PackedReader({gate_up_key: gate_up, down_key: down})
+    comparator = _packed_comparator()
+    comparator.activation_quant = True
+    comparator.activation_quant_type = "W4A4_DYNAMIC"
+    x = torch.tensor([[0.13, -0.57, 1.0]])
+
+    ref_out = comparator._streaming_expert_forward(
+        0, x, "cpu", prefix, reader, None, False, False, _packed_mlp(),
+        apply_activation_quant=False,
+    )
+    quant_out = comparator._streaming_expert_forward(
+        0, x, "cpu", prefix, reader, None, False, False, _packed_mlp(),
+        apply_activation_quant=True,
+    )
+
+    gate = torch.nn.functional.linear(x, gate_up[0, :2])
+    up = torch.nn.functional.linear(x, gate_up[0, 2:])
+    expected_ref = torch.nn.functional.linear(
+        torch.nn.functional.silu(gate) * up, down[0]
+    )
+    torch.testing.assert_close(ref_out, expected_ref)
+    assert not torch.allclose(quant_out, expected_ref)
+
+
 def test_qwen36_packed_w8a8_expert_slices_scales_before_dequant():
     prefix = "model.language_model.layers.0.mlp.experts"
     gate_up_key = f"{prefix}.gate_up_proj"

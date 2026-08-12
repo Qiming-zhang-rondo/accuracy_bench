@@ -158,7 +158,7 @@ class _Model(nn.Module):
         self.model.layers = nn.ModuleList([_Layer()])
 
 
-def test_activation_quant_hooks_remain_registered_on_both_models():
+def test_activation_quant_hooks_are_registered_on_quant_model_only():
     comparator = object.__new__(ShardedBlockComparator)
     comparator.activation_quant = True
     comparator.activation_quant_type = "W8A8_MXFP8"
@@ -167,12 +167,11 @@ def test_activation_quant_hooks_remain_registered_on_both_models():
     ref_model = _Model()
     quant_model = _Model()
 
-    comparator._register_activation_quant_hooks(ref_model, [0])
-    comparator._register_activation_quant_hooks(quant_model, [0])
+    comparator._register_quant_activation_hooks(quant_model, [0])
 
-    assert len(ref_model.model.layers[0].proj._forward_pre_hooks) == 1
+    assert len(ref_model.model.layers[0].proj._forward_pre_hooks) == 0
     assert len(quant_model.model.layers[0].proj._forward_pre_hooks) == 1
-    assert len(comparator._activation_hooks) == 2
+    assert len(comparator._activation_hooks) == 1
     comparator._clear_activation_quant_hooks()
 
 

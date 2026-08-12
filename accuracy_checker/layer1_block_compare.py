@@ -1122,7 +1122,10 @@ class ShardedBlockComparator:
             logger.info(f"[Sharded L1] ref_device: {self.ref_device}, quant_device: {self.quant_device}")
             logger.info(f"[Sharded L1] 每批层数: {layers_per_shard}")
             if self.activation_quant:
-                logger.info(f"  activation_quant: {self.activation_quant_type} 激活伪量化已启用 (ref+quant 双侧)")
+                logger.info(
+                    f"  activation_quant: {self.activation_quant_type} "
+                    "fake quant enabled (quant side only)"
+                )
             logger.info(f"[Sharded L1] 输入长度: {input_ids.shape[1]} tokens")
 
         # 清理 NPU 缓存
@@ -1209,8 +1212,7 @@ class ShardedBlockComparator:
 
                 # 注册 MXFP8 激活伪量化 hook (dense 层)
                 if self.activation_quant:
-                    self._register_activation_quant_hooks(ref_model, layers)
-                    self._register_activation_quant_hooks(quant_model, layers)
+                    self._register_quant_activation_hooks(quant_model, layers)
 
                 if self.verbose:
                     logger.info(f"  [RSS] after load: {self._get_rss_gb():.1f}GB")
@@ -1322,7 +1324,10 @@ class ShardedBlockComparator:
             )
             logger.info(f"  streaming dequant: {dequant_location}")
             if self.activation_quant:
-                logger.info(f"  activation_quant: {self.activation_quant_type} 激活伪量化已启用 (ref+quant 双侧)")
+                logger.info(
+                    f"  activation_quant: {self.activation_quant_type} "
+                    "fake quant enabled (quant side only)"
+                )
 
         forward_kwargs.setdefault("use_cache", False)
 
@@ -1399,8 +1404,7 @@ class ShardedBlockComparator:
                 load_elapsed = time.perf_counter() - load_started
 
                 if self.activation_quant:
-                    self._register_activation_quant_hooks(ref_model, layers)
-                    self._register_activation_quant_hooks(quant_model, layers)
+                    self._register_quant_activation_hooks(quant_model, layers)
 
                 if self.verbose:
                     logger.info(f"  [RSS] after load: {self._get_rss_gb():.1f}GB")
@@ -1505,14 +1509,16 @@ class ShardedBlockComparator:
                     decoder_layers[i] = layer.to_empty(device='cpu')
 
     def _make_chunked_mlp_forward(self, orig_fwd, layer, devices, chunk_size,
-                                    lidx, sf_rdr, q_desc, is_q, is_ct):
+                                    lidx, sf_rdr, q_desc, is_q, is_ct,
+                                    apply_activation_quant=False):
         """创建 chunked MLP forward 闭包。"""
         _self = self
         def _chunked_mlp_forward(hidden_states, *args, **kwargs):
             return _self._moe_forward_chunked(
                 layer, hidden_states, devices, chunk_size,
                 layer_idx=lidx, sf_reader=sf_rdr,
-                quant_desc_str=q_desc, is_quant=is_q, is_ct=is_ct)
+                quant_desc_str=q_desc, is_quant=is_q, is_ct=is_ct,
+                apply_activation_quant=apply_activation_quant)
         return _chunked_mlp_forward
 
     def _patch_moe_forward_for_layer(self, ref_layer, quant_layer, layer_idx,
@@ -1532,11 +1538,11 @@ class ShardedBlockComparator:
         ref_moe.forward = self._make_chunked_mlp_forward(
             ref_orig_mlp_fwd, ref_layer, self.ref_devices,
             self.expert_chunk_size, layer_idx, ref_reader, _ref_qds,
-            ref_is_quant, ref_is_ct)
+            ref_is_quant, ref_is_ct, apply_activation_quant=False)
         quant_moe.forward = self._make_chunked_mlp_forward(
             quant_orig_mlp_fwd, quant_layer, self.quant_devices,
             self.expert_chunk_size, layer_idx, quant_reader, _quant_qds,
-            quant_is_quant, quant_is_ct)
+            quant_is_quant, quant_is_ct, apply_activation_quant=True)
         return ref_moe, ref_orig_mlp_fwd, quant_moe, quant_orig_mlp_fwd
 
     def _log_norm_debug(self, layer_idx, ref_hidden, quant_hidden, stage):
@@ -1657,8 +1663,8 @@ class ShardedBlockComparator:
         _, moe = get_moe_module(layer)
         return moe is not None
 
-    def _register_activation_quant_hooks(self, model, layers: List[int]):
-        """在指定层的所有 nn.Linear (除 router/gate 外) 上注册 MXFP8 激活伪量化 hook。"""
+    def _register_quant_activation_hooks(self, model, layers: List[int]):
+        """Register activation fake-quant hooks on the quant model only."""
         if not self.activation_quant:
             return
         previous_count = len(self._activation_hooks)
@@ -1676,17 +1682,17 @@ class ShardedBlockComparator:
                     continue
                 if 'router' in name:
                     continue
-                # 跳过 MoE expert 内部的 linear (streaming 模式已单独处理)
-                if 'experts' in name:
-                    continue
+                # Streaming experts are placeholders and are handled by
+                # _streaming_expert_forward. Materialized ModuleList experts
+                # need hooks just like any other quant-side Linear.
                 h = mod.register_forward_pre_hook(_make_act_fake_quant_hook(self.activation_quant_type))
                 self._activation_hooks.append(h)
         added_count = len(self._activation_hooks) - previous_count
         if self.verbose and added_count:
             logger.info(
-                f"  [ACT FAKE QUANT] 本侧注册 {added_count} 个 "
-                f"{self.activation_quant_type} hook "
-                f"(ref+quant 当前合计 {len(self._activation_hooks)})"
+                f"  [ACT FAKE QUANT] registered {added_count} "
+                f"{self.activation_quant_type} hooks on quant side "
+                f"(active total: {len(self._activation_hooks)})"
             )
 
     def _clear_activation_quant_hooks(self):
@@ -1706,6 +1712,7 @@ class ShardedBlockComparator:
         quant_desc_str: dict = None,
         is_quant: bool = False,
         is_ct: bool = False,
+        apply_activation_quant: bool = False,
     ) -> Tensor:
         """手动拆解 MoE forward，expert chunk 轮询分发到 devices。
 
@@ -1779,7 +1786,8 @@ class ShardedBlockComparator:
             mlp, experts_mod, routed_input, devices, chunk_size, layer_idx,
             topk_scores, topk_indices, num_experts_per_tok, num_experts,
             is_packed, is_module_list, use_streaming,
-            sf_reader, quant_desc_str, is_quant, is_ct, primary_device)
+            sf_reader, quant_desc_str, is_quant, is_ct, primary_device,
+            apply_activation_quant)
 
         # Kimi K3 Stable LatentMoE maps routed output back to hidden_size.
         routed_norm = getattr(mlp, 'routed_expert_norm', None)
@@ -1958,6 +1966,7 @@ class ShardedBlockComparator:
         is_quant: bool,
         is_ct: bool,
         mlp: nn.Module,
+        apply_activation_quant: bool = False,
     ) -> Optional[Tensor]:
         """Streaming expert forward: 从 safetensors 读取权重，反量化后传 NPU 计算。
 
@@ -2043,7 +2052,7 @@ class ShardedBlockComparator:
         # activation fake quant: 模拟 per-block 激活量化 (按 activation_quant_type 分派)
         x_for_gate = x_chunk
         x_for_up = x_chunk
-        if self.activation_quant:
+        if self.activation_quant and apply_activation_quant:
             x_for_gate = _dispatch_act_fake_quant(x_chunk, self.activation_quant_type)
             x_for_up = _dispatch_act_fake_quant(x_chunk, self.activation_quant_type)
 
@@ -2051,7 +2060,7 @@ class ShardedBlockComparator:
         up_out = torch.nn.functional.linear(x_for_up, up_fp)
         act_out = self._apply_expert_activation(mlp, gate_out, up_out)
 
-        if self.activation_quant:
+        if self.activation_quant and apply_activation_quant:
             act_out = _dispatch_act_fake_quant(act_out, self.activation_quant_type)
 
         expert_out = torch.nn.functional.linear(act_out, down_fp)
@@ -2298,7 +2307,10 @@ class ShardedBlockComparator:
             shared_out = shared_expert(hidden_states)
             return shared_out[0] if isinstance(shared_out, tuple) else shared_out
 
-    def _forward_single_expert_packed(self, experts_mod, eid, x_chunk, chunk_device):
+    def _forward_single_expert_packed(
+        self, experts_mod, eid, x_chunk, chunk_device,
+        apply_activation_quant=False,
+    ):
         """Legacy: 从预构造的 3D packed tensor 取 expert 权重并 forward。"""
         gate_up_w = getattr(experts_mod, 'gate_up_proj', None)
         down_w = getattr(experts_mod, 'down_proj', None)
@@ -2308,13 +2320,13 @@ class ShardedBlockComparator:
         down_e = down_w.data[eid].to(chunk_device, non_blocking=True)
         intermediate_dim = down_e.shape[1]
         x_for_gate_up = x_chunk
-        if self.activation_quant:
+        if self.activation_quant and apply_activation_quant:
             x_for_gate_up = _dispatch_act_fake_quant(x_chunk, self.activation_quant_type)
         gate_up_out = torch.nn.functional.linear(x_for_gate_up, gate_up_e)
         gate_out = gate_up_out[..., :intermediate_dim]
         up_out = gate_up_out[..., intermediate_dim:]
         act_out = torch.nn.functional.silu(gate_out) * up_out
-        if self.activation_quant:
+        if self.activation_quant and apply_activation_quant:
             act_out = _dispatch_act_fake_quant(act_out, self.activation_quant_type)
         expert_out = torch.nn.functional.linear(act_out, down_e)
         del gate_up_e, down_e
@@ -2381,7 +2393,8 @@ class ShardedBlockComparator:
     def _run_expert_chunks(self, mlp, experts_mod, hidden_states, devices, chunk_size,
                             layer_idx, topk_scores, topk_indices, num_experts_per_tok,
                             num_experts, is_packed, is_module_list, use_streaming,
-                            sf_reader, quant_desc_str, is_quant, is_ct, primary_device):
+                            sf_reader, quant_desc_str, is_quant, is_ct, primary_device,
+                            apply_activation_quant=False):
         """逐 chunk 处理 routed experts，返回累积输出 y。"""
         orig_shape = hidden_states.shape
         h_flat = hidden_states.view(-1, orig_shape[-1])
@@ -2437,6 +2450,7 @@ class ShardedBlockComparator:
                         experts_mod, is_packed, is_module_list, use_streaming,
                         expert_prefix, sf_reader, quant_desc_str, is_quant,
                         is_ct, mlp, y, primary_device, layer_idx,
+                        apply_activation_quant,
                     )
                     if expert_out is not None:
                         del expert_out
@@ -2469,7 +2483,8 @@ class ShardedBlockComparator:
                                        chunk_device, experts_mod, is_packed,
                                        is_module_list, use_streaming, expert_prefix,
                                        sf_reader, quant_desc_str, is_quant, is_ct, mlp,
-                                       y, primary_device, layer_idx):
+                                       y, primary_device, layer_idx,
+                                       apply_activation_quant=False):
         """处理单个 routed expert: 取 token mask → forward → 累积到 y。"""
         eid_mask = (indices_flat == eid)
         token_mask = eid_mask.any(dim=-1)
@@ -2481,9 +2496,13 @@ class ShardedBlockComparator:
         if use_streaming:
             expert_out = self._streaming_expert_forward(
                 eid, x_chunk, chunk_device, expert_prefix,
-                sf_reader, quant_desc_str, is_quant, is_ct, mlp)
+                sf_reader, quant_desc_str, is_quant, is_ct, mlp,
+                apply_activation_quant=apply_activation_quant)
         elif is_packed:
-            expert_out = self._forward_single_expert_packed(experts_mod, eid, x_chunk, chunk_device)
+            expert_out = self._forward_single_expert_packed(
+                experts_mod, eid, x_chunk, chunk_device,
+                apply_activation_quant=apply_activation_quant,
+            )
         elif is_module_list:
             expert_out = self._forward_single_expert_module_list(experts_mod, eid, x_chunk, chunk_device)
         if expert_out is None:
