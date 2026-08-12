@@ -6,7 +6,7 @@
   2. --available_devices 已删除 (死参数)
   3. --model_type 新增 (auto/dense/moe/glm_mla/glm_moe_dsa)
   4. --boundary 新增 (定界占位)
-  5. --activation_quant_type 新增 (5 choices)
+  5. --activation_quant_type 提供 4 个规范类型（LAOS 激活别名归一到 Dynamic）
   6. subgraph_locate.py 无 import argparse (死 import 删除)
   7. subgraph_locate.py docstring 无 python -m 示例 (改为库 API)
 """
@@ -136,16 +136,17 @@ def test_boundary_added():
 # ---------------------------------------------------------------------------
 
 def test_activation_quant_type_added():
-    """--activation_quant_type 新增, 5 choices"""
+    """--activation_quant_type exposes four canonical activation paths."""
     calls = _get_add_argument_calls(_parse_run_script())
     found = False
     for name, kwargs in calls:
         if name == "--activation_quant_type":
             found = True
             choices = kwargs.get("choices", [])
-            for expected in ("W8A8_MXFP8", "W4A8_MXFP", "W4A4_MXFP4", "W4A4_DYNAMIC", "W4A4_LAOS"):
+            for expected in ("W8A8_MXFP8", "W4A8_MXFP", "W4A4_MXFP4", "W4A4_DYNAMIC"):
                 assert expected in choices, \
                     f"--activation_quant_type choices 应含 {expected}, got {choices}"
+            assert "W4A4_LAOS" not in choices
     assert found, "--activation_quant_type 参数未找到"
 
 

@@ -44,25 +44,60 @@ from .block_compare_types import (
     BadLayerDetection, BlockCompareReport,
 )
 
+
+_ACTIVATION_QUANT_ALIASES = {"W4A4_LAOS": "W4A4_DYNAMIC"}
+_ACTIVATION_QUANT_TYPES = frozenset({
+    "W8A8_MXFP8",
+    "W4A8_MXFP",
+    "W4A4_MXFP4",
+    "W4A4_DYNAMIC",
+    "W8A8_DYNAMIC",
+    "W4A8_DYNAMIC",
+    "W8A8",
+    "W4A8",
+})
+
+
+def _canonical_activation_quant_type(quant_type: str) -> str:
+    normalized = str(quant_type).strip().upper()
+    normalized = _ACTIVATION_QUANT_ALIASES.get(normalized, normalized)
+    if normalized not in _ACTIVATION_QUANT_TYPES:
+        supported = ", ".join(sorted(_ACTIVATION_QUANT_TYPES))
+        raise ValueError(
+            f"unsupported activation quant type {quant_type!r}; "
+            f"expected one of: {supported}"
+        )
+    return normalized
+
+
 def _dispatch_act_fake_quant(x, quant_type: str):
-    """按 quant_type 分派激活伪量化函数。
-    W8A8_MXFP8 / W4A8_MXFP → MXFP8 per-block (A8 microscaling)
-    W4A4_MXFP4            → MXFP4 per-block (A4 microscaling)
-    W4A4_DYNAMIC          → INT4 per-token sym (A4 线性)
-    W4A8_DYNAMIC / W8A8_DYNAMIC / W4A8 / W8A8 → INT8 per-token sym (A8 线性)
-    """
+    """Apply the canonical activation QDQ path without changing its contract."""
+    quant_type = _canonical_activation_quant_type(quant_type)
     if quant_type == "W4A4_MXFP4":
         from .mxfp4_fake_quant import mxfp4_fake_quant_per_block
-        return mxfp4_fake_quant_per_block(x)
-    if quant_type in ("W4A4_DYNAMIC", "W4A4_LAOS"):
+        result = mxfp4_fake_quant_per_block(x)
+    elif quant_type == "W4A4_DYNAMIC":
         from .int4_fake_quant import int4_fake_quant_per_token_sym
-        return int4_fake_quant_per_token_sym(x)
-    if quant_type in ("W4A8_DYNAMIC", "W8A8_DYNAMIC", "W4A8", "W8A8"):
+        result = int4_fake_quant_per_token_sym(x)
+    elif quant_type in ("W8A8_DYNAMIC", "W4A8_DYNAMIC", "W8A8", "W4A8"):
         from .int8_fake_quant import int8_fake_quant_per_token_sym
-        return int8_fake_quant_per_token_sym(x)
-    # 默认: MXFP8 (W8A8_MXFP8, W4A8_MXFP)
-    from .mxfp8_fake_quant import mxfp8_fake_quant_per_block
-    return mxfp8_fake_quant_per_block(x)
+        result = int8_fake_quant_per_token_sym(x)
+    # W8A8_MXFP8 and W4A8_MXFP share the same A8 activation path.
+    else:
+        from .mxfp8_fake_quant import mxfp8_fake_quant_per_block
+        result = mxfp8_fake_quant_per_block(x)
+
+    if tuple(result.shape) != tuple(x.shape):
+        raise RuntimeError(
+            f"{quant_type} activation fake quant changed shape: "
+            f"{tuple(x.shape)} -> {tuple(result.shape)}"
+        )
+    if result.dtype != x.dtype or result.device != x.device:
+        raise RuntimeError(
+            f"{quant_type} activation fake quant changed tensor contract: "
+            f"dtype {x.dtype}->{result.dtype}, device {x.device}->{result.device}"
+        )
+    return result
 
 
 def _make_act_fake_quant_hook(quant_type: str):
@@ -192,7 +227,9 @@ class ShardedBlockComparator:
             model_paths=(ref_model_path, quant_model_path),
         )
         self.activation_quant = activation_quant
-        self.activation_quant_type = activation_quant_type
+        self.activation_quant_type = _canonical_activation_quant_type(
+            activation_quant_type
+        )
         self.collect_full_logits = collect_full_logits
         self.logits_max_positions = logits_max_positions
         self._activation_hooks = []  # track registered hooks for cleanup

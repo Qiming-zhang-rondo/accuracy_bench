@@ -18,6 +18,7 @@ import torch
 
 from accuracy_checker.mxfp4_fake_quant import mxfp4_fake_quant_per_block, E2M1_MAX
 from accuracy_checker.int4_fake_quant import int4_fake_quant_per_token_sym, INT4_MAX
+from accuracy_checker.layer1_block_compare import _dispatch_act_fake_quant
 
 # E2M1 可表示正值 (与 model_loader.py E2M1_VALUES 一致)
 E2M1_POSITIVE = {0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}
@@ -214,3 +215,37 @@ class TestINT4:
         out = int4_fake_quant_per_token_sym(x)
         assert out.shape == x.shape
         assert out.dtype == torch.float16
+
+
+def test_all_activation_quant_dispatches_preserve_tensor_contract():
+    # transpose keeps the last dimension quantizable while making the tensor
+    # non-contiguous, matching hidden states produced by some accelerator ops.
+    x = torch.randn(2, 3, 64, dtype=torch.float16).transpose(0, 1)
+    assert not x.is_contiguous()
+    for quant_type in (
+        "W8A8_MXFP8",
+        "W4A8_MXFP",
+        "W4A4_MXFP4",
+        "W4A4_DYNAMIC",
+        "W8A8_DYNAMIC",
+        "W4A8_DYNAMIC",
+        "W8A8",
+        "W4A8",
+    ):
+        out = _dispatch_act_fake_quant(x, quant_type)
+        assert out.shape == x.shape
+        assert out.dtype == x.dtype
+        assert out.device == x.device
+
+
+def test_legacy_laos_activation_alias_matches_dynamic():
+    x = torch.randn(2, 64)
+    torch.testing.assert_close(
+        _dispatch_act_fake_quant(x, "W4A4_LAOS"),
+        _dispatch_act_fake_quant(x, "W4A4_DYNAMIC"),
+    )
+
+
+def test_unknown_activation_quant_type_fails_closed():
+    with pytest.raises(ValueError, match="unsupported activation quant type"):
+        _dispatch_act_fake_quant(torch.randn(2, 64), "W4A4_UNKNOWN")

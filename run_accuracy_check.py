@@ -31,6 +31,19 @@ import logging
 logger = logging.getLogger(__name__)
 
 VALID_MODES = ("screening", "boundary", "l1", "l2", "full", "report", "inference")
+ACTIVATION_QUANT_TYPES = (
+    "W8A8_MXFP8",
+    "W4A8_MXFP",
+    "W4A4_MXFP4",
+    "W4A4_DYNAMIC",
+)
+ACTIVATION_QUANT_ALIASES = {"W4A4_LAOS": "W4A4_DYNAMIC"}
+
+
+def parse_activation_quant_type(value: str) -> str:
+    """Normalize legacy activation-only aliases before argparse choices."""
+    normalized = value.strip().upper()
+    return ACTIVATION_QUANT_ALIASES.get(normalized, normalized)
 
 
 def parse_args():
@@ -102,11 +115,13 @@ def parse_args():
                         help="L2: 关闭 MLA 细粒度拆分 (只输出粗粒度 self_attn)")
     parser.add_argument("--activation_quant", action="store_true",
                         help="L1: 启用激活伪量化 (类型由 --activation_quant_type 指定)")
-    parser.add_argument("--activation_quant_type", type=str, default="W8A8_MXFP8",
-                        choices=["W8A8_MXFP8", "W4A8_MXFP", "W4A4_MXFP4", "W4A4_DYNAMIC", "W4A4_LAOS"],
+    parser.add_argument("--activation_quant_type", type=parse_activation_quant_type,
+                        default="W8A8_MXFP8",
+                        choices=["W8A8_MXFP8", "W4A8_MXFP", "W4A4_MXFP4", "W4A4_DYNAMIC"],
                         help="L1: 激活伪量化类型 (W8A8_MXFP8/W4A8_MXFP=MXFP8 per-block; "
                              "W4A4_MXFP4=MXFP4 E2M1 per-block; "
-                             "W4A4_DYNAMIC/W4A4_LAOS=INT4 per-token sym)")
+                             "W4A4_DYNAMIC=INT4 per-token sym; legacy "
+                             "W4A4_LAOS maps to W4A4_DYNAMIC)")
     parser.add_argument("--compare_mode", type=str, default="dual",
                         choices=["dual", "grouped_dual"],
                         help="L1: 对比模式 (dual=双卡分片, grouped_dual=MoE expert跨卡)")

@@ -771,9 +771,8 @@
                 <option value="W4A8_MXFP">W4A8_MXFP · MXFP8 per-block</option>
                 <option value="W4A4_MXFP4">W4A4_MXFP4 · MXFP4 E2M1 per-block</option>
                 <option value="W4A4_DYNAMIC">W4A4_DYNAMIC · INT4 per-token</option>
-                <option value="W4A4_LAOS">W4A4_LAOS · INT4 per-token</option>
               </select>
-              <span class="hint">选择具体类型后会自动同时加入 <code>--activation_quant</code> 与 <code>--activation_quant_type</code>。</span>
+              <span class="hint">选择具体类型后会自动同时加入 <code>--activation_quant</code> 与 <code>--activation_quant_type</code>。LAOS 的激活侧与 W4A4_DYNAMIC 相同，统一选择后者。</span>
             </div>
             <div id="targetLayersField" class="hidden" aria-hidden="true">
               <label for="targetLayers">L2 目标层 <span class="optional">逗号分隔；留空自动扫描 cache</span></label>
@@ -938,7 +937,7 @@
             <tr><td><code>--rotation_matrix</code></td><td>空</td><td>QuaRot 等旋转量化且 R 未融合时提供；普通非旋转 W8A8 不需要。</td></tr>
             <tr><td><code>--mla_fine</code> / <code>--no_mla_fine</code></td><td>开启</td><td>控制 L2 MLA attention 的细粒度拆分。</td></tr>
             <tr><td><code>--activation_quant</code></td><td>false</td><td>L1 双侧启用激活伪量化。</td></tr>
-            <tr><td><code>--activation_quant_type</code></td><td>W8A8_MXFP8</td><td>W8A8_MXFP8 / W4A8_MXFP / W4A4_MXFP4 / W4A4_DYNAMIC / W4A4_LAOS。</td></tr>
+            <tr><td><code>--activation_quant_type</code></td><td>W8A8_MXFP8</td><td>W8A8_MXFP8 / W4A8_MXFP / W4A4_MXFP4 / W4A4_DYNAMIC；旧命令中的 W4A4_LAOS 自动归一为 W4A4_DYNAMIC。</td></tr>
             <tr><td><code>--compare_mode</code></td><td>dual</td><td>dual / grouped_dual；MoE 推荐 grouped_dual，DSpark 必须 dual。</td></tr>
             <tr><td><code>--ref_devices</code></td><td>空</td><td>grouped_dual 的 ref 多卡列表，例如 npu:0,1。</td></tr>
             <tr><td><code>--quant_devices</code></td><td>空</td><td>grouped_dual 的 quant 多卡列表，例如 npu:2,3。</td></tr>

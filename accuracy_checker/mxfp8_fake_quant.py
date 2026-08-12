@@ -48,7 +48,7 @@ def mxfp8_fake_quant_per_block(
 
     # reshape to [..., hidden_size // block_size, block_size]
     new_shape = original_shape[:-1] + (hidden_size // block_size, block_size)
-    x_blocked = x_fp32.view(new_shape)
+    x_blocked = x_fp32.reshape(new_shape)
 
     # per-block amax → shared scale (E8M0 格式, 2 的幂次)
     x_amax = x_blocked.abs().amax(dim=-1, keepdim=True).clamp(min=torch.finfo(torch.float32).eps)
@@ -75,4 +75,4 @@ def mxfp8_fake_quant_per_block(
     x_quantized = x_quant_abs * sign
     x_fake_quantized = x_quantized * shared_scale
 
-    return x_fake_quantized.view(original_shape).to(original_dtype)
+    return x_fake_quantized.reshape(original_shape).to(original_dtype)

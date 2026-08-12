@@ -48,7 +48,7 @@ def mxfp4_fake_quant_per_block(
 
     # reshape to [..., hidden_size // block_size, block_size]
     new_shape = original_shape[:-1] + (hidden_size // block_size, block_size)
-    x_blocked = x_fp32.view(new_shape)
+    x_blocked = x_fp32.reshape(new_shape)
 
     # per-block amax → E8M0 shared scale (D2: floor OCP even)
     # shared_exp = floor(log2(amax)) - emax  (= floor(log2(amax)) - 2)
@@ -82,4 +82,4 @@ def mxfp4_fake_quant_per_block(
     x_quantized = x_q_abs * sign
     x_fake_quantized = x_quantized * shared_scale
 
-    return x_fake_quantized.view(original_shape).to(original_dtype)
+    return x_fake_quantized.reshape(original_shape).to(original_dtype)
