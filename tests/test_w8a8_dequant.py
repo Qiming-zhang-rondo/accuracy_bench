@@ -205,6 +205,16 @@ def test_streaming_activation_fake_quant_is_applied_on_quant_side_only():
     comparator = _packed_comparator()
     comparator.activation_quant = True
     comparator.activation_quant_type = "W4A4_DYNAMIC"
+    comparator._dequant_streaming_weight = (
+        lambda sf_reader, key, w_type, device, is_ct=False,
+        expert_id=None, num_experts=None: sf_reader.get_tensor_slice(
+            key, expert_id, expected_first_dim=num_experts
+        )
+    )
+    quant_desc = {
+        gate_up_key: "W4A4_INT4_DYNAMIC",
+        down_key: "FLOAT",
+    }
     x = torch.tensor([[0.13, -0.57, 1.0]])
 
     ref_out = comparator._streaming_expert_forward(
@@ -212,7 +222,7 @@ def test_streaming_activation_fake_quant_is_applied_on_quant_side_only():
         apply_activation_quant=False,
     )
     quant_out = comparator._streaming_expert_forward(
-        0, x, "cpu", prefix, reader, None, False, False, _packed_mlp(),
+        0, x, "cpu", prefix, reader, quant_desc, True, False, _packed_mlp(),
         apply_activation_quant=True,
     )
 

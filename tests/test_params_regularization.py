@@ -136,16 +136,20 @@ def test_boundary_added():
 # ---------------------------------------------------------------------------
 
 def test_activation_quant_type_added():
-    """--activation_quant_type exposes four canonical activation paths."""
+    """--activation_quant_type exposes auto plus canonical activation paths."""
     calls = _get_add_argument_calls(_parse_run_script())
     found = False
     for name, kwargs in calls:
         if name == "--activation_quant_type":
             found = True
             choices = kwargs.get("choices", [])
-            for expected in ("W8A8_MXFP8", "W4A8_MXFP", "W4A4_MXFP4", "W4A4_DYNAMIC"):
+            for expected in (
+                "AUTO", "W8A8_MXFP8", "W4A8_MXFP",
+                "W4A4_MXFP4", "W4A4_DYNAMIC",
+            ):
                 assert expected in choices, \
                     f"--activation_quant_type choices 应含 {expected}, got {choices}"
+            assert kwargs.get("default") == "AUTO"
             assert "W4A4_LAOS" not in choices
     assert found, "--activation_quant_type 参数未找到"
 

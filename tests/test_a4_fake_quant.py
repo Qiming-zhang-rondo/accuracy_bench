@@ -249,3 +249,8 @@ def test_legacy_laos_activation_alias_matches_dynamic():
 def test_unknown_activation_quant_type_fails_closed():
     with pytest.raises(ValueError, match="unsupported activation quant type"):
         _dispatch_act_fake_quant(torch.randn(2, 64), "W4A4_UNKNOWN")
+
+
+def test_auto_activation_type_must_be_resolved_before_dispatch():
+    with pytest.raises(ValueError, match="must be resolved"):
+        _dispatch_act_fake_quant(torch.randn(2, 64), "AUTO")

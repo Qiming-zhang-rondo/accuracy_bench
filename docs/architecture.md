@@ -83,7 +83,8 @@ acc_bench/
 | `--rotation_matrix FILE` | QuaRot 旋转矩阵（R1） |
 | `--quant_method dequantize\|fake_quant` | 量化模型加载方式 |
 | `--compare_mode dual\|grouped_dual` | dual=双卡分片, grouped_dual=MoE expert 跨卡 |
-| `--activation_quant` | 启用 MXFP8 per-block 激活伪量化 |
+| `--activation_quant` | 仅在 quant 侧启用 descriptor 驱动的激活伪量化 |
+| `--activation_quant_type AUTO\|...` | 默认按每个权重 descriptor 自动选择激活格式；显式类型只匹配兼容算子 |
 
 ---
 

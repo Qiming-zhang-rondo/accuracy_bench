@@ -2,11 +2,14 @@
 
 ## 2026-08-12 — CLI guide activation quant
 
+- activation fake-quant 改为 checkpoint descriptor 驱动：普通 Linear 与 streaming/packed MoE expert 只在对应权重声明兼容的 activation quant 时执行 QDQ，FLOAT、回退层和其他量化格式不再被全局误量化
+- 新增 `--activation_quant_type AUTO`（默认），支持混合量化模型按算子自动选择 MXFP8/MXFP4/INT4/INT8 激活路径；显式类型仅匹配同一激活格式
+- 缺少 `quant_model_description.json` 或显式类型与 checkpoint 完全不匹配时提前失败，避免输出失真的完整报告
 - 统一 msModelSlim `W4A4_INT4_DYNAMIC` checkpoint 标签为内部 `W4A4_DYNAMIC`，覆盖普通 Linear、3D expert、grouped-dual streaming expert、inference 与 L2 replay
 - 审计全部 activation fake-quant 路径并增加 shape/dtype/device 不变量检查；未知类型不再静默回退 MXFP8
 - 激活类型合并 `W4A4_LAOS` 与 `W4A4_DYNAMIC`：CLI/参数页只展示 `W4A4_DYNAMIC`，旧 LAOS 命令自动归一；checkpoint 权重格式仍分别识别
 - 修复 Qwen MoE shared expert 的 A4 packed 权重在量化描述漏标时被误当作 FLOAT、导致中间维度减半的问题；装载阶段按骨架形状和 scale 编码区分 Dynamic/LAOS dim-0 与 MXFP4 dim-1 解包，并在进入 NPU forward 前校验投影形状
-- 修复 activation fake-quant 连续注册 ref/quant 时清掉 ref hook 的问题，确保双侧配置对称
+- 修复 activation fake-quant 误作用于 ref 的问题，激活量化只作用于 quant 路径
 - 参数页新增激活伪量化类型下拉框；选择类型后自动生成 `--activation_quant` 与 `--activation_quant_type`
 - 参数页按模式切换 L1/L2 字段；L2 改为单卡 ref/quant、L1 cache 目录、可选目标层自动发现和 MLA 诊断粒度，不再生成 L1 专用参数
 

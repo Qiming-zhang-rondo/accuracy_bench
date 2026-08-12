@@ -77,7 +77,7 @@ class TestCliGuide(unittest.TestCase):
 
     def test_activation_quant_type_is_selectable_and_generates_both_flags(self):
         for quant_type in (
-            "W8A8_MXFP8", "W4A8_MXFP", "W4A4_MXFP4",
+            "AUTO", "W8A8_MXFP8", "W4A8_MXFP", "W4A4_MXFP4",
             "W4A4_DYNAMIC",
         ):
             self.assertIn(f'value="{quant_type}"', self.html)
@@ -87,6 +87,8 @@ class TestCliGuide(unittest.TestCase):
             'args.push(line("--activation_quant_type", el.activationQuantType.value))',
             self.html,
         )
+        self.assertIn("按 checkpoint descriptor 逐算子选择", self.html)
+        self.assertIn("ref 始终保持原始精度", self.html)
 
     def test_l2_form_uses_cache_and_single_device_contract(self):
         l2_block = self.html.split('} else if (mode === "l2") {', 1)[1]

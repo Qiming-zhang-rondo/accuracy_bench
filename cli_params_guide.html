@@ -767,12 +767,13 @@
               <label for="activationQuantType">激活伪量化类型 <span class="optional">L1 / full</span></label>
               <select id="activationQuantType">
                 <option value="">关闭 · 不做激活伪量化</option>
+                <option value="AUTO">AUTO · 按 checkpoint descriptor 逐算子选择（推荐）</option>
                 <option value="W8A8_MXFP8">W8A8_MXFP8 · MXFP8 per-block</option>
                 <option value="W4A8_MXFP">W4A8_MXFP · MXFP8 per-block</option>
                 <option value="W4A4_MXFP4">W4A4_MXFP4 · MXFP4 E2M1 per-block</option>
                 <option value="W4A4_DYNAMIC">W4A4_DYNAMIC · INT4 per-token</option>
               </select>
-              <span class="hint">选择具体类型后会自动同时加入 <code>--activation_quant</code> 与 <code>--activation_quant_type</code>。LAOS 的激活侧与 W4A4_DYNAMIC 相同，统一选择后者。</span>
+              <span class="hint">推荐 AUTO：只量化 descriptor 明确声明了 activation quant 的 quant 侧算子；FLOAT、回退层和不匹配的量化类型不会被全局误量化。显式类型用于只验证指定激活格式。</span>
             </div>
             <div id="targetLayersField" class="hidden" aria-hidden="true">
               <label for="targetLayers">L2 目标层 <span class="optional">逗号分隔；留空自动扫描 cache</span></label>
@@ -936,8 +937,8 @@
             <tr><td><code>--l1_target_layers</code></td><td>空</td><td>L1 只报告指定层，但仍从第 0 层 forward 以保持真实上下文。</td></tr>
             <tr><td><code>--rotation_matrix</code></td><td>空</td><td>QuaRot 等旋转量化且 R 未融合时提供；普通非旋转 W8A8 不需要。</td></tr>
             <tr><td><code>--mla_fine</code> / <code>--no_mla_fine</code></td><td>开启</td><td>控制 L2 MLA attention 的细粒度拆分。</td></tr>
-            <tr><td><code>--activation_quant</code></td><td>false</td><td>L1 双侧启用激活伪量化。</td></tr>
-            <tr><td><code>--activation_quant_type</code></td><td>W8A8_MXFP8</td><td>W8A8_MXFP8 / W4A8_MXFP / W4A4_MXFP4 / W4A4_DYNAMIC；旧命令中的 W4A4_LAOS 自动归一为 W4A4_DYNAMIC。</td></tr>
+            <tr><td><code>--activation_quant</code></td><td>false</td><td>仅在 L1 quant 侧启用 descriptor 驱动的激活伪量化；ref 始终保持原始精度。</td></tr>
+            <tr><td><code>--activation_quant_type</code></td><td>AUTO</td><td>AUTO 按每个权重的 descriptor 自动选择；也可显式指定 W8A8_MXFP8 / W4A8_MXFP / W4A4_MXFP4 / W4A4_DYNAMIC。</td></tr>
             <tr><td><code>--compare_mode</code></td><td>dual</td><td>dual / grouped_dual；MoE 推荐 grouped_dual，DSpark 必须 dual。</td></tr>
             <tr><td><code>--ref_devices</code></td><td>空</td><td>grouped_dual 的 ref 多卡列表，例如 npu:0,1。</td></tr>
             <tr><td><code>--quant_devices</code></td><td>空</td><td>grouped_dual 的 quant 多卡列表，例如 npu:2,3。</td></tr>

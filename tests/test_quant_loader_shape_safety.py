@@ -40,6 +40,7 @@ def test_missing_split_descriptor_recovers_dim0_packed_w4_weight():
     assert loaded
     assert tuple(param.shape) == (4, 3)
     assert param.dtype == torch.float32
+    assert param._acc_quant_type == "W4A4_LAOS"
 
 
 def test_msmodelslim_int4_dynamic_alias_loads_normal_weight():
@@ -61,6 +62,7 @@ def test_msmodelslim_int4_dynamic_alias_loads_normal_weight():
 
     assert loaded
     assert tuple(param.shape) == (4, 3)
+    assert param._acc_quant_type == "W4A4_DYNAMIC"
 
 
 def test_msmodelslim_int4_dynamic_alias_loads_streaming_expert():
@@ -149,6 +151,7 @@ class _Layer(nn.Module):
     def __init__(self):
         super().__init__()
         self.proj = nn.Linear(4, 4, bias=False)
+        self.float_proj = nn.Linear(4, 4, bias=False)
 
 
 class _Model(nn.Module):
@@ -161,9 +164,13 @@ class _Model(nn.Module):
 def test_activation_quant_hooks_are_registered_on_quant_model_only():
     comparator = object.__new__(ShardedBlockComparator)
     comparator.activation_quant = True
-    comparator.activation_quant_type = "W8A8_MXFP8"
+    comparator.activation_quant_type = "AUTO"
     comparator.verbose = False
     comparator._activation_hooks = []
+    comparator._quant_quant_desc = {
+        "model.layers.0.proj.weight": "W4A4_INT4_DYNAMIC",
+        "model.layers.0.float_proj.weight": "FLOAT",
+    }
     ref_model = _Model()
     quant_model = _Model()
 
@@ -171,8 +178,40 @@ def test_activation_quant_hooks_are_registered_on_quant_model_only():
 
     assert len(ref_model.model.layers[0].proj._forward_pre_hooks) == 0
     assert len(quant_model.model.layers[0].proj._forward_pre_hooks) == 1
+    assert len(quant_model.model.layers[0].float_proj._forward_pre_hooks) == 0
     assert len(comparator._activation_hooks) == 1
     comparator._clear_activation_quant_hooks()
+
+
+def test_explicit_activation_type_does_not_touch_other_schemes():
+    comparator = object.__new__(ShardedBlockComparator)
+    comparator.activation_quant = True
+    comparator.activation_quant_type = "W4A4_DYNAMIC"
+    comparator.verbose = False
+    comparator._activation_hooks = []
+    comparator._quant_quant_desc = {
+        "model.layers.0.proj.weight": "W4A4_INT4_DYNAMIC",
+        "model.layers.0.float_proj.weight": "W8A8_MXFP8",
+    }
+    quant_model = _Model()
+
+    comparator._register_quant_activation_hooks(quant_model, [0])
+
+    assert len(quant_model.model.layers[0].proj._forward_pre_hooks) == 1
+    assert len(quant_model.model.layers[0].float_proj._forward_pre_hooks) == 0
+    comparator._clear_activation_quant_hooks()
+
+
+def test_activation_quant_requires_checkpoint_descriptors():
+    comparator = object.__new__(ShardedBlockComparator)
+    comparator.activation_quant = True
+    comparator.activation_quant_type = "AUTO"
+    comparator.verbose = False
+    comparator._activation_hooks = []
+    comparator._quant_quant_desc = None
+
+    with pytest.raises(ValueError, match="quant_model_description.json"):
+        comparator._register_quant_activation_hooks(_Model(), [0])
 
 
 def test_shared_expert_shape_guard_reports_before_matmul():

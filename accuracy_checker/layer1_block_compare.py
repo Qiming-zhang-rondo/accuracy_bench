@@ -47,6 +47,7 @@ from .block_compare_types import (
 
 _ACTIVATION_QUANT_ALIASES = {"W4A4_LAOS": "W4A4_DYNAMIC"}
 _ACTIVATION_QUANT_TYPES = frozenset({
+    "AUTO",
     "W8A8_MXFP8",
     "W4A8_MXFP",
     "W4A4_MXFP4",
@@ -56,6 +57,28 @@ _ACTIVATION_QUANT_TYPES = frozenset({
     "W8A8",
     "W4A8",
 })
+
+_WEIGHT_TO_ACTIVATION_QUANT = {
+    "W8A8_MXFP8": "W8A8_MXFP8",
+    "W4A8_MXFP": "W4A8_MXFP",
+    "W4A4_MXFP4": "W4A4_MXFP4",
+    "W4A4_DYNAMIC": "W4A4_DYNAMIC",
+    "W4A4_LAOS": "W4A4_DYNAMIC",
+    "W4A4_INT4_DYNAMIC": "W4A4_DYNAMIC",
+    "W8A8_DYNAMIC": "W8A8_DYNAMIC",
+    "W4A8_DYNAMIC": "W4A8_DYNAMIC",
+}
+
+_ACTIVATION_QUANT_FAMILIES = {
+    "W8A8_MXFP8": "mxfp8",
+    "W4A8_MXFP": "mxfp8",
+    "W4A4_MXFP4": "mxfp4",
+    "W4A4_DYNAMIC": "int4_dynamic",
+    "W8A8_DYNAMIC": "int8_dynamic",
+    "W4A8_DYNAMIC": "int8_dynamic",
+    "W8A8": "int8_dynamic",
+    "W4A8": "int8_dynamic",
+}
 
 
 def _canonical_activation_quant_type(quant_type: str) -> str:
@@ -73,6 +96,11 @@ def _canonical_activation_quant_type(quant_type: str) -> str:
 def _dispatch_act_fake_quant(x, quant_type: str):
     """Apply the canonical activation QDQ path without changing its contract."""
     quant_type = _canonical_activation_quant_type(quant_type)
+    if quant_type == "AUTO":
+        raise ValueError(
+            "activation quant type 'auto' must be resolved from the weight "
+            "descriptor before QDQ"
+        )
     if quant_type == "W4A4_MXFP4":
         from .mxfp4_fake_quant import mxfp4_fake_quant_per_block
         result = mxfp4_fake_quant_per_block(x)
@@ -98,6 +126,86 @@ def _dispatch_act_fake_quant(x, quant_type: str):
             f"dtype {x.dtype}->{result.dtype}, device {x.device}->{result.device}"
         )
     return result
+
+
+def _activation_quant_for_weight(weight_quant_type: str,
+                                 requested_type: str) -> Optional[str]:
+    """Resolve the QDQ kernel for one weight descriptor.
+
+    ``auto`` follows the descriptor exactly.  An explicit CLI type only
+    applies to descriptors using the same activation representation.  FLOAT,
+    weight-only, static, and unknown formats return ``None`` instead of being
+    silently activation-quantized.
+    """
+    if not isinstance(weight_quant_type, str):
+        return None
+    normalized = weight_quant_type.strip().upper()
+    expected = _WEIGHT_TO_ACTIVATION_QUANT.get(normalized)
+    if expected is None:
+        return None
+
+    requested = _canonical_activation_quant_type(requested_type)
+    if requested == "AUTO":
+        return expected
+    if _ACTIVATION_QUANT_FAMILIES.get(requested) == _ACTIVATION_QUANT_FAMILIES.get(expected):
+        return requested
+    return None
+
+
+def _lookup_quant_descriptor(quant_desc: Optional[dict], weight_key: str,
+                             default=None):
+    """Look up a quant type using both Parameter and Linear-style keys."""
+    if not quant_desc:
+        return default
+    from .utils import parse_base_name, normalize_quant_type
+
+    candidates = [weight_key, parse_base_name(weight_key)]
+    if weight_key.endswith(".weight"):
+        candidates.append(weight_key[:-len(".weight")])
+    else:
+        candidates.extend((
+            f"{weight_key}.weight",
+            parse_base_name(f"{weight_key}.weight"),
+        ))
+    for candidate in candidates:
+        quant_type = quant_desc.get(candidate)
+        if isinstance(quant_type, str):
+            return normalize_quant_type(quant_type)
+    return default
+
+
+def _lookup_linear_quant_descriptor(quant_desc: Optional[dict],
+                                    weight_key: str):
+    """Resolve a Linear descriptor, including safe shared-MLP recovery.
+
+    Some msModelSlim exports omit gate/up descriptors while retaining the
+    sibling down projection descriptor.  Reuse a sibling only for the tightly
+    coupled MLP projection set and only when all described siblings agree.
+    """
+    quant_type = _lookup_quant_descriptor(quant_desc, weight_key)
+    if quant_type is not None:
+        return quant_type
+
+    module_key = weight_key[:-len(".weight")] if weight_key.endswith(".weight") else weight_key
+    parent, separator, projection = module_key.rpartition(".")
+    mlp_projections = ("gate_proj", "up_proj", "down_proj", "gate_up_proj")
+    if not separator or projection not in mlp_projections:
+        return None
+
+    sibling_types = {
+        sibling_type
+        for sibling in mlp_projections
+        if sibling != projection
+        for sibling_type in (
+            _lookup_quant_descriptor(
+                quant_desc, f"{parent}.{sibling}.weight"
+            ),
+        )
+        if _activation_quant_for_weight(sibling_type, "AUTO") is not None
+    }
+    if len(sibling_types) == 1:
+        return sibling_types.pop()
+    return None
 
 
 def _make_act_fake_quant_hook(quant_type: str):
@@ -187,7 +295,7 @@ class ShardedBlockComparator:
         expert_chunk_size: Optional[int] = None,
         kimi_kda_backend: str = "auto",
         activation_quant: bool = False,
-        activation_quant_type: str = "W8A8_MXFP8",
+        activation_quant_type: str = "AUTO",
         # Full logits capture on the L1 forward pass (no extra model reload).
         # Default on; compare_logits 4-panel data feeds ReportData.logits.
         collect_full_logits: bool = True,
@@ -1664,35 +1772,82 @@ class ShardedBlockComparator:
         return moe is not None
 
     def _register_quant_activation_hooks(self, model, layers: List[int]):
-        """Register activation fake-quant hooks on the quant model only."""
+        """Register descriptor-matched activation hooks on the quant side."""
         if not self.activation_quant:
             return
+        from .utils import get_decoder_layers, normalize_quant_desc_keys
+
+        raw_quant_desc = getattr(self, "_quant_quant_desc", None)
+        if not raw_quant_desc:
+            raise ValueError(
+                "--activation_quant requires quant_model_description.json; "
+                "operator scope cannot be inferred safely without descriptors"
+            )
+        quant_desc = normalize_quant_desc_keys(raw_quant_desc, model)
+        if not any(
+            _activation_quant_for_weight(value, self.activation_quant_type)
+            is not None
+            for value in quant_desc.values()
+            if isinstance(value, str)
+        ):
+            raise ValueError(
+                "--activation_quant_type %s does not match any activation-"
+                "quantized weight in quant_model_description.json"
+                % self.activation_quant_type
+            )
+
         previous_count = len(self._activation_hooks)
-        from .utils import get_decoder_layers
         decoder_layers = get_decoder_layers(model)
+        module_names = {id(module): name for name, module in model.named_modules()}
+        skipped_unquantized = 0
+        skipped_other_scheme = 0
         for i in layers:
             if i >= len(decoder_layers):
                 continue
             layer = decoder_layers[i]
+            layer_name = module_names.get(id(layer))
+            if layer_name is None:
+                raise RuntimeError(
+                    f"could not resolve decoder layer {i} in model.named_modules()"
+                )
             for name, mod in layer.named_modules():
                 if not isinstance(mod, nn.Linear):
                     continue
-                # 跳过 MoE router/gate (选专家不应量化)
-                if 'gate' in name and 'gate_up' not in name and 'gate_proj' not in name:
-                    continue
-                if 'router' in name:
+                module_name = layer_name if not name else f"{layer_name}.{name}"
+                weight_quant_type = getattr(
+                    mod.weight, "_acc_quant_type", None
+                )
+                if weight_quant_type is None:
+                    weight_quant_type = _lookup_linear_quant_descriptor(
+                        quant_desc, f"{module_name}.weight"
+                    )
+                activation_type = _activation_quant_for_weight(
+                    weight_quant_type, self.activation_quant_type
+                )
+                if activation_type is None:
+                    if _activation_quant_for_weight(weight_quant_type, "AUTO") is None:
+                        skipped_unquantized += 1
+                    else:
+                        skipped_other_scheme += 1
                     continue
                 # Streaming experts are placeholders and are handled by
                 # _streaming_expert_forward. Materialized ModuleList experts
                 # need hooks just like any other quant-side Linear.
-                h = mod.register_forward_pre_hook(_make_act_fake_quant_hook(self.activation_quant_type))
+                h = mod.register_forward_pre_hook(
+                    _make_act_fake_quant_hook(activation_type)
+                )
                 self._activation_hooks.append(h)
         added_count = len(self._activation_hooks) - previous_count
-        if self.verbose and added_count:
+        if self.verbose:
             logger.info(
-                f"  [ACT FAKE QUANT] registered {added_count} "
-                f"{self.activation_quant_type} hooks on quant side "
-                f"(active total: {len(self._activation_hooks)})"
+                "  [ACT FAKE QUANT] registered %d descriptor-matched hooks "
+                "on quant side (requested=%s, skipped unquantized=%d, "
+                "other activation scheme=%d, active total=%d)",
+                added_count,
+                self.activation_quant_type,
+                skipped_unquantized,
+                skipped_other_scheme,
+                len(self._activation_hooks),
             )
 
     def _clear_activation_quant_hooks(self):
@@ -1846,22 +2001,10 @@ class ShardedBlockComparator:
     @staticmethod
     def _streaming_quant_type(quant_desc_str, weight_key, default="FLOAT"):
         """Look up quant type for both Parameter and Linear-style keys."""
-        if not quant_desc_str:
-            return default
-        from .utils import parse_base_name, normalize_quant_type
-        candidates = [weight_key, parse_base_name(weight_key)]
-        if weight_key.endswith(".weight"):
-            candidates.append(weight_key[:-len(".weight")])
-        else:
-            candidates.extend((
-                f"{weight_key}.weight",
-                parse_base_name(f"{weight_key}.weight"),
-            ))
-        for candidate in candidates:
-            quant_type = quant_desc_str.get(candidate)
-            if isinstance(quant_type, str):
-                return normalize_quant_type(quant_type)
-        return normalize_quant_type(default)
+        from .utils import normalize_quant_type
+        return _lookup_quant_descriptor(
+            quant_desc_str, weight_key, normalize_quant_type(default)
+        )
 
     def _dequant_streaming_weight(self, sf_reader, weight_key, w_type, device,
                                     is_ct=False, expert_id=None,
@@ -2049,19 +2192,35 @@ class ShardedBlockComparator:
             logger.debug(f"  [STREAM EXPERT {expert_id}] x_chunk: shape={x_chunk.shape} min={x_chunk.float().min().item():.6f} max={x_chunk.float().max().item():.6f}")
             self._debug_layer3_expert0 = False  # only once
 
-        # activation fake quant: 模拟 per-block 激活量化 (按 activation_quant_type 分派)
+        # Activation QDQ follows each projection's checkpoint descriptor.
         x_for_gate = x_chunk
         x_for_up = x_chunk
         if self.activation_quant and apply_activation_quant:
-            x_for_gate = _dispatch_act_fake_quant(x_chunk, self.activation_quant_type)
-            x_for_up = _dispatch_act_fake_quant(x_chunk, self.activation_quant_type)
+            gate_activation_type = _activation_quant_for_weight(
+                g_type, self.activation_quant_type
+            )
+            up_activation_type = _activation_quant_for_weight(
+                u_type, self.activation_quant_type
+            )
+            if gate_activation_type is not None:
+                x_for_gate = _dispatch_act_fake_quant(
+                    x_chunk, gate_activation_type
+                )
+            if up_activation_type is not None:
+                x_for_up = _dispatch_act_fake_quant(x_chunk, up_activation_type)
 
         gate_out = torch.nn.functional.linear(x_for_gate, gate_fp)
         up_out = torch.nn.functional.linear(x_for_up, up_fp)
         act_out = self._apply_expert_activation(mlp, gate_out, up_out)
 
         if self.activation_quant and apply_activation_quant:
-            act_out = _dispatch_act_fake_quant(act_out, self.activation_quant_type)
+            down_activation_type = _activation_quant_for_weight(
+                d_type, self.activation_quant_type
+            )
+            if down_activation_type is not None:
+                act_out = _dispatch_act_fake_quant(
+                    act_out, down_activation_type
+                )
 
         expert_out = torch.nn.functional.linear(act_out, down_fp)
 
@@ -2309,7 +2468,8 @@ class ShardedBlockComparator:
 
     def _forward_single_expert_packed(
         self, experts_mod, eid, x_chunk, chunk_device,
-        apply_activation_quant=False,
+        apply_activation_quant=False, gate_up_quant_type="FLOAT",
+        down_quant_type="FLOAT",
     ):
         """Legacy: 从预构造的 3D packed tensor 取 expert 权重并 forward。"""
         gate_up_w = getattr(experts_mod, 'gate_up_proj', None)
@@ -2321,13 +2481,25 @@ class ShardedBlockComparator:
         intermediate_dim = down_e.shape[1]
         x_for_gate_up = x_chunk
         if self.activation_quant and apply_activation_quant:
-            x_for_gate_up = _dispatch_act_fake_quant(x_chunk, self.activation_quant_type)
+            gate_up_activation_type = _activation_quant_for_weight(
+                gate_up_quant_type, self.activation_quant_type
+            )
+            if gate_up_activation_type is not None:
+                x_for_gate_up = _dispatch_act_fake_quant(
+                    x_chunk, gate_up_activation_type
+                )
         gate_up_out = torch.nn.functional.linear(x_for_gate_up, gate_up_e)
         gate_out = gate_up_out[..., :intermediate_dim]
         up_out = gate_up_out[..., intermediate_dim:]
         act_out = torch.nn.functional.silu(gate_out) * up_out
         if self.activation_quant and apply_activation_quant:
-            act_out = _dispatch_act_fake_quant(act_out, self.activation_quant_type)
+            down_activation_type = _activation_quant_for_weight(
+                down_quant_type, self.activation_quant_type
+            )
+            if down_activation_type is not None:
+                act_out = _dispatch_act_fake_quant(
+                    act_out, down_activation_type
+                )
         expert_out = torch.nn.functional.linear(act_out, down_e)
         del gate_up_e, down_e
         return expert_out
@@ -2499,9 +2671,24 @@ class ShardedBlockComparator:
                 sf_reader, quant_desc_str, is_quant, is_ct, mlp,
                 apply_activation_quant=apply_activation_quant)
         elif is_packed:
+            gate_up_quant_type = down_quant_type = "FLOAT"
+            if is_quant and sf_reader is not None:
+                packed_keys = self._resolve_packed_expert_keys(
+                    sf_reader, expert_prefix
+                )
+                if packed_keys is not None:
+                    gate_up_key, down_key, _ = packed_keys
+                    gate_up_quant_type = self._streaming_quant_type(
+                        quant_desc_str, gate_up_key, "FLOAT"
+                    )
+                    down_quant_type = self._streaming_quant_type(
+                        quant_desc_str, down_key, gate_up_quant_type
+                    )
             expert_out = self._forward_single_expert_packed(
                 experts_mod, eid, x_chunk, chunk_device,
                 apply_activation_quant=apply_activation_quant,
+                gate_up_quant_type=gate_up_quant_type,
+                down_quant_type=down_quant_type,
             )
         elif is_module_list:
             expert_out = self._forward_single_expert_module_list(experts_mod, eid, x_chunk, chunk_device)

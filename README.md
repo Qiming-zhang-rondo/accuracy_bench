@@ -36,6 +36,14 @@ python3 run_accuracy_check.py --l2 --target_layers 11 20 33 \
   --rotation_matrix <ROT> [--mla_fine]
 ```
 
+需要把 activation quant 纳入 L1 时追加：
+
+```bash
+--activation_quant --activation_quant_type AUTO
+```
+
+`AUTO` 会读取 `quant_model_description.json`，只在 quant 侧对各权重声明的 activation 格式执行 QDQ；FLOAT、回退层和 router 等未声明算子保持原精度。缺少 descriptor 时会在模型 forward 前直接报错。显式指定 `W4A4_DYNAMIC` 等类型时，只处理使用兼容激活格式的算子。
+
 ## 定界使用实例
 
 定界回答的是“坏输出来自量化权重，还是来自部署框架”。`--quant_model` 运行 Transformers 反量化基线；提供 `--ref_model` 后还会增加 BF16/FP16 基线，用于区分量化回归与 base 模型本身行为。

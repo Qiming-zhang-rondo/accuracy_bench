@@ -1005,10 +1005,12 @@ def _load_msslim_quant_param(name: str, param, sf_reader: ShardWeightReader,
                     name, param, recovered,
                     f"inferred {inferred_type} dequantization",
                 )
+                param._acc_quant_type = inferred_type
                 return True
             _assign_param_checked(
                 name, param, weight_data.to(dtype), "FLOAT checkpoint tensor"
             )
+            param._acc_quant_type = "FLOAT"
             return True
         return False
 
@@ -1032,6 +1034,7 @@ def _load_msslim_quant_param(name: str, param, sf_reader: ShardWeightReader,
         # 已知类型但缺少 scale/bias: 静默跳过 (与原 skipped_count += 1 一致)
         return False
     _assign_param_checked(name, param, w_fp, f"{quant_type} dequantization")
+    param._acc_quant_type = quant_type
     return True
 
 

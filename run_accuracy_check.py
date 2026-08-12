@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 VALID_MODES = ("screening", "boundary", "l1", "l2", "full", "report", "inference")
 ACTIVATION_QUANT_TYPES = (
+    "AUTO",
     "W8A8_MXFP8",
     "W4A8_MXFP",
     "W4A4_MXFP4",
@@ -116,9 +117,10 @@ def parse_args():
     parser.add_argument("--activation_quant", action="store_true",
                         help="L1: 启用激活伪量化 (类型由 --activation_quant_type 指定)")
     parser.add_argument("--activation_quant_type", type=parse_activation_quant_type,
-                        default="W8A8_MXFP8",
-                        choices=["W8A8_MXFP8", "W4A8_MXFP", "W4A4_MXFP4", "W4A4_DYNAMIC"],
-                        help="L1: 激活伪量化类型 (W8A8_MXFP8/W4A8_MXFP=MXFP8 per-block; "
+                        default="AUTO",
+                        choices=["AUTO", "W8A8_MXFP8", "W4A8_MXFP", "W4A4_MXFP4", "W4A4_DYNAMIC"],
+                        help="L1: 激活伪量化类型 (AUTO=按 quant descriptor 逐算子选择; "
+                             "W8A8_MXFP8/W4A8_MXFP=MXFP8 per-block; "
                              "W4A4_MXFP4=MXFP4 E2M1 per-block; "
                              "W4A4_DYNAMIC=INT4 per-token sym; legacy "
                              "W4A4_LAOS maps to W4A4_DYNAMIC)")
