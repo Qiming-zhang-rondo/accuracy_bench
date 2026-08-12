@@ -85,6 +85,7 @@ acc_bench/
 | `--compare_mode dual\|grouped_dual` | dual=双卡分片, grouped_dual=MoE expert 跨卡 |
 | `--activation_quant` | 仅在 quant 侧启用 descriptor 驱动的激活伪量化 |
 | `--activation_quant_type AUTO\|...` | 默认按每个权重 descriptor 自动选择激活格式；显式类型只匹配兼容算子 |
+| `--activation_quant_backend auto\|npu\|torch` | W4A4 在 NPU 上默认调用原生 dynamic-quant 算子；Torch 公式路径仅用于诊断 |
 
 ---
 

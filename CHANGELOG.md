@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-08-12 — Ascend-native W4A4 activation QDQ
+
+- W4A4 dynamic activation QDQ now uses `torch_npu.npu_dynamic_quant(..., dst_type=torch.quint4x2)` for NPU tensors, then unpacks the operator result in the official low/high-nibble order before dequantization.
+- NPU execution fails closed when the native INT4 operator is unavailable; the formula-only Torch path is retained solely for CPU tests and explicit diagnostics.
+- Added `--activation_quant_backend auto|npu|torch` and exposed the same choice in the command generator. `auto` is recommended and selects the native operator on NPU.
+
 ## 2026-08-12 — CLI guide activation quant
 
 - activation fake-quant 改为 checkpoint descriptor 驱动：普通 Linear 与 streaming/packed MoE expert 只在对应权重声明兼容的 activation quant 时执行 QDQ，FLOAT、回退层和其他量化格式不再被全局误量化

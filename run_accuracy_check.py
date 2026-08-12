@@ -124,6 +124,12 @@ def parse_args():
                              "W4A4_MXFP4=MXFP4 E2M1 per-block; "
                              "W4A4_DYNAMIC=INT4 per-token sym; legacy "
                              "W4A4_LAOS maps to W4A4_DYNAMIC)")
+    parser.add_argument(
+        "--activation_quant_backend", type=str, default="auto",
+        choices=["auto", "npu", "torch"],
+        help=("L1: INT4 激活量化后端 (auto=NPU 上使用原生 "
+              "npu_dynamic_quant，CPU 上使用 Torch reference；torch 仅用于诊断)"),
+    )
     parser.add_argument("--compare_mode", type=str, default="dual",
                         choices=["dual", "grouped_dual"],
                         help="L1: 对比模式 (dual=双卡分片, grouped_dual=MoE expert跨卡)")
@@ -401,6 +407,7 @@ def run_hf_l1(args, ref_device, target_device, dtype):
         l1_target_layers=args.l1_target_layers,
         activation_quant=args.activation_quant,
         activation_quant_type=args.activation_quant_type,
+        activation_quant_backend=args.activation_quant_backend,
         compare_mode=getattr(args, 'compare_mode', 'dual'),
         ref_devices=_parse_dev_list(getattr(args, 'ref_devices', None)),
         quant_devices=_parse_dev_list(getattr(args, 'quant_devices', None)),

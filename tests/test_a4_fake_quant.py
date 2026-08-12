@@ -17,7 +17,11 @@ import pytest
 import torch
 
 from accuracy_checker.mxfp4_fake_quant import mxfp4_fake_quant_per_block, E2M1_MAX
-from accuracy_checker.int4_fake_quant import int4_fake_quant_per_token_sym, INT4_MAX
+from accuracy_checker.int4_fake_quant import (
+    INT4_MAX,
+    _unpack_npu_int4,
+    int4_fake_quant_per_token_sym,
+)
 from accuracy_checker.layer1_block_compare import _dispatch_act_fake_quant
 
 # E2M1 可表示正值 (与 model_loader.py E2M1_VALUES 一致)
@@ -142,6 +146,27 @@ class TestMXFP4:
 # ===========================================================================
 
 class TestINT4:
+
+    def test_npu_quint4x2_unpack_matches_official_nibble_order(self):
+        values = torch.tensor([
+            [-8, -7, -1, 0, 1, 2, 6, 7],
+            [7, 6, 2, 1, 0, -1, -7, -8],
+        ], dtype=torch.int8)
+        flat = values.reshape(-1).to(torch.int16)
+        low = flat[0::2] & 0x0F
+        high = (flat[1::2] & 0x0F) << 4
+        packed = (low | high).to(torch.uint8).contiguous().view(torch.int32)
+
+        actual = _unpack_npu_int4(packed, values.shape)
+        torch.testing.assert_close(actual, values)
+
+    def test_npu_backend_rejects_cpu_tensor(self):
+        with pytest.raises(ValueError, match="requires an NPU tensor"):
+            int4_fake_quant_per_token_sym(torch.randn(2, 8), backend="npu")
+
+    def test_unknown_backend_fails_closed(self):
+        with pytest.raises(ValueError, match="unsupported INT4 activation backend"):
+            int4_fake_quant_per_token_sym(torch.randn(2, 8), backend="guess")
 
     def test_output_values_in_int4_set(self):
         """所有输出值 / scale 必须落在 {-8..7} 整数集"""

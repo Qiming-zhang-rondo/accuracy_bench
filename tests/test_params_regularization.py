@@ -154,6 +154,16 @@ def test_activation_quant_type_added():
     assert found, "--activation_quant_type 参数未找到"
 
 
+def test_activation_quant_backend_defaults_to_native_auto():
+    calls = _get_add_argument_calls(_parse_run_script())
+    for name, kwargs in calls:
+        if name == "--activation_quant_backend":
+            assert kwargs.get("default") == "auto"
+            assert set(kwargs.get("choices", [])) == {"auto", "npu", "torch"}
+            return
+    raise AssertionError("--activation_quant_backend 参数未找到")
+
+
 def test_kimi_kda_backend_added():
     """Kimi K3 exposes an Ascend-safe KDA backend policy."""
     calls = _get_add_argument_calls(_parse_run_script())

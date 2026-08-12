@@ -87,6 +87,11 @@ class TestCliGuide(unittest.TestCase):
             'args.push(line("--activation_quant_type", el.activationQuantType.value))',
             self.html,
         )
+        self.assertIn('id="activationQuantBackend"', self.html)
+        self.assertIn(
+            'args.push(line("--activation_quant_backend", el.activationQuantBackend.value))',
+            self.html,
+        )
         self.assertIn("按 checkpoint descriptor 逐算子选择", self.html)
         self.assertIn("ref 始终保持原始精度", self.html)
 

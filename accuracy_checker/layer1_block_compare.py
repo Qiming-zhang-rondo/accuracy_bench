@@ -93,7 +93,7 @@ def _canonical_activation_quant_type(quant_type: str) -> str:
     return normalized
 
 
-def _dispatch_act_fake_quant(x, quant_type: str):
+def _dispatch_act_fake_quant(x, quant_type: str, backend: str = "auto"):
     """Apply the canonical activation QDQ path without changing its contract."""
     quant_type = _canonical_activation_quant_type(quant_type)
     if quant_type == "AUTO":
@@ -106,7 +106,7 @@ def _dispatch_act_fake_quant(x, quant_type: str):
         result = mxfp4_fake_quant_per_block(x)
     elif quant_type == "W4A4_DYNAMIC":
         from .int4_fake_quant import int4_fake_quant_per_token_sym
-        result = int4_fake_quant_per_token_sym(x)
+        result = int4_fake_quant_per_token_sym(x, backend=backend)
     elif quant_type in ("W8A8_DYNAMIC", "W4A8_DYNAMIC", "W8A8", "W4A8"):
         from .int8_fake_quant import int8_fake_quant_per_token_sym
         result = int8_fake_quant_per_token_sym(x)
@@ -208,11 +208,11 @@ def _lookup_linear_quant_descriptor(quant_desc: Optional[dict],
     return None
 
 
-def _make_act_fake_quant_hook(quant_type: str):
+def _make_act_fake_quant_hook(quant_type: str, backend: str = "auto"):
     """构造捕获 quant_type 的 pre-forward hook (闭包)。"""
     def _hook(module, input):
         x = input[0]
-        x_fq = _dispatch_act_fake_quant(x, quant_type)
+        x_fq = _dispatch_act_fake_quant(x, quant_type, backend=backend)
         return (x_fq,) + input[1:]
     return _hook
 
@@ -296,6 +296,7 @@ class ShardedBlockComparator:
         kimi_kda_backend: str = "auto",
         activation_quant: bool = False,
         activation_quant_type: str = "AUTO",
+        activation_quant_backend: str = "auto",
         # Full logits capture on the L1 forward pass (no extra model reload).
         # Default on; compare_logits 4-panel data feeds ReportData.logits.
         collect_full_logits: bool = True,
@@ -338,6 +339,12 @@ class ShardedBlockComparator:
         self.activation_quant_type = _canonical_activation_quant_type(
             activation_quant_type
         )
+        activation_quant_backend = str(activation_quant_backend).strip().lower()
+        if activation_quant_backend not in {"auto", "npu", "torch"}:
+            raise ValueError(
+                "activation_quant_backend must be auto, npu, or torch"
+            )
+        self.activation_quant_backend = activation_quant_backend
         self.collect_full_logits = collect_full_logits
         self.logits_max_positions = logits_max_positions
         self._activation_hooks = []  # track registered hooks for cleanup
@@ -1834,19 +1841,31 @@ class ShardedBlockComparator:
                 # _streaming_expert_forward. Materialized ModuleList experts
                 # need hooks just like any other quant-side Linear.
                 h = mod.register_forward_pre_hook(
-                    _make_act_fake_quant_hook(activation_type)
+                    _make_act_fake_quant_hook(
+                        activation_type,
+                        backend=getattr(self, "activation_quant_backend", "auto"),
+                    )
                 )
                 self._activation_hooks.append(h)
         added_count = len(self._activation_hooks) - previous_count
         if self.verbose:
+            requested_backend = getattr(self, "activation_quant_backend", "auto")
+            resolved_backend = requested_backend
+            if requested_backend == "auto":
+                resolved_backend = (
+                    "npu_dynamic_quant"
+                    if str(self.actual_quant_device).split(":", 1)[0] == "npu"
+                    else "torch"
+                )
             logger.info(
                 "  [ACT FAKE QUANT] registered %d descriptor-matched hooks "
                 "on quant side (requested=%s, skipped unquantized=%d, "
-                "other activation scheme=%d, active total=%d)",
+                "other activation scheme=%d, backend=%s, active total=%d)",
                 added_count,
                 self.activation_quant_type,
                 skipped_unquantized,
                 skipped_other_scheme,
+                resolved_backend,
                 len(self._activation_hooks),
             )
 
@@ -2204,10 +2223,14 @@ class ShardedBlockComparator:
             )
             if gate_activation_type is not None:
                 x_for_gate = _dispatch_act_fake_quant(
-                    x_chunk, gate_activation_type
+                    x_chunk, gate_activation_type,
+                    backend=getattr(self, "activation_quant_backend", "auto"),
                 )
             if up_activation_type is not None:
-                x_for_up = _dispatch_act_fake_quant(x_chunk, up_activation_type)
+                x_for_up = _dispatch_act_fake_quant(
+                    x_chunk, up_activation_type,
+                    backend=getattr(self, "activation_quant_backend", "auto"),
+                )
 
         gate_out = torch.nn.functional.linear(x_for_gate, gate_fp)
         up_out = torch.nn.functional.linear(x_for_up, up_fp)
@@ -2219,7 +2242,8 @@ class ShardedBlockComparator:
             )
             if down_activation_type is not None:
                 act_out = _dispatch_act_fake_quant(
-                    act_out, down_activation_type
+                    act_out, down_activation_type,
+                    backend=getattr(self, "activation_quant_backend", "auto"),
                 )
 
         expert_out = torch.nn.functional.linear(act_out, down_fp)
@@ -2486,7 +2510,8 @@ class ShardedBlockComparator:
             )
             if gate_up_activation_type is not None:
                 x_for_gate_up = _dispatch_act_fake_quant(
-                    x_chunk, gate_up_activation_type
+                    x_chunk, gate_up_activation_type,
+                    backend=getattr(self, "activation_quant_backend", "auto"),
                 )
         gate_up_out = torch.nn.functional.linear(x_for_gate_up, gate_up_e)
         gate_out = gate_up_out[..., :intermediate_dim]
@@ -2498,7 +2523,8 @@ class ShardedBlockComparator:
             )
             if down_activation_type is not None:
                 act_out = _dispatch_act_fake_quant(
-                    act_out, down_activation_type
+                    act_out, down_activation_type,
+                    backend=getattr(self, "activation_quant_backend", "auto"),
                 )
         expert_out = torch.nn.functional.linear(act_out, down_e)
         del gate_up_e, down_e

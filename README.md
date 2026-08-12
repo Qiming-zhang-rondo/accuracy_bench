@@ -44,6 +44,8 @@ python3 run_accuracy_check.py --l2 --target_layers 11 20 33 \
 
 `AUTO` 会读取 `quant_model_description.json`，只在 quant 侧对各权重声明的 activation 格式执行 QDQ；FLOAT、回退层和 router 等未声明算子保持原精度。缺少 descriptor 时会在模型 forward 前直接报错。显式指定 `W4A4_DYNAMIC` 等类型时，只处理使用兼容激活格式的算子。
 
+W4A4_DYNAMIC 在 NPU 上默认通过 `torch_npu.npu_dynamic_quant(..., dst_type=torch.quint4x2)` 复现部署算子的 INT4 舍入和打包，再做 QDQ 对比；`--activation_quant_backend torch` 仅用于 CPU 自检或算子差异诊断，不建议作为 NPU 精度结论。
+
 ## 定界使用实例
 
 定界回答的是“坏输出来自量化权重，还是来自部署框架”。`--quant_model` 运行 Transformers 反量化基线；提供 `--ref_model` 后还会增加 BF16/FP16 基线，用于区分量化回归与 base 模型本身行为。

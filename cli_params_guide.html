@@ -775,6 +775,15 @@
               </select>
               <span class="hint">推荐 AUTO：只量化 descriptor 明确声明了 activation quant 的 quant 侧算子；FLOAT、回退层和不匹配的量化类型不会被全局误量化。显式类型用于只验证指定激活格式。</span>
             </div>
+            <div id="activationQuantBackendField">
+              <label for="activationQuantBackend">INT4 激活后端 <span class="optional">L1 / full</span></label>
+              <select id="activationQuantBackend">
+                <option value="auto">auto · NPU 原生算子（推荐）</option>
+                <option value="npu">npu · 强制 npu_dynamic_quant</option>
+                <option value="torch">torch · 公式模拟，仅诊断</option>
+              </select>
+              <span class="hint">auto 在 NPU 上直接调用 <code>npu_dynamic_quant(..., quint4x2)</code>，复现部署侧 INT4 舍入与打包；CPU 自检才使用 Torch reference。</span>
+            </div>
             <div id="targetLayersField" class="hidden" aria-hidden="true">
               <label for="targetLayers">L2 目标层 <span class="optional">逗号分隔；留空自动扫描 cache</span></label>
               <input id="targetLayers" type="text" autocomplete="off" placeholder="例如 27,31,38；或留空">
@@ -939,6 +948,7 @@
             <tr><td><code>--mla_fine</code> / <code>--no_mla_fine</code></td><td>开启</td><td>控制 L2 MLA attention 的细粒度拆分。</td></tr>
             <tr><td><code>--activation_quant</code></td><td>false</td><td>仅在 L1 quant 侧启用 descriptor 驱动的激活伪量化；ref 始终保持原始精度。</td></tr>
             <tr><td><code>--activation_quant_type</code></td><td>AUTO</td><td>AUTO 按每个权重的 descriptor 自动选择；也可显式指定 W8A8_MXFP8 / W4A8_MXFP / W4A4_MXFP4 / W4A4_DYNAMIC。</td></tr>
+            <tr><td><code>--activation_quant_backend</code></td><td>auto</td><td>W4A4_DYNAMIC 在 NPU 上默认使用原生 npu_dynamic_quant；torch 仅用于无 NPU 自检或算子差异诊断。</td></tr>
             <tr><td><code>--compare_mode</code></td><td>dual</td><td>dual / grouped_dual；MoE 推荐 grouped_dual，DSpark 必须 dual。</td></tr>
             <tr><td><code>--ref_devices</code></td><td>空</td><td>grouped_dual 的 ref 多卡列表，例如 npu:0,1。</td></tr>
             <tr><td><code>--quant_devices</code></td><td>空</td><td>grouped_dual 的 quant 多卡列表，例如 npu:2,3。</td></tr>
@@ -975,7 +985,7 @@
         "refModel", "quantModel", "mode", "modelType", "visibleDevices",
         "modelSizeB", "perDeviceMemory", "refDevices", "quantDevices",
         "compareMode", "kimiKdaBackend", "layersPerShard",
-        "quantMethod", "dtype", "activationQuantType", "cacheTopK", "cacheDir", "mlaFine",
+        "quantMethod", "dtype", "activationQuantType", "activationQuantBackend", "cacheTopK", "cacheDir", "mlaFine",
         "outputDir", "prompt",
         "dsparkSample", "dsparkSeed", "dsparkAnchors", "rotationMatrix",
         "targetLayers", "expertChunkSize", "frameworkBadOutput"
@@ -1131,6 +1141,7 @@
         setFieldVisibility("perDeviceMemoryField", l1Flow && !dspark);
         setFieldVisibility("quantMethodField", l1Flow || l2Flow);
         setFieldVisibility("activationQuantField", l1Flow && !dspark);
+        setFieldVisibility("activationQuantBackendField", l1Flow && !dspark && !!el.activationQuantType.value);
         setFieldVisibility("cacheTopKField", l1Flow && !dspark);
         setFieldVisibility("cacheDirField", (l1Flow || l2Flow) && !dspark);
         setFieldVisibility("targetLayersField", l2Flow);
@@ -1333,7 +1344,7 @@
         }
         if (["l1", "full"].indexOf(mode) !== -1 && type === "kimi_k3") addStatus("KDA backend=" + el.kimiKdaBackend.value + "；auto 在 Ascend 上使用无 Triton 依赖的 torch recurrence", "ok");
         if (el.activationQuantType.value && ["l1", "full"].indexOf(mode) !== -1 && type !== "dspark") {
-          addStatus("已启用激活伪量化：" + el.activationQuantType.value, "ok");
+          addStatus("已启用激活伪量化：" + el.activationQuantType.value + "；backend=" + el.activationQuantBackend.value, "ok");
         }
         if (!dspark && ["l1", "l2", "full"].indexOf(mode) !== -1 && el.rotationMatrix.value.trim()) addStatus("已加入 rotation_matrix；请确认 ref/quant 旋转契约一致", "ok");
         else if (["l1", "l2", "full"].indexOf(mode) !== -1) addStatus("未使用旋转矩阵：适用于非旋转量化或 R 已融合 checkpoint", "");
@@ -1372,6 +1383,7 @@
         el.compareMode.disabled = dspark;
         el.quantMethod.disabled = dspark;
         el.activationQuantType.disabled = dspark || ["l1", "full"].indexOf(mode) === -1;
+        el.activationQuantBackend.disabled = el.activationQuantType.disabled || !el.activationQuantType.value;
         if (dspark) {
           el.mode.value = "l1";
           el.compareMode.value = "dual";
@@ -1412,6 +1424,7 @@
             if (el.activationQuantType.value) {
               args.push(line("--activation_quant"));
               args.push(line("--activation_quant_type", el.activationQuantType.value));
+              args.push(line("--activation_quant_backend", el.activationQuantBackend.value));
             }
             if (el.expertChunkSize.value) args.push(line("--expert_chunk_size", el.expertChunkSize.value));
             if (type === "kimi_k3") args.push(line("--kimi_kda_backend", el.kimiKdaBackend.value));
