@@ -31,6 +31,7 @@ from .utils import parse_base_name, normalize_quant_desc_keys, normalize_quant_t
 import logging
 
 logger = logging.getLogger(__name__)
+_INFERRED_QUANT_WARNINGS = set()
 
 # ============================================================================
 # 运行时注册 glm_moe_dsa (transformers < 5.5 可能没有)
@@ -987,11 +988,19 @@ def _load_msslim_quant_param(name: str, param, sf_reader: ShardWeightReader,
                         "as FLOAT and its quantization format could not be "
                         "inferred safely; fix quant_model_description.json"
                     )
-                logger.warning(
+                projection = weight_key.rsplit('.', 2)[-2]
+                warning_key = (inferred_type, projection)
+                log = (
+                    logger.warning
+                    if warning_key not in _INFERRED_QUANT_WARNINGS
+                    else logger.debug
+                )
+                log(
                     "quant descriptor missing for %s; inferred %s from "
                     "checkpoint metadata and model shape",
                     weight_key, inferred_type,
                 )
+                _INFERRED_QUANT_WARNINGS.add(warning_key)
                 _assign_param_checked(
                     name, param, recovered,
                     f"inferred {inferred_type} dequantization",

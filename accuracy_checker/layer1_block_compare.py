@@ -1661,6 +1661,7 @@ class ShardedBlockComparator:
         """在指定层的所有 nn.Linear (除 router/gate 外) 上注册 MXFP8 激活伪量化 hook。"""
         if not self.activation_quant:
             return
+        previous_count = len(self._activation_hooks)
         from .utils import get_decoder_layers
         decoder_layers = get_decoder_layers(model)
         for i in layers:
@@ -1680,8 +1681,13 @@ class ShardedBlockComparator:
                     continue
                 h = mod.register_forward_pre_hook(_make_act_fake_quant_hook(self.activation_quant_type))
                 self._activation_hooks.append(h)
-        if self.verbose and self._activation_hooks:
-            logger.info(f"  [ACT FAKE QUANT] 注册了 {len(self._activation_hooks)} 个 {self.activation_quant_type} 激活伪量化 hook")
+        added_count = len(self._activation_hooks) - previous_count
+        if self.verbose and added_count:
+            logger.info(
+                f"  [ACT FAKE QUANT] 本侧注册 {added_count} 个 "
+                f"{self.activation_quant_type} hook "
+                f"(ref+quant 当前合计 {len(self._activation_hooks)})"
+            )
 
     def _clear_activation_quant_hooks(self):
         """移除所有激活伪量化 hook。"""
