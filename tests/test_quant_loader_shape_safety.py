@@ -229,3 +229,23 @@ def test_shared_expert_shape_guard_reports_before_matmul():
         ShardedBlockComparator._forward_shared_expert(
             mlp, torch.randn(1, 3, 8)
         )
+
+
+def test_qwen35_shared_expert_uses_token_wise_sigmoid_gate():
+    """grouped_dual must match Qwen3.5's native shared-expert formula."""
+    mlp = nn.Module()
+    mlp.shared_expert = nn.Linear(3, 3, bias=False)
+    mlp.shared_expert_gate = nn.Linear(3, 1, bias=False)
+    with torch.no_grad():
+        mlp.shared_expert.weight.copy_(torch.eye(3))
+        mlp.shared_expert_gate.weight.copy_(torch.tensor([[1.0, -0.5, 0.25]]))
+
+    hidden = torch.tensor([[[1.0, 2.0, -1.0], [-2.0, 0.5, 3.0]]])
+    expected = (
+        torch.sigmoid(mlp.shared_expert_gate(hidden))
+        * mlp.shared_expert(hidden)
+    )
+
+    actual = ShardedBlockComparator._forward_shared_expert(mlp, hidden)
+
+    torch.testing.assert_close(actual, expected)

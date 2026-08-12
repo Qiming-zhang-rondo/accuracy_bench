@@ -53,12 +53,17 @@ class LogitsCollection:
     token_positions: List[int]
     logits: torch.Tensor            # [num_positions, vocab_size]
     input_ids: Optional[torch.Tensor] = None  # 完整 prompt+生成 ids
+    # generation: each row is one autoregressive decode step.
+    # prompt_prefill: rows are teacher-forced predictions inside the prompt;
+    #                 the final row predicts the first decode token.
+    position_mode: str = "generation"
 
     def to(self, *args, **kwargs):  # noqa: D401 - 便捷搬运
         return LogitsCollection(
             token_positions=list(self.token_positions),
             logits=self.logits.to(*args, **kwargs),
             input_ids=None if self.input_ids is None else self.input_ids.to(*args, **kwargs),
+            position_mode=self.position_mode,
         )
 
     @property
@@ -145,6 +150,7 @@ def collect_last_logits(model, tokenizer, prompt: str, device: str = "cpu",
 class LogitsComparison:
     """ref vs quant logits 对比结果 (含 4 类可视化数据)"""
     token_positions: List[int] = field(default_factory=list)
+    position_mode: str = "unknown"
     ref_topk: List[List[TokenProb]] = field(default_factory=list)
     quant_topk: List[List[TokenProb]] = field(default_factory=list)
     ref_argmax_logits: List[float] = field(default_factory=list)       # 每 position ref argmax logit
@@ -163,6 +169,7 @@ class LogitsComparison:
         """转成 report_schema.LogitsData (供 HTML 报告直接消费)。"""
         return LogitsData(
             token_positions=list(self.token_positions),
+            position_mode=self.position_mode,
             ref_topk=[list(pos) for pos in self.ref_topk],
             quant_topk=[list(pos) for pos in self.quant_topk],
             ref_logits=list(self.ref_argmax_logits),
@@ -235,7 +242,18 @@ def compare_logits(ref: LogitsCollection, quant: LogitsCollection,
     ref_logits = ref_logits[:n, :vocab]
     quant_logits = quant_logits[:n, :vocab]
 
-    positions: List[int] = list(range(n))
+    ref_positions = list(ref.token_positions[:n])
+    quant_positions = list(quant.token_positions[:n])
+    positions: List[int] = (
+        ref_positions
+        if len(ref_positions) == n and ref_positions == quant_positions
+        else list(range(n))
+    )
+    position_mode = (
+        ref.position_mode
+        if ref.position_mode == quant.position_mode
+        else "unknown"
+    )
     ref_topk: List[List[TokenProb]] = []
     quant_topk: List[List[TokenProb]] = []
     ref_argmax: List[float] = []
@@ -245,7 +263,7 @@ def compare_logits(ref: LogitsCollection, quant: LogitsCollection,
     t_overlap: List[Optional[float]] = []
     t_top1: List[bool] = []
 
-    for i in positions:
+    for i in range(n):
         r_row = ref_logits[i]
         q_row = quant_logits[i]
         r_ids, r_p = _topk_prob(r_row, top_k)
@@ -294,6 +312,7 @@ def compare_logits(ref: LogitsCollection, quant: LogitsCollection,
 
     return LogitsComparison(
         token_positions=positions,
+        position_mode=position_mode,
         ref_topk=ref_topk,
         quant_topk=quant_topk,
         ref_argmax_logits=ref_argmax,

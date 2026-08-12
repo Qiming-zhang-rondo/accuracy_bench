@@ -874,10 +874,13 @@ function appendChart(root,s){const w=document.createElement("div");w.className="
 // ====================================================================
 // LOGITS 可视化
 // ====================================================================
-let curPos=0;
+let curPos=-1;
 function renderLogits(){
   const root=el("logits");const L=R.logits;
   if(!L||!L.token_positions||!L.token_positions.length){root.innerHTML='<div class="empty"><div class="empty-icon">—</div><div class="empty-text">未采集 logits 对比</div><div class="empty-hint">NPU 内存不足时跳过; 用 --collect-logits 采集</div></div>';return;}
+  if(curPos<0||curPos>=L.token_positions.length){
+    curPos=L.position_mode==="prompt_prefill"?L.token_positions.length-1:0;
+  }
   root.innerHTML='<div class="grid" style="grid-template-columns:1fr"><div id="logits_scatter"></div>'
     +'<div id="logits_topk"></div><div id="logits_lines"></div><div id="logits_hist"></div></div>';
   renderScatter();renderLines();renderHist();renderTopK(curPos);
@@ -925,7 +928,7 @@ function renderLines(){
     mk.setAttribute("onclick","__selPos("+i+")");s.appendChild(mk);
     const tx=E("text",{x:X(i),y:H-m+14,"text-anchor":"middle",class:"axis","font-size":"8"});tx.textContent=p;s.appendChild(tx);});
   s.appendChild(E("line",{x1:m,y1:H-m,x2:W-m,y2:H-m,stroke:C.border}));s.appendChild(E("line",{x1:m,y1:m,x2:m,y2:H-m,stroke:C.border}));
-  const tt=E("text",{x:W/2,y:H-2,"text-anchor":"middle",class:"axis"});tt.textContent="生成 position";s.appendChild(tt);
+  const tt=E("text",{x:W/2,y:H-2,"text-anchor":"middle",class:"axis"});tt.textContent=L.position_mode==="prompt_prefill"?"Prompt token position":"Decode step";s.appendChild(tt);
   root.innerHTML='<div class="card"><h3>Token-wise 指标折线 '+hIcon("token_wise_cos")+hIcon("topk_overlap")+hIcon("token_wise_kl")+'</h3></div>';
   appendChart(root,s);
   const lg=document.createElement("div");lg.className="tip";lg.innerHTML=
@@ -952,6 +955,9 @@ function avgKL(){const k=R.logits.token_wise_kl||[];const f=k.map(x=>num(x)).fil
 function renderTopK(i){
   const root=el("logits_topk");if(!root)return;const L=R.logits;if(!L.ref_topk||!L.ref_topk[i]){root.innerHTML="";return;}
   curPos=i;
+  const pos=L.token_positions[i]===undefined?i:L.token_positions[i];
+  const isFirstDecode=L.position_mode==="prompt_prefill"&&i===L.token_positions.length-1;
+  const role=L.position_mode==="prompt_prefill"?(isFirstDecode?"首个 Decode Token":"Prompt 内 next-token 预测"):(L.position_mode==="generation"?"Decode step":"Token position");
   const rf=L.ref_topk[i]||[];const qf=L.quant_topk[i]||[];
   // merge by token_id: 同一 token 取 ref_prob 与 quant_prob 并排
   const map={};const order=[];
@@ -962,7 +968,7 @@ function renderTopK(i){
   const maxp=Math.max(...rows.map(t=>Math.max(num(t.ref_prob)||0,num(t.quant_prob)||0)),0.001);
   const X=v=>mL+(W-mL-mR)*v/maxp;
   const s=svgBox(W,H);
-  const t1=E("text",{x:mL,y:12,"text-anchor":"start",class:"axis"});t1.textContent="Position "+(L.token_positions[i]||i)+" — Top-K 概率 (蓝=ref, 橙=quant)";s.appendChild(t1);
+  const t1=E("text",{x:mL,y:12,"text-anchor":"start",class:"axis"});t1.textContent="Position "+pos+" · "+role+" — Top-K 概率 (蓝=ref, 橙=quant)";s.appendChild(t1);
   rows.forEach((t,r)=>{const y=mT+r*h;
     const rp=num(t.ref_prob),qp=num(t.quant_prob);
     const lblClean=(t.token_str||'').replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\x00-\x1f\x7f]/g,'').trim();
@@ -985,7 +991,7 @@ function renderTopK(i){
   const card=document.createElement("div");
   card.className="card";
   card.innerHTML='<h3>Top-K 概率并排 '+hIcon("top1_match")+' <span class="'+summaryCls+'">'+summaryBadge+'</span></h3>'
-    +'<div class="tip">Position '+(L.token_positions[i]||i)+' — 当前: '+matchBadge+' · 蓝(粗)=ref 概率 · 橙(细)=quant 概率 · 点击折线节点切换</div>';
+    +'<div class="tip">Position '+pos+' · '+role+' — 当前: '+matchBadge+' · 蓝(粗)=ref 概率 · 橙(细)=quant 概率 · 点击折线节点切换</div>';
   root.innerHTML="";
   root.appendChild(card);
   appendChart(card,s);
@@ -1020,7 +1026,7 @@ function goto(id){const e=el(id);if(e){e.scrollIntoView({behavior:"smooth",block
 window.__selectL2=function(idx){const root=el("l2");if(!root)return;const c=root.querySelector('.l2layer[data-layer="'+idx+'"]');
   if(!c){goto("l2");return;}c.scrollIntoView({behavior:"smooth",block:"start"});c.classList.add("jump-target");
   window.setTimeout(()=>c.classList.remove("jump-target"),1400);}
-window.__selPos=function(i){renderTopK(i);}
+window.__selPos=function(i){renderTopK(i);renderLines();}
 // scroll-spy: highlight nav based on visible section
 function initScrollSpy(){
   const links=document.querySelectorAll('.nav a');

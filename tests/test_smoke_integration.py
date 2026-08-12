@@ -312,6 +312,24 @@ class TestLogitsCompare:
         ld = comp.to_logits_data()
         assert isinstance(ld, LogitsData)
         assert ld.token_positions == [0, 1, 2]
+        assert ld.position_mode == "generation"
+
+    def test_compare_preserves_prompt_positions_and_mode(self):
+        ref = LogitsCollection(
+            token_positions=[7, 8, 9],
+            logits=torch.randn(3, 20),
+            position_mode="prompt_prefill",
+        )
+        quant = LogitsCollection(
+            token_positions=[7, 8, 9],
+            logits=torch.randn(3, 20),
+            position_mode="prompt_prefill",
+        )
+
+        comp = compare_logits(ref, quant, _FakeTokenizer(), top_k=5)
+
+        assert comp.token_positions == [7, 8, 9]
+        assert comp.position_mode == "prompt_prefill"
 
     def test_identical_logits_top1_match(self):
         lc = self._collection(42)
@@ -441,7 +459,8 @@ class TestCollectFullLogits:
         ld = cmp._collect_full_logits(ref_model, quant_model, ref_hs, quant_hs)
         # sanity: returned a LogitsData with N positions (capped to max_positions=3)
         assert isinstance(ld, LogitsData)
-        assert ld.token_positions == [0, 1, 2]   # last 3 positions of the 5-token seq
+        assert ld.token_positions == [2, 3, 4]   # absolute last 3 positions of seq=5
+        assert ld.position_mode == "prompt_prefill"
         assert len(ld.token_wise_cos) == 3
         assert len(ld.ref_topk) == 3 and len(ld.quant_topk) == 3
         # scatter + histogram data populated (compare_logits contract)
@@ -578,7 +597,8 @@ class TestCollectFullLogits:
         )
         rd = assemble_report(l1_report=rep, model_name="ut-model")
         assert rd.logits is not None
-        assert rd.logits.token_positions == [0, 1, 2]
+        assert rd.logits.token_positions == [2, 3, 4]
+        assert rd.logits.position_mode == "prompt_prefill"
         # assemble_report routes the data through, so L1's logits panel data is in ReportData
 
 

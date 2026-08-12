@@ -1212,8 +1212,23 @@ class ShardedBlockComparator:
                 ref_hidden_states, quant_hidden_states,
                 ref_norm_mod, quant_norm_mod,
                 ref_head_w, quant_head_w, max_positions)
-            ref_c = LogitsCollection(token_positions=list(range(N)), logits=ref_logits_np)
-            quant_c = LogitsCollection(token_positions=list(range(N)), logits=quant_logits_np)
+            # These rows are teacher-forced next-token predictions for the
+            # last N prompt positions.  Preserve their absolute prompt token
+            # indices so HTML does not mistake the first captured row for
+            # decode step 0.  The final row predicts the first generated token.
+            seq_len = int(ref_hidden_states.shape[1])
+            start_position = max(0, seq_len - N)
+            positions = list(range(start_position, start_position + N))
+            ref_c = LogitsCollection(
+                token_positions=positions,
+                logits=ref_logits_np,
+                position_mode="prompt_prefill",
+            )
+            quant_c = LogitsCollection(
+                token_positions=positions,
+                logits=quant_logits_np,
+                position_mode="prompt_prefill",
+            )
             if self.verbose:
                 logger.info(f"[L1 logits] full logits 采集完成: {N} positions × "
                             f"{ref_logits_np.shape[1]} vocab → compare_logits")
@@ -2488,7 +2503,23 @@ class ShardedBlockComparator:
                 )
         with torch.no_grad():
             shared_out = shared_expert(hidden_states)
-            return shared_out[0] if isinstance(shared_out, tuple) else shared_out
+            shared_out = shared_out[0] if isinstance(shared_out, tuple) else shared_out
+
+            # Qwen3.5/3.6 MoE does not add the always-on shared expert
+            # directly.  Its checkpoint contains ``shared_expert_gate`` and
+            # the native forward applies a token-wise sigmoid gate before the
+            # shared branch is merged with routed experts:
+            #
+            #   sigmoid(shared_expert_gate(x)) * shared_expert(x)
+            #
+            # grouped_dual replaces the native MoE forward on both ref and
+            # quant sides, so omitting this gate makes both sides agree with
+            # each other while silently drifting away from the real model.
+            shared_gate = getattr(mlp, 'shared_expert_gate', None)
+            if shared_gate is not None:
+                gate = torch.sigmoid(shared_gate(hidden_states).float())
+                shared_out = shared_out * gate.to(shared_out.dtype)
+            return shared_out
 
     def _forward_single_expert_packed(
         self, experts_mod, eid, x_chunk, chunk_device,

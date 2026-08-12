@@ -129,6 +129,9 @@ class TokenProb:
 class LogitsData:
     """生成序列逐位置 logits 对比 (驱动 4 类可视化: topk 并排柱 / scatter / token-wise 折线 / 直方图)"""
     token_positions: List[int] = field(default_factory=list)
+    # generation: autoregressive decode steps; prompt_prefill: prompt token
+    # positions whose final row predicts the first generated token.
+    position_mode: str = "unknown"
     ref_topk: List[List[TokenProb]] = field(default_factory=list)   # 每 position top-k (并排柱状图原料)
     quant_topk: List[List[TokenProb]] = field(default_factory=list)
     ref_logits: List[float] = field(default_factory=list)            # 每 position ref argmax logit (折线)
@@ -284,6 +287,7 @@ def _build_logits(d: Optional[Dict[str, Any]]) -> Optional[LogitsData]:
         return None
     return LogitsData(
         token_positions=list(d.get("token_positions") or []),
+        position_mode=str(d.get("position_mode") or "unknown"),
         ref_topk=[[_build_token_prob(x) for x in pos] for pos in d.get("ref_topk") or []],
         quant_topk=[[_build_token_prob(x) for x in pos] for pos in d.get("quant_topk") or []],
         ref_logits=list(d.get("ref_logits") or []),

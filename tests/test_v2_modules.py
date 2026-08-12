@@ -176,6 +176,9 @@ class TestHtmlReportV2:
         assert "@media print" in html
         assert "chart-scroll" in html
         assert "table-scroll" in html
+        assert "let curPos=-1" in html
+        assert 'L.position_mode==="prompt_prefill"' in html
+        assert "首个 Decode Token" in html
         # Metric help is keyboard-focusable rather than a click-only span.
         assert "<button type='button' class='help'" in html
         assert 'aria-label="指标说明"' in html

@@ -55,7 +55,7 @@ class TopKCompareResult:
         quant_tokens = str(self.quant_topk_ids[:self.top_k])
         match_str = f"{self.match_count}/{self.top_k}"
         top1 = "YES" if self.top1_match else "NO"
-        result = (f"  Top-K Token: top-{self.top_k} match={match_str}, "
+        result = (f"  First Decode Token Top-K: top-{self.top_k} match={match_str}, "
                 f"top-1 match={top1}, logits_cos_sim={self.logits_cos_sim:.6f}\n"
                 f"    ref_topk={ref_tokens}\n"
                 f"    quant_topk={quant_tokens}\n"
