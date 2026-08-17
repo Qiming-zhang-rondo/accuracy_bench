@@ -37,14 +37,31 @@ ACTIVATION_QUANT_TYPES = (
     "W4A8_MXFP",
     "W4A4_MXFP4",
     "W4A4_DYNAMIC",
+    "W4A4_INT4_PER_GROUP",
 )
-ACTIVATION_QUANT_ALIASES = {"W4A4_LAOS": "W4A4_DYNAMIC"}
+ACTIVATION_QUANT_ALIASES = {
+    "W4A4_LAOS": "W4A4_DYNAMIC",
+    "INT4_PER_GROUP": "W4A4_INT4_PER_GROUP",
+    "W4A4_PER_GROUP": "W4A4_INT4_PER_GROUP",
+    "W4A4_INT4_PERGROUP": "W4A4_INT4_PER_GROUP",
+}
 
 
 def parse_activation_quant_type(value: str) -> str:
     """Normalize legacy activation-only aliases before argparse choices."""
     normalized = value.strip().upper()
     return ACTIVATION_QUANT_ALIASES.get(normalized, normalized)
+
+
+def parse_positive_int(value: str) -> int:
+    """Argparse type for strictly positive integer parameters."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def parse_args():
@@ -118,17 +135,23 @@ def parse_args():
                         help="L1: 启用激活伪量化 (类型由 --activation_quant_type 指定)")
     parser.add_argument("--activation_quant_type", type=parse_activation_quant_type,
                         default="AUTO",
-                        choices=["AUTO", "W8A8_MXFP8", "W4A8_MXFP", "W4A4_MXFP4", "W4A4_DYNAMIC"],
+                        choices=["AUTO", "W8A8_MXFP8", "W4A8_MXFP", "W4A4_MXFP4", "W4A4_DYNAMIC", "W4A4_INT4_PER_GROUP"],
                         help="L1: 激活伪量化类型 (AUTO=按 quant descriptor 逐算子选择; "
                              "W8A8_MXFP8/W4A8_MXFP=MXFP8 per-block; "
                              "W4A4_MXFP4=MXFP4 E2M1 per-block; "
-                             "W4A4_DYNAMIC=INT4 per-token sym; legacy "
+                             "W4A4_DYNAMIC=INT4 per-token sym; "
+                             "W4A4_INT4_PER_GROUP=INT4 hidden-axis per-group sym; legacy "
                              "W4A4_LAOS maps to W4A4_DYNAMIC)")
     parser.add_argument(
         "--activation_quant_backend", type=str, default="auto",
         choices=["auto", "npu", "torch"],
         help=("L1: INT4 激活量化后端 (auto=NPU 上使用原生 "
               "npu_dynamic_quant，CPU 上使用 Torch reference；torch 仅用于诊断)"),
+    )
+    parser.add_argument(
+        "--activation_quant_group_size", type=parse_positive_int, default=128,
+        help=("L1: W4A4_INT4_PER_GROUP 沿 hidden 维的 group size "
+              "(默认 128；其他 activation 类型忽略)"),
     )
     parser.add_argument("--compare_mode", type=str, default="dual",
                         choices=["dual", "grouped_dual"],
@@ -428,6 +451,7 @@ def run_hf_l1(args, ref_device, target_device, dtype):
         activation_quant=args.activation_quant,
         activation_quant_type=args.activation_quant_type,
         activation_quant_backend=args.activation_quant_backend,
+        activation_quant_group_size=args.activation_quant_group_size,
         compare_mode=getattr(args, 'compare_mode', 'dual'),
         ref_devices=_parse_dev_list(getattr(args, 'ref_devices', None)),
         quant_devices=_parse_dev_list(getattr(args, 'quant_devices', None)),
@@ -703,6 +727,7 @@ def _write_stage_report_artifacts(args, report, mode):
         activation_quant_enabled=bool(getattr(args, "activation_quant", False)),
         activation_quant_type=getattr(args, "activation_quant_type", "") or "",
         activation_quant_backend=getattr(args, "activation_quant_backend", "") or "",
+        activation_quant_group_size=getattr(args, "activation_quant_group_size", None),
     )
     json_path = os.path.join(out_dir, "report_data.json")
     with open(json_path, "w", encoding="utf-8") as f:
@@ -924,6 +949,7 @@ def _full_assemble_and_write(args, l1_report, l2_results, boundary_dict,
         activation_quant_enabled=bool(getattr(args, "activation_quant", False)),
         activation_quant_type=getattr(args, "activation_quant_type", "") or "",
         activation_quant_backend=getattr(args, "activation_quant_backend", "") or "",
+        activation_quant_group_size=getattr(args, "activation_quant_group_size", None),
     )
     logger.info(f"  run_status = {report_data.run_status}")
 

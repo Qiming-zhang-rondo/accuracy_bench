@@ -685,6 +685,7 @@ function renderScopeBanner(o){
   if(o.quant_method)tags.push('<span class="pill muted">WEIGHT · '+esc(o.quant_method)+'</span>');
   if(o.activation_quant_enabled===true&&o.activation_quant_type)tags.push('<span class="pill warn">TYPE · '+esc(o.activation_quant_type)+'</span>');
   if(o.activation_quant_enabled===true&&o.activation_quant_backend)tags.push('<span class="pill muted">BACKEND · '+esc(o.activation_quant_backend)+'</span>');
+  if(o.activation_quant_enabled===true&&o.activation_quant_group_size!=null)tags.push('<span class="pill muted">GROUP · '+esc(o.activation_quant_group_size)+'</span>');
   let l2Note="";
   if(hasL2)l2Note='<div class="scope-note"><b>L2 口径独立：</b>子图反事实诊断基于 checkpoint 权重路径，不重放 L1 的 Activation QDQ hooks。</div>';
   const prefix=hasL1?"L1 COMPARISON SCOPE":"DIAGNOSTIC SCOPE";
@@ -708,7 +709,8 @@ function renderOverview(){
     ('<div class="conf-wrap"><div class="conf-bar" style="width:'+clamp(conf*100,0,100).toFixed(0)+'%"></div></div>'
     +'<div class="tip">可信度 '+pct(conf,0)+'</div>');
   const inputMode=o.input_mode==="messages"?"Chat messages · apply_chat_template":(o.input_mode==="prompt"?"Raw prompt":(o.input_mode||"—"));
-  const activationText=o.activation_quant_enabled===true?("ON · "+(o.activation_quant_type||"AUTO")+" · "+(o.activation_quant_backend||"auto")):
+  const activationGroup=o.activation_quant_group_size==null?"":(" · group "+o.activation_quant_group_size);
+  const activationText=o.activation_quant_enabled===true?("ON · "+(o.activation_quant_type||"AUTO")+" · "+(o.activation_quant_backend||"auto")+activationGroup):
     (o.activation_quant_enabled===false?"OFF":"未记录");
   let alert="";
   if(st==="INVALID_RUN"){alert='<div class="alert-invalid">输入无效 (模型加载/forward 失败或全 NaN)。以下排名仅供参考, 不可作为定论。'+hIcon("baseline_l2")+'</div>';}

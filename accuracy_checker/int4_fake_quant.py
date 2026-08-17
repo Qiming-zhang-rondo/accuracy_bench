@@ -1,9 +1,13 @@
 """
-INT4 per-token 对称线性激活伪量化模块。
+INT4 对称线性激活伪量化模块。
 
 对齐 msmodelslim `W4A4DynamicPerChannelFakeQuantLinear` /
 `W4A4DynamicPerGroupFakeQuantLinear` / `W4A4LAOSFakeQuantLinear` 的激活侧
 (三者激活侧一致: INT4 per-token symmetric)。
+
+另外提供显式的 ``INT4 per-group activation`` 诊断路径。它沿 hidden
+维按 ``group_size`` 独立计算 scale；这是 acc_bench 的可选扩展，不会把
+msModelSlim 的“per-group 权重 + per-token 激活”误解释为 per-group 激活。
 
 决策 (docs/proposals/a4_activation.md §6):
   D4: round = half-even (torch.round() 默认, 与 msmodelslim int_quantize .round_() 一致)
@@ -13,7 +17,10 @@ INT4 per-token 对称线性激活伪量化模块。
 
 from __future__ import annotations
 
+import operator
+
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 INT4_MAX = 7  # symmetric INT4: scale = amax/7, clamp range [-8, 7]
@@ -144,3 +151,79 @@ def int4_fake_quant_per_token_sym(x: Tensor, backend: str = "auto") -> Tensor:
     if resolved == "npu":
         return _int4_fake_quant_per_token_sym_npu(x)
     return _int4_fake_quant_per_token_sym_torch(x)
+
+
+def _validate_group_size(group_size: int) -> int:
+    if isinstance(group_size, bool):
+        raise ValueError("INT4 activation group_size must be a positive integer")
+    try:
+        group_size = operator.index(group_size)
+    except TypeError as exc:
+        raise ValueError(
+            "INT4 activation group_size must be a positive integer"
+        ) from exc
+    if group_size <= 0:
+        raise ValueError("INT4 activation group_size must be a positive integer")
+    return group_size
+
+
+def int4_fake_quant_per_group_sym(
+    x: Tensor,
+    group_size: int = 128,
+    backend: str = "auto",
+) -> Tensor:
+    """Feature-group symmetric INT4 activation QDQ.
+
+    The last (hidden) dimension is partitioned into groups. Each token/group
+    gets an independent ``amax / 7`` scale. A short final group is zero-padded
+    only for scale/packing and is trimmed after dequantization.
+
+    On NPU, ``auto`` reshapes every feature group into one row and reuses the
+    real ``npu_dynamic_quant(..., quint4x2)`` kernel, so rounding and nibble
+    packing follow the deployment operator. CPU/CUDA use the Torch reference.
+    """
+    group_size = _validate_group_size(group_size)
+    if x.dim() < 1 or x.shape[-1] <= 0:
+        raise ValueError(
+            "INT4 per-group activation quantization requires a non-empty "
+            "hidden dimension"
+        )
+
+    backend = str(backend).strip().lower()
+    if backend not in {"auto", "npu", "torch"}:
+        raise ValueError(
+            f"unsupported INT4 activation backend {backend!r}; "
+            "expected auto, npu, or torch"
+        )
+    use_npu_kernel = backend == "npu" or (
+        backend == "auto" and x.device.type == "npu"
+    )
+    if backend == "npu" and x.device.type != "npu":
+        raise ValueError(
+            "the npu activation-quant backend requires an NPU tensor, got "
+            f"{x.device}"
+        )
+
+    original_shape = x.shape
+    hidden_size = int(original_shape[-1])
+    num_groups = (hidden_size + group_size - 1) // group_size
+    grouped_hidden = num_groups * group_size
+    logical_pad = grouped_hidden - hidden_size
+    padded = F.pad(x, (0, logical_pad)) if logical_pad else x
+    grouped = padded.reshape(-1, group_size)
+
+    # quint4x2 packs eight values into every int32. Pad within each group so
+    # group boundaries remain independent even when group_size % 8 != 0.
+    pack_pad = (-group_size) % 8 if use_npu_kernel else 0
+    grouped_for_qdq = F.pad(grouped, (0, pack_pad)) if pack_pad else grouped
+    quantized_groups = int4_fake_quant_per_token_sym(
+        grouped_for_qdq,
+        backend=backend,
+    )
+    if pack_pad:
+        quantized_groups = quantized_groups[..., :group_size]
+
+    restored = quantized_groups.reshape(
+        tuple(original_shape[:-1]) + (grouped_hidden,)
+    )
+    return restored[..., :hidden_size]

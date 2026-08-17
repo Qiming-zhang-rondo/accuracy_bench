@@ -86,6 +86,7 @@ acc_bench/
 | `--activation_quant` | 仅在 quant 侧启用 descriptor 驱动的激活伪量化 |
 | `--activation_quant_type AUTO\|...` | 默认按每个权重 descriptor 自动选择激活格式；显式类型只匹配兼容算子 |
 | `--activation_quant_backend auto\|npu\|torch` | W4A4 在 NPU 上默认调用原生 dynamic-quant 算子；Torch 公式路径仅用于诊断 |
+| `--activation_quant_group_size N` | `W4A4_INT4_PER_GROUP` 沿 hidden 维的分组大小，默认 128 |
 
 ---
 

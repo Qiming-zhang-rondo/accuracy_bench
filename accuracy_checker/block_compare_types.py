@@ -154,6 +154,7 @@ class BlockCompareReport:
     activation_quant_enabled: Optional[bool] = None
     activation_quant_type: str = ""
     activation_quant_backend: str = ""
+    activation_quant_group_size: Optional[int] = None
     # 缓存的检测结果 (首次调用 _detect_bad_layers 后填充)
     _detection_cache: Optional[BadLayerDetection] = field(default=None, repr=False)
 
@@ -329,10 +330,15 @@ class BlockCompareReport:
         lines = [f"{'='*70}", "L1 逐Block对比", f"{'='*70}"]
         if self.activation_quant_enabled is True:
             lines.append("  对比口径: 权重 + 激活 QDQ 联合仿真")
+            group_detail = (
+                f", group_size={self.activation_quant_group_size}"
+                if self.activation_quant_group_size is not None else ""
+            )
             lines.append(
                 "  Activation QDQ: 仅 Quant 侧启用"
                 f" (type={self.activation_quant_type or 'AUTO'}, "
-                f"backend={self.activation_quant_backend or 'auto'})"
+                f"backend={self.activation_quant_backend or 'auto'}"
+                f"{group_detail})"
             )
             lines.append(
                 "  解读: block output 包含累计权重误差与激活 QDQ 误差，"

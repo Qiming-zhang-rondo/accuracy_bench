@@ -389,6 +389,7 @@ def assemble_report(
     activation_quant_enabled: Optional[bool] = None,
     activation_quant_type: str = "",
     activation_quant_backend: str = "",
+    activation_quant_group_size: Optional[int] = None,
 ) -> ReportData:
     """从各模块收集结果, 组装成统一 ReportData JSON。
 
@@ -446,9 +447,17 @@ def assemble_report(
     resolved_aq_backend = activation_quant_backend or (
         getattr(l1_report, "activation_quant_backend", "") if l1_report is not None else ""
     )
+    resolved_aq_group_size = activation_quant_group_size
+    if resolved_aq_group_size is None and l1_report is not None:
+        resolved_aq_group_size = getattr(
+            l1_report, "activation_quant_group_size", None
+        )
     if resolved_aq_enabled is not True:
         resolved_aq_type = ""
         resolved_aq_backend = ""
+        resolved_aq_group_size = None
+    elif resolved_aq_type != "W4A4_INT4_PER_GROUP":
+        resolved_aq_group_size = None
 
     # --- inference compare ---
     inference_compare = _coerce_inference_compare(inference_compare_data)
@@ -466,6 +475,7 @@ def assemble_report(
         activation_quant_enabled=resolved_aq_enabled,
         activation_quant_type=resolved_aq_type,
         activation_quant_backend=resolved_aq_backend,
+        activation_quant_group_size=resolved_aq_group_size,
         boundary_result=boundary_verdict,
         first_divergence_layer=first_div_idx,
         first_threshold_crossing_layer=first_threshold_idx,

@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-08-17 — INT4 per-group activation diagnostics
+
+- 新增 `W4A4_INT4_PER_GROUP` 激活伪量化类型和 `--activation_quant_group_size`，按每个 token 的 hidden feature group 独立计算对称 INT4 scale。
+- NPU 路径将 feature group 重排为独立 row 后复用原生 `npu_dynamic_quant(..., quint4x2)`，保留部署算子的舍入与打包行为；末组和非 8 对齐 group 自动补零并在 QDQ 后裁剪。
+- 普通 Linear、materialized/streaming/packed MoE expert 共用同一 per-group 路径；CLI 参数页、预检、命令生成器、终端与 HTML 报告均记录 group size。
+- `AUTO` 继续保持已有 `W4A4_DYNAMIC` descriptor 的 per-token 语义，不把 per-group 权重格式误判成 per-group activation；显式选择可用于对兼容 INT4 checkpoint 做 per-group 诊断。
+
 ## 2026-08-12 — Qwen3.5/3.6 replay correctness + report semantics
 
 - 修复 grouped-dual 手工 MoE replay 漏掉 `sigmoid(shared_expert_gate(x))` 的问题，恢复 Qwen3.5/3.6 原生 shared expert 门控公式，避免 ref/quant 同时走错路径却看似相互对齐。

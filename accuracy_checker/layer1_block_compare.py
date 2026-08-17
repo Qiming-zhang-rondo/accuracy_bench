@@ -45,13 +45,19 @@ from .block_compare_types import (
 )
 
 
-_ACTIVATION_QUANT_ALIASES = {"W4A4_LAOS": "W4A4_DYNAMIC"}
+_ACTIVATION_QUANT_ALIASES = {
+    "W4A4_LAOS": "W4A4_DYNAMIC",
+    "INT4_PER_GROUP": "W4A4_INT4_PER_GROUP",
+    "W4A4_PER_GROUP": "W4A4_INT4_PER_GROUP",
+    "W4A4_INT4_PERGROUP": "W4A4_INT4_PER_GROUP",
+}
 _ACTIVATION_QUANT_TYPES = frozenset({
     "AUTO",
     "W8A8_MXFP8",
     "W4A8_MXFP",
     "W4A4_MXFP4",
     "W4A4_DYNAMIC",
+    "W4A4_INT4_PER_GROUP",
     "W8A8_DYNAMIC",
     "W4A8_DYNAMIC",
     "W8A8",
@@ -65,6 +71,7 @@ _WEIGHT_TO_ACTIVATION_QUANT = {
     "W4A4_DYNAMIC": "W4A4_DYNAMIC",
     "W4A4_LAOS": "W4A4_DYNAMIC",
     "W4A4_INT4_DYNAMIC": "W4A4_DYNAMIC",
+    "W4A4_INT4_PER_GROUP": "W4A4_INT4_PER_GROUP",
     "W8A8_DYNAMIC": "W8A8_DYNAMIC",
     "W4A8_DYNAMIC": "W4A8_DYNAMIC",
 }
@@ -74,6 +81,7 @@ _ACTIVATION_QUANT_FAMILIES = {
     "W4A8_MXFP": "mxfp8",
     "W4A4_MXFP4": "mxfp4",
     "W4A4_DYNAMIC": "int4_dynamic",
+    "W4A4_INT4_PER_GROUP": "int4_dynamic",
     "W8A8_DYNAMIC": "int8_dynamic",
     "W4A8_DYNAMIC": "int8_dynamic",
     "W8A8": "int8_dynamic",
@@ -93,7 +101,12 @@ def _canonical_activation_quant_type(quant_type: str) -> str:
     return normalized
 
 
-def _dispatch_act_fake_quant(x, quant_type: str, backend: str = "auto"):
+def _dispatch_act_fake_quant(
+    x,
+    quant_type: str,
+    backend: str = "auto",
+    group_size: int = 128,
+):
     """Apply the canonical activation QDQ path without changing its contract."""
     quant_type = _canonical_activation_quant_type(quant_type)
     if quant_type == "AUTO":
@@ -104,6 +117,11 @@ def _dispatch_act_fake_quant(x, quant_type: str, backend: str = "auto"):
     if quant_type == "W4A4_MXFP4":
         from .mxfp4_fake_quant import mxfp4_fake_quant_per_block
         result = mxfp4_fake_quant_per_block(x)
+    elif quant_type == "W4A4_INT4_PER_GROUP":
+        from .int4_fake_quant import int4_fake_quant_per_group_sym
+        result = int4_fake_quant_per_group_sym(
+            x, group_size=group_size, backend=backend
+        )
     elif quant_type == "W4A4_DYNAMIC":
         from .int4_fake_quant import int4_fake_quant_per_token_sym
         result = int4_fake_quant_per_token_sym(x, backend=backend)
@@ -208,11 +226,17 @@ def _lookup_linear_quant_descriptor(quant_desc: Optional[dict],
     return None
 
 
-def _make_act_fake_quant_hook(quant_type: str, backend: str = "auto"):
+def _make_act_fake_quant_hook(
+    quant_type: str,
+    backend: str = "auto",
+    group_size: int = 128,
+):
     """构造捕获 quant_type 的 pre-forward hook (闭包)。"""
     def _hook(module, input):
         x = input[0]
-        x_fq = _dispatch_act_fake_quant(x, quant_type, backend=backend)
+        x_fq = _dispatch_act_fake_quant(
+            x, quant_type, backend=backend, group_size=group_size
+        )
         return (x_fq,) + input[1:]
     return _hook
 
@@ -297,6 +321,7 @@ class ShardedBlockComparator:
         activation_quant: bool = False,
         activation_quant_type: str = "AUTO",
         activation_quant_backend: str = "auto",
+        activation_quant_group_size: int = 128,
         # Full logits capture on the L1 forward pass (no extra model reload).
         # Default on; compare_logits 4-panel data feeds ReportData.logits.
         collect_full_logits: bool = True,
@@ -345,6 +370,15 @@ class ShardedBlockComparator:
                 "activation_quant_backend must be auto, npu, or torch"
             )
         self.activation_quant_backend = activation_quant_backend
+        if (
+            isinstance(activation_quant_group_size, bool)
+            or not isinstance(activation_quant_group_size, int)
+            or activation_quant_group_size <= 0
+        ):
+            raise ValueError(
+                "activation_quant_group_size must be a positive integer"
+            )
+        self.activation_quant_group_size = activation_quant_group_size
         self.collect_full_logits = collect_full_logits
         self.logits_max_positions = logits_max_positions
         self._activation_hooks = []  # track registered hooks for cleanup
@@ -1252,9 +1286,14 @@ class ShardedBlockComparator:
             logger.info(f"[Sharded L1] ref_device: {self.ref_device}, quant_device: {self.quant_device}")
             logger.info(f"[Sharded L1] 每批层数: {layers_per_shard}")
             if self.activation_quant:
+                group_detail = (
+                    f", group_size={self.activation_quant_group_size}"
+                    if self.activation_quant_type == "W4A4_INT4_PER_GROUP"
+                    else ""
+                )
                 logger.info(
                     f"  activation_quant: {self.activation_quant_type} "
-                    "fake quant enabled (quant side only)"
+                    f"fake quant enabled (quant side only{group_detail})"
                 )
             logger.info(f"[Sharded L1] 输入长度: {input_ids.shape[1]} tokens")
 
@@ -1454,9 +1493,14 @@ class ShardedBlockComparator:
             )
             logger.info(f"  streaming dequant: {dequant_location}")
             if self.activation_quant:
+                group_detail = (
+                    f", group_size={self.activation_quant_group_size}"
+                    if self.activation_quant_type == "W4A4_INT4_PER_GROUP"
+                    else ""
+                )
                 logger.info(
                     f"  activation_quant: {self.activation_quant_type} "
-                    "fake quant enabled (quant side only)"
+                    f"fake quant enabled (quant side only{group_detail})"
                 )
 
         forward_kwargs.setdefault("use_cache", False)
@@ -1859,6 +1903,9 @@ class ShardedBlockComparator:
                     _make_act_fake_quant_hook(
                         activation_type,
                         backend=getattr(self, "activation_quant_backend", "auto"),
+                        group_size=getattr(
+                            self, "activation_quant_group_size", 128
+                        ),
                     )
                 )
                 self._activation_hooks.append(h)
@@ -1875,12 +1922,14 @@ class ShardedBlockComparator:
             logger.info(
                 "  [ACT FAKE QUANT] registered %d descriptor-matched hooks "
                 "on quant side (requested=%s, skipped unquantized=%d, "
-                "other activation scheme=%d, backend=%s, active total=%d)",
+                "other activation scheme=%d, backend=%s, group_size=%d, "
+                "active total=%d)",
                 added_count,
                 self.activation_quant_type,
                 skipped_unquantized,
                 skipped_other_scheme,
                 resolved_backend,
+                getattr(self, "activation_quant_group_size", 128),
                 len(self._activation_hooks),
             )
 
@@ -2240,11 +2289,17 @@ class ShardedBlockComparator:
                 x_for_gate = _dispatch_act_fake_quant(
                     x_chunk, gate_activation_type,
                     backend=getattr(self, "activation_quant_backend", "auto"),
+                    group_size=getattr(
+                        self, "activation_quant_group_size", 128
+                    ),
                 )
             if up_activation_type is not None:
                 x_for_up = _dispatch_act_fake_quant(
                     x_chunk, up_activation_type,
                     backend=getattr(self, "activation_quant_backend", "auto"),
+                    group_size=getattr(
+                        self, "activation_quant_group_size", 128
+                    ),
                 )
 
         gate_out = torch.nn.functional.linear(x_for_gate, gate_fp)
@@ -2259,6 +2314,9 @@ class ShardedBlockComparator:
                 act_out = _dispatch_act_fake_quant(
                     act_out, down_activation_type,
                     backend=getattr(self, "activation_quant_backend", "auto"),
+                    group_size=getattr(
+                        self, "activation_quant_group_size", 128
+                    ),
                 )
 
         expert_out = torch.nn.functional.linear(act_out, down_fp)
@@ -2543,6 +2601,9 @@ class ShardedBlockComparator:
                 x_for_gate_up = _dispatch_act_fake_quant(
                     x_chunk, gate_up_activation_type,
                     backend=getattr(self, "activation_quant_backend", "auto"),
+                    group_size=getattr(
+                        self, "activation_quant_group_size", 128
+                    ),
                 )
         gate_up_out = torch.nn.functional.linear(x_for_gate_up, gate_up_e)
         gate_out = gate_up_out[..., :intermediate_dim]
@@ -2556,6 +2617,9 @@ class ShardedBlockComparator:
                 act_out = _dispatch_act_fake_quant(
                     act_out, down_activation_type,
                     backend=getattr(self, "activation_quant_backend", "auto"),
+                    group_size=getattr(
+                        self, "activation_quant_group_size", 128
+                    ),
                 )
         expert_out = torch.nn.functional.linear(act_out, down_e)
         del gate_up_e, down_e
@@ -3091,6 +3155,11 @@ class ShardedBlockComparator:
         if self.activation_quant:
             report.activation_quant_type = self.activation_quant_type
             report.activation_quant_backend = self.activation_quant_backend
+            report.activation_quant_group_size = (
+                self.activation_quant_group_size
+                if self.activation_quant_type == "W4A4_INT4_PER_GROUP"
+                else None
+            )
         report.results = all_results
         if self.l1_target_layers is not None:
             logger.info(f"\n[Sharded L1] 目标层 {sorted(self.l1_target_layers)} 已全部缓存完毕。")

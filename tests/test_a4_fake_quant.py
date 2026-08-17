@@ -20,6 +20,7 @@ from accuracy_checker.mxfp4_fake_quant import mxfp4_fake_quant_per_block, E2M1_M
 from accuracy_checker.int4_fake_quant import (
     INT4_MAX,
     _unpack_npu_int4,
+    int4_fake_quant_per_group_sym,
     int4_fake_quant_per_token_sym,
 )
 from accuracy_checker.layer1_block_compare import _dispatch_act_fake_quant
@@ -164,6 +165,12 @@ class TestINT4:
         with pytest.raises(ValueError, match="requires an NPU tensor"):
             int4_fake_quant_per_token_sym(torch.randn(2, 8), backend="npu")
 
+    def test_per_group_npu_backend_rejects_cpu_tensor(self):
+        with pytest.raises(ValueError, match="requires an NPU tensor"):
+            int4_fake_quant_per_group_sym(
+                torch.randn(2, 8), group_size=4, backend="npu"
+            )
+
     def test_unknown_backend_fails_closed(self):
         with pytest.raises(ValueError, match="unsupported INT4 activation backend"):
             int4_fake_quant_per_token_sym(torch.randn(2, 8), backend="guess")
@@ -241,6 +248,36 @@ class TestINT4:
         assert out.shape == x.shape
         assert out.dtype == torch.float16
 
+    def test_per_group_uses_independent_hidden_group_scales(self):
+        x = torch.tensor([[7.0, 2.5, 1.0, 0.0, 70.0, 25.0, 10.0, 0.0]])
+        out = int4_fake_quant_per_group_sym(x, group_size=4, backend="torch")
+
+        expected_groups = []
+        for group in x.reshape(-1, 4).float():
+            scale = group.abs().amax().clamp(min=torch.finfo(torch.float32).eps) / 7
+            expected_groups.append(torch.round(group / scale).clamp(-8, 7) * scale)
+        expected = torch.stack(expected_groups).reshape_as(x)
+
+        torch.testing.assert_close(out, expected)
+        per_token = int4_fake_quant_per_token_sym(x, backend="torch")
+        assert not torch.equal(out, per_token)
+        assert out[0, 0].item() == pytest.approx(7.0)
+
+    def test_per_group_supports_short_final_group(self):
+        x = torch.tensor([[7.0, 3.0, 1.0, 0.0, 2.0, -1.0]], dtype=torch.float16)
+        out = int4_fake_quant_per_group_sym(x, group_size=4, backend="torch")
+        assert out.shape == x.shape
+        assert out.dtype == x.dtype
+        assert out.device == x.device
+        assert out[0, 4].item() == pytest.approx(2.0, abs=2e-3)
+
+    @pytest.mark.parametrize("group_size", [0, -1, True, "bad"])
+    def test_per_group_rejects_invalid_group_size(self, group_size):
+        with pytest.raises(ValueError, match="positive integer"):
+            int4_fake_quant_per_group_sym(
+                torch.randn(2, 8), group_size=group_size
+            )
+
 
 def test_all_activation_quant_dispatches_preserve_tensor_contract():
     # transpose keeps the last dimension quantizable while making the tensor
@@ -252,6 +289,7 @@ def test_all_activation_quant_dispatches_preserve_tensor_contract():
         "W4A8_MXFP",
         "W4A4_MXFP4",
         "W4A4_DYNAMIC",
+        "W4A4_INT4_PER_GROUP",
         "W8A8_DYNAMIC",
         "W4A8_DYNAMIC",
         "W8A8",
@@ -269,6 +307,17 @@ def test_legacy_laos_activation_alias_matches_dynamic():
         _dispatch_act_fake_quant(x, "W4A4_LAOS"),
         _dispatch_act_fake_quant(x, "W4A4_DYNAMIC"),
     )
+
+
+def test_per_group_activation_aliases_match_canonical():
+    x = torch.randn(2, 16)
+    expected = _dispatch_act_fake_quant(
+        x, "W4A4_INT4_PER_GROUP", group_size=4
+    )
+    for alias in ("INT4_PER_GROUP", "W4A4_PER_GROUP", "W4A4_INT4_PERGROUP"):
+        torch.testing.assert_close(
+            _dispatch_act_fake_quant(x, alias, group_size=4), expected
+        )
 
 
 def test_unknown_activation_quant_type_fails_closed():

@@ -6,7 +6,7 @@
   2. --available_devices 已删除 (死参数)
   3. --model_type 新增 (auto/dense/moe/glm_mla/glm_moe_dsa)
   4. --boundary 新增 (定界占位)
-  5. --activation_quant_type 提供 4 个规范类型（LAOS 激活别名归一到 Dynamic）
+  5. --activation_quant_type 提供规范类型（LAOS 激活别名归一到 Dynamic）
   6. subgraph_locate.py 无 import argparse (死 import 删除)
   7. subgraph_locate.py docstring 无 python -m 示例 (改为库 API)
 """
@@ -145,7 +145,7 @@ def test_activation_quant_type_added():
             choices = kwargs.get("choices", [])
             for expected in (
                 "AUTO", "W8A8_MXFP8", "W4A8_MXFP",
-                "W4A4_MXFP4", "W4A4_DYNAMIC",
+                "W4A4_MXFP4", "W4A4_DYNAMIC", "W4A4_INT4_PER_GROUP",
             ):
                 assert expected in choices, \
                     f"--activation_quant_type choices 应含 {expected}, got {choices}"
@@ -162,6 +162,15 @@ def test_activation_quant_backend_defaults_to_native_auto():
             assert set(kwargs.get("choices", [])) == {"auto", "npu", "torch"}
             return
     raise AssertionError("--activation_quant_backend 参数未找到")
+
+
+def test_activation_quant_group_size_defaults_to_128():
+    calls = _get_add_argument_calls(_parse_run_script())
+    for name, kwargs in calls:
+        if name == "--activation_quant_group_size":
+            assert kwargs.get("default") == 128
+            return
+    raise AssertionError("--activation_quant_group_size 参数未找到")
 
 
 def test_kimi_kda_backend_added():

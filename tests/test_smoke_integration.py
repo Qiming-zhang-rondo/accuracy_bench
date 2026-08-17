@@ -134,8 +134,9 @@ class TestReportSchema:
                                   comparison_scope="weight_plus_activation_qdq",
                                   quant_method="dequantize",
                                   activation_quant_enabled=True,
-                                  activation_quant_type="W4A4_DYNAMIC",
+                                  activation_quant_type="W4A4_INT4_PER_GROUP",
                                   activation_quant_backend="npu",
+                                  activation_quant_group_size=128,
                                   first_divergence_layer=7,
                                   boundary_result="CLEAN"),
             l1_layers=[L1LayerData(layer_idx=7, layer_name="layer.7",
@@ -151,7 +152,8 @@ class TestReportSchema:
         assert rd2.overview.input_mode == "messages"
         assert rd2.overview.comparison_scope == "weight_plus_activation_qdq"
         assert rd2.overview.activation_quant_enabled is True
-        assert rd2.overview.activation_quant_type == "W4A4_DYNAMIC"
+        assert rd2.overview.activation_quant_type == "W4A4_INT4_PER_GROUP"
+        assert rd2.overview.activation_quant_group_size == 128
         assert rd2.l1_layers[0].cos_sim == 0.42
         assert rd2.l1_layers[0].is_first_divergence is True
         assert rd2.l2_results[0].impact_boundary == "mlp"
@@ -261,6 +263,16 @@ class TestAssembleReport:
         assert rd.overview.activation_quant_type == "AUTO"
         assert rd.overview.activation_quant_backend == "npu"
         assert rd.overview.input_mode == "messages"
+
+    def test_assemble_records_int4_per_group_size(self):
+        rd = assemble_report(
+            l1_report=_mock_l1(),
+            activation_quant_enabled=True,
+            activation_quant_type="W4A4_INT4_PER_GROUP",
+            activation_quant_backend="npu",
+            activation_quant_group_size=64,
+        )
+        assert rd.overview.activation_quant_group_size == 64
 
     def test_old_report_scope_stays_unknown(self):
         rd = assemble_report(l1_report=_mock_l1())

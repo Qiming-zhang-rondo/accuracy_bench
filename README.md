@@ -46,6 +46,17 @@ python3 run_accuracy_check.py --l2 --target_layers 11 20 33 \
 
 W4A4_DYNAMIC 在 NPU 上默认通过 `torch_npu.npu_dynamic_quant(..., dst_type=torch.quint4x2)` 复现部署算子的 INT4 舍入和打包，再做 QDQ 对比；`--activation_quant_backend torch` 仅用于 CPU 自检或算子差异诊断，不建议作为 NPU 精度结论。
 
+需要验证 hidden-axis INT4 per-group 激活时，显式指定：
+
+```bash
+--activation_quant \
+--activation_quant_type W4A4_INT4_PER_GROUP \
+--activation_quant_group_size 128 \
+--activation_quant_backend auto
+```
+
+该模式让每个 token 的每个 hidden group 独立计算对称 INT4 scale；末组不足会补零后裁剪。NPU 路径把各 feature group 重排为独立 row 后复用原生 `npu_dynamic_quant`，不会退回近似公式。注意：msModelSlim 名称里的 `PerGroup` 通常描述的是**权重**粒度，其激活仍可能是 per-token，因此 `AUTO` 不会据此猜测；只有 descriptor 明确声明 `W4A4_INT4_PER_GROUP`，或命令显式选择该类型时，才启用 per-group activation。
+
 报告顶部会明确标记本次 L1 是“仅权重误差”还是“权重 + 激活 QDQ 联合仿真”，并记录 `quant_method`、activation type/backend。联合仿真的逐层 block output 是权重误差与 Quant 侧激活 QDQ 误差的累计结果，单次运行不能把两者的贡献拆开；若要判断激活 QDQ 的增量影响，请用同一输入分别跑一份关闭/开启 `--activation_quant` 的报告。L2 的子图反事实诊断口径独立，不重放 L1 的 activation hooks。
 
 Chat/Instruct 模型建议使用 `--messages '[{"role":"user","content":"你好"}]'`，工具会调用 tokenizer 的 `apply_chat_template(..., add_generation_prompt=True)`；裸 `--prompt` 不会自动补 chat template。报告会记录输入方式，Prompt prefill 的最后一个 position 才是首个 Decode Token。
@@ -86,7 +97,7 @@ python3 run_accuracy_check.py --mode boundary \
 | **定界** | 反量化 (BF16 round-trip, 非无损) → generate, 区分"量化坏" vs "推理框架坏" | ✅ |
 | **L2** | 子图反事实替换, 测 Recovery Ratio, 输出 RootSuspect (假设: 候选子图为误差**充足原因**, 不作必要性主张) | ✅ |
 | **HTML 报告** | 比较口径 + L1/L2/Logits + 历史侧边栏，自包含 | ✅ |
-| **A4 激活量化** | MXFP4 (E2M1) + INT4 per-token, W4A4 全链路 | ✅ |
+| **A4 激活量化** | MXFP4 (E2M1) + INT4 per-token / hidden-axis per-group, W4A4 全链路 | ✅ |
 | **Bad Case 工作流** | manifest + 单点 clip + GT 对比 | ✅ |
 
 ## 对比

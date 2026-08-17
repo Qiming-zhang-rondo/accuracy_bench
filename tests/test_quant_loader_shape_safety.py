@@ -4,7 +4,10 @@ import pytest
 import torch
 import torch.nn as nn
 
-from accuracy_checker.layer1_block_compare import ShardedBlockComparator
+from accuracy_checker.layer1_block_compare import (
+    ShardedBlockComparator,
+    _activation_quant_for_weight,
+)
 from accuracy_checker.model_loader import _load_msslim_quant_param
 from accuracy_checker.utils import normalize_quant_desc_values, normalize_quant_type
 
@@ -200,6 +203,29 @@ def test_explicit_activation_type_does_not_touch_other_schemes():
     assert len(quant_model.model.layers[0].proj._forward_pre_hooks) == 1
     assert len(quant_model.model.layers[0].float_proj._forward_pre_hooks) == 0
     comparator._clear_activation_quant_hooks()
+
+
+def test_explicit_int4_per_group_preserves_auto_descriptor_semantics():
+    assert (
+        _activation_quant_for_weight("W4A4_INT4_DYNAMIC", "AUTO")
+        == "W4A4_DYNAMIC"
+    )
+    assert (
+        _activation_quant_for_weight(
+            "W4A4_INT4_DYNAMIC", "W4A4_INT4_PER_GROUP"
+        )
+        == "W4A4_INT4_PER_GROUP"
+    )
+    assert (
+        _activation_quant_for_weight("W4A4_INT4_PER_GROUP", "AUTO")
+        == "W4A4_INT4_PER_GROUP"
+    )
+    assert (
+        _activation_quant_for_weight(
+            "W8A8_MXFP8", "W4A4_INT4_PER_GROUP"
+        )
+        is None
+    )
 
 
 def test_activation_quant_requires_checkpoint_descriptors():

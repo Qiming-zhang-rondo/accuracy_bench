@@ -78,7 +78,7 @@ class TestCliGuide(unittest.TestCase):
     def test_activation_quant_type_is_selectable_and_generates_both_flags(self):
         for quant_type in (
             "AUTO", "W8A8_MXFP8", "W4A8_MXFP", "W4A4_MXFP4",
-            "W4A4_DYNAMIC",
+            "W4A4_DYNAMIC", "W4A4_INT4_PER_GROUP",
         ):
             self.assertIn(f'value="{quant_type}"', self.html)
         self.assertNotIn('value="W4A4_LAOS"', self.html)
@@ -90,6 +90,15 @@ class TestCliGuide(unittest.TestCase):
         self.assertIn('id="activationQuantBackend"', self.html)
         self.assertIn(
             'args.push(line("--activation_quant_backend", el.activationQuantBackend.value))',
+            self.html,
+        )
+        self.assertIn('id="activationQuantGroupSize"', self.html)
+        self.assertIn(
+            'args.push(line("--activation_quant_group_size", el.activationQuantGroupSize.value || "128"))',
+            self.html,
+        )
+        self.assertIn(
+            'setFieldVisibility(\n          "activationQuantGroupSizeField"',
             self.html,
         )
         self.assertIn("按 checkpoint descriptor 逐算子选择", self.html)

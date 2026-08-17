@@ -83,6 +83,7 @@ class OverviewData:
     activation_quant_enabled: Optional[bool] = None
     activation_quant_type: str = ""          # AUTO / W4A4_DYNAMIC / ...
     activation_quant_backend: str = ""       # auto / npu / torch
+    activation_quant_group_size: Optional[int] = None
 
 
 @dataclass
@@ -227,6 +228,16 @@ def _build_overview(d: Dict[str, Any]) -> OverviewData:
     activation_quant_enabled = d.get("activation_quant_enabled")
     if activation_quant_enabled is not None:
         activation_quant_enabled = bool(activation_quant_enabled)
+    activation_quant_group_size = d.get("activation_quant_group_size")
+    try:
+        activation_quant_group_size = (
+            int(activation_quant_group_size)
+            if activation_quant_group_size is not None else None
+        )
+    except (TypeError, ValueError):
+        activation_quant_group_size = None
+    if activation_quant_group_size is not None and activation_quant_group_size <= 0:
+        activation_quant_group_size = None
     return OverviewData(
         model_name=d.get("model_name", ""),
         ref_model_path=d.get("ref_model_path", ""),
@@ -240,6 +251,7 @@ def _build_overview(d: Dict[str, Any]) -> OverviewData:
         activation_quant_enabled=activation_quant_enabled,
         activation_quant_type=d.get("activation_quant_type", ""),
         activation_quant_backend=d.get("activation_quant_backend", ""),
+        activation_quant_group_size=activation_quant_group_size,
         boundary_result=d.get("boundary_result"),
         first_divergence_layer=d.get("first_divergence_layer"),
         first_threshold_crossing_layer=d.get("first_threshold_crossing_layer"),
