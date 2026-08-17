@@ -379,6 +379,7 @@ class ShardedBlockComparator:
                 "activation_quant_group_size must be a positive integer"
             )
         self.activation_quant_group_size = activation_quant_group_size
+        self._streaming_activation_logged = False
         self.collect_full_logits = collect_full_logits
         self.logits_max_positions = logits_max_positions
         self._activation_hooks = []  # track registered hooks for cleanup
@@ -1920,7 +1921,8 @@ class ShardedBlockComparator:
                     else "torch"
                 )
             logger.info(
-                "  [ACT FAKE QUANT] registered %d descriptor-matched hooks "
+                "  [ACT FAKE QUANT] registered %d descriptor-matched ordinary "
+                "Linear hooks "
                 "on quant side (requested=%s, skipped unquantized=%d, "
                 "other activation scheme=%d, backend=%s, group_size=%d, "
                 "active total=%d)",
@@ -1932,6 +1934,12 @@ class ShardedBlockComparator:
                 getattr(self, "activation_quant_group_size", 128),
                 len(self._activation_hooks),
             )
+            if self.compare_mode == "grouped_dual":
+                logger.info(
+                    "  [ACT FAKE QUANT] streaming routed-expert projections "
+                    "are descriptor-dispatched during replay and are not "
+                    "included in the ordinary Linear hook count"
+                )
 
     def _clear_activation_quant_hooks(self):
         """移除所有激活伪量化 hook。"""
@@ -2231,6 +2239,28 @@ class ShardedBlockComparator:
                 )
             else:
                 g_type = u_type = d_type = "FLOAT"
+
+        if (
+            self.activation_quant
+            and apply_activation_quant
+            and self.verbose
+            and not getattr(self, "_streaming_activation_logged", False)
+        ):
+            logger.info(
+                "  [ACT FAKE QUANT] streaming expert QDQ: gate=%s, up=%s, "
+                "down=%s, group_size=%d",
+                _activation_quant_for_weight(
+                    g_type, self.activation_quant_type
+                ),
+                _activation_quant_for_weight(
+                    u_type, self.activation_quant_type
+                ),
+                _activation_quant_for_weight(
+                    d_type, self.activation_quant_type
+                ),
+                getattr(self, "activation_quant_group_size", 128),
+            )
+            self._streaming_activation_logged = True
 
         # ---- gate/up/down proj: 读取压缩权重→目标设备反量化→F.linear ----
         if packed_keys is not None:

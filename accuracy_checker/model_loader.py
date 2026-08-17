@@ -260,27 +260,146 @@ def dequantize_weight_mx(
         return dequantize_weight_mxfp8(weight_data, weight_scale_u8, block_size, dtype)
 
 
+def _canonical_dynamic_qparam(
+    value: Tensor,
+    weight_shape: Tuple[int, int],
+    name: str,
+    device: torch.device,
+) -> Tensor:
+    """Normalize a dynamic weight qparam without expanding it in memory."""
+    value = value.to(device=device, dtype=torch.float32)
+    while value.dim() > 2 and value.shape[-1] == 1:
+        value = value.squeeze(-1)
+
+    if value.dim() == 0:
+        return value
+    if value.dim() > 2:
+        raise ValueError(
+            f"{name} must be scalar, 1-D, or 2-D after removing trailing "
+            f"singleton dimensions; got {tuple(value.shape)}"
+        )
+
+    out_features, in_features = weight_shape
+    if value.dim() == 1:
+        count = value.numel()
+        if count == out_features:
+            value = value.reshape(out_features, 1)
+        elif count == in_features:
+            value = value.reshape(1, in_features)
+        elif count % out_features == 0:
+            columns = count // out_features
+            if columns > in_features or in_features % columns != 0:
+                raise ValueError(
+                    f"{name} shape {tuple(value.shape)} is incompatible with "
+                    f"weight shape {weight_shape}"
+                )
+            value = value.reshape(out_features, columns)
+        elif count < in_features and in_features % count == 0:
+            value = value.reshape(1, count)
+        else:
+            raise ValueError(
+                f"{name} shape {tuple(value.shape)} is incompatible with "
+                f"weight shape {weight_shape}"
+            )
+
+    rows, columns = value.shape
+    if rows not in (1, out_features):
+        raise ValueError(
+            f"{name} first dimension must be 1 or {out_features}, got "
+            f"{tuple(value.shape)}"
+        )
+    if columns > in_features or in_features % columns != 0:
+        raise ValueError(
+            f"{name} second dimension must divide input width {in_features}, "
+            f"got {tuple(value.shape)}"
+        )
+    return value
+
+
+def _reshape_grouped_dynamic_qparam(
+    value: Tensor,
+    weight_shape: Tuple[int, int],
+    num_groups: int,
+    name: str,
+) -> Tensor:
+    """View a qparam so it broadcasts over [out, groups, group_size]."""
+    if value.dim() == 0:
+        return value
+
+    _, in_features = weight_shape
+    rows, columns = value.shape
+    group_size = in_features // num_groups
+    if columns == 1:
+        return value.reshape(rows, 1, 1)
+    if columns == num_groups:
+        return value.unsqueeze(-1)
+    if columns == in_features:
+        return value.reshape(rows, num_groups, group_size)
+    raise ValueError(
+        f"{name} shape {tuple(value.shape)} cannot broadcast across "
+        f"{num_groups} weight groups for weight shape {weight_shape}"
+    )
+
+
 def dequantize_weight_dynamic(
     weight_data: Tensor,
     weight_scale: Tensor,
     weight_offset: Tensor = None,
     dtype: torch.dtype = torch.float16,
 ) -> Tensor:
+    """Dequantize dynamic weights, including per-channel and per-group layouts.
+
+    Per-group checkpoints store scale/offset as ``[out_features, num_groups]``.
+    The weight group size is inferred from those tensors; it is independent of
+    the activation fake-quant group size selected by the CLI.
     """
-    W8A8_DYNAMIC / W8A8_MIX 反量化
+    if weight_data.dim() != 2:
+        raise ValueError(
+            "dynamic weight dequantization expects a 2-D matrix, got "
+            f"{tuple(weight_data.shape)}"
+        )
 
-    公式: w_fp = (w_data - offset) * scale
-    """
-    if weight_offset is None:
-        weight_offset = torch.zeros_like(weight_scale)
+    weight_shape = tuple(weight_data.shape)
+    weight_fp = weight_data.to(torch.float32)
+    scale = _canonical_dynamic_qparam(
+        weight_scale, weight_shape, "weight_scale", weight_data.device
+    )
+    offset = None
+    if weight_offset is not None:
+        offset = _canonical_dynamic_qparam(
+            weight_offset, weight_shape, "weight_offset", weight_data.device
+        )
 
-    # 确保 shape 匹配: scale/offset 是 [out_features], 需要扩展到 [out_features, 1]
-    if weight_scale.dim() == 1:
-        weight_scale = weight_scale.unsqueeze(1)
-        weight_offset = weight_offset.unsqueeze(1)
+    scale_columns = scale.shape[1] if scale.dim() == 2 else 1
+    in_features = weight_shape[1]
+    is_grouped = 1 < scale_columns < in_features
+    if is_grouped:
+        num_groups = scale_columns
+        group_size = in_features // num_groups
+        grouped_weight = weight_fp.reshape(
+            weight_shape[0], num_groups, group_size
+        )
+        grouped_scale = _reshape_grouped_dynamic_qparam(
+            scale, weight_shape, num_groups, "weight_scale"
+        )
+        grouped_offset = 0.0
+        if offset is not None:
+            grouped_offset = _reshape_grouped_dynamic_qparam(
+                offset, weight_shape, num_groups, "weight_offset"
+            )
+        result = (grouped_weight - grouped_offset) * grouped_scale
+        return result.reshape(weight_shape).to(dtype)
 
-    w_fp = (weight_data.to(torch.float32) - weight_offset) * weight_scale
-    return w_fp.to(dtype)
+    try:
+        result = weight_fp if offset is None else weight_fp - offset
+        return (result * scale).to(dtype)
+    except RuntimeError as exc:
+        offset_shape = None if offset is None else tuple(offset.shape)
+        raise ValueError(
+            "dynamic weight qparams are not broadcast-compatible: "
+            f"weight={weight_shape}, scale={tuple(scale.shape)}, "
+            f"offset={offset_shape}"
+        ) from exc
 
 
 def dequantize_weight_static(
@@ -841,7 +960,10 @@ def _dequant_msslim_weight(weight_data: Tensor, quant_type: str, quant_name: str
             ), "loaded"
         return None, "skipped"
 
-    if quant_type in ("W4A16", "W4A8_DYNAMIC", "W4A8", "W4A4_DYNAMIC", "W4A4_LAOS"):
+    if quant_type in (
+        "W4A16", "W4A8_DYNAMIC", "W4A8", "W4A4_DYNAMIC", "W4A4_LAOS",
+        "W4A4_INT4_PER_GROUP",
+    ):
         weight_scale = sf_reader.get_tensor(f"{quant_name}.weight_scale")
         weight_offset = sf_reader.get_tensor(f"{quant_name}.weight_offset")
         if weight_data.dtype == torch.int8 and weight_scale is not None:
@@ -858,7 +980,7 @@ _KNOWN_QUANT_TYPES = (
     "W8A8", "W8A8S", "W8A8_DYNAMIC", "W8A8_MIX", "W8A8_MXFP8",
     "W4A8_MXFP", "W4A4_MXFP4",
     "W4A16", "W4A8_DYNAMIC", "W4A8",
-    "W4A4_DYNAMIC", "W4A4_LAOS",
+    "W4A4_DYNAMIC", "W4A4_LAOS", "W4A4_INT4_PER_GROUP",
 )
 
 
@@ -1533,7 +1655,10 @@ def _load_3d_expert_indexed(name, param, sf_reader, quant_desc_str, dtype, use_f
     g0_key = f"{expert_prefix}.0.gate_proj.weight" if is_gate_up else f"{expert_prefix}.0.down_proj.weight"
     g0_type = quant_desc_str.get(g0_key, quant_desc_str.get(parse_base_name(g0_key), "FLOAT"))
     is_w4_packed = g0_type in _MXFP4_QUANT_TYPES
-    is_w4_unpack = g0_type in ("W4A8_DYNAMIC", "W4A16", "W4A8", "W4A4_DYNAMIC", "W4A4_LAOS")
+    is_w4_unpack = g0_type in (
+        "W4A8_DYNAMIC", "W4A16", "W4A8", "W4A4_DYNAMIC", "W4A4_LAOS",
+        "W4A4_INT4_PER_GROUP",
+    )
 
     if is_gate_up:
         return _load_3d_expert_indexed_gate_up(
@@ -1657,7 +1782,10 @@ def _dequant_single_expert_indexed(weight_key, quant_type, sf_reader, dtype, use
             return dequantize_weight_mx(weight_data, weight_scale_u8, quant_type, dtype=dtype)
         return None
 
-    if quant_type in ("W4A8_DYNAMIC", "W4A16", "W4A8", "W4A4_DYNAMIC", "W4A4_LAOS"):
+    if quant_type in (
+        "W4A8_DYNAMIC", "W4A16", "W4A8", "W4A4_DYNAMIC", "W4A4_LAOS",
+        "W4A4_INT4_PER_GROUP",
+    ):
         weight_scale = sf_reader.get_tensor(f"{quant_name}.weight_scale")
         weight_offset = sf_reader.get_tensor(f"{quant_name}.weight_offset")
         if weight_scale is not None and weight_data.dtype == torch.int8:
