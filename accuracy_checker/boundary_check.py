@@ -59,6 +59,36 @@ class BoundaryResult:
     limitations: List[str] = field(default_factory=list)
 
 
+def normalize_request_payload(data: Any) -> Dict[str, Any]:
+    """校验并规范化 OpenAI/vLLM Chat 请求；messages 数组可直接简写。"""
+    if isinstance(data, list):
+        data = {"messages": data}
+    if not isinstance(data, dict):
+        raise ValueError("完整请求必须是 JSON object，或直接传 messages 数组")
+    messages = data.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise ValueError("完整请求的 messages 必须是非空数组")
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or not isinstance(message.get("role"), str):
+            raise ValueError(f"messages[{index}] 必须是含 role 的 object")
+        if "content" not in message and not message.get("tool_calls"):
+            raise ValueError(f"messages[{index}] 缺少 content/tool_calls")
+    for key in ("max_tokens", "max_new_tokens"):
+        if key in data and (not isinstance(data[key], int) or data[key] <= 0):
+            raise ValueError(f"{key} 必须是正整数")
+    if "tools" in data and not isinstance(data["tools"], list):
+        raise ValueError("tools 必须是数组")
+    return dict(data)
+
+
+def parse_request_json(raw: str) -> Dict[str, Any]:
+    """解析命令行直接粘贴的完整请求 JSON。"""
+    try:
+        return normalize_request_payload(json.loads(raw))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"request_json 不是合法 JSON: {exc}") from exc
+
+
 # ----- badcase 启发式判定 -----
 
 def repeat_4gram_ratio(text: str, n: int = 4) -> float:
@@ -179,10 +209,6 @@ def detect_badcase(
         "thinking_truncated": thinking_truncated,
     }
 
-    if thinking_truncated:
-        return {"reproduced": None, "reason": "thinking 被截断, 无法判定",
-                "metrics": metrics}
-
     if not text or not text.strip():
         return {"reproduced": None, "reason": "空生成, 无法判定", "metrics": metrics}
 
@@ -196,6 +222,10 @@ def detect_badcase(
     result = _detect_badcase_heuristics(text, p, output_tokens, metrics)
     if result is not None:
         return result
+
+    if thinking_truncated:
+        return {"reproduced": None, "reason": "thinking 被截断且未发现明确复读, 无法判定",
+                "metrics": metrics}
 
     return {"reproduced": False, "reason": "通过启发式检测, 未发现坏 case 特征",
             "metrics": metrics}
@@ -213,17 +243,20 @@ def _run_transformers_on_path(
     framework_gen_config: Optional[Dict],
     verbose: bool,
     label: str,
-) -> Dict[str, Any]:
+    num_runs: int = 1,
+    concurrency: int = 1,
+    stop_on_first_badcase: bool = False,
+    bad_pattern: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     """在给定 model_path 上跑原生 Transformers generate, 复用 hf_inference_check 加载链。
 
     通过临时 prompt_file 把单轮对话喂给 hf_inference_check, 避免重复实现
-    skeleton/distribute/dequantize 逻辑。返回第一条对话的解码结果 +
-    gen-config 对齐信息 (供 evidence/limitations 使用)。
+    skeleton/distribute/dequantize 逻辑。返回全部批次的逐次解码结果。
 
     若 do_sample 启用, hf_inference_check 当前固定 greedy, 这里记录 limitation。
     """
     # 延迟 import 避免循环
-    from .inference_check import hf_inference_check, load_prompt_file
+    from .inference_check import hf_inference_check
 
     # 临时写入单对话 prompt 文件 (load_prompt_file 接受 dict 带 messages+tools)
     payload = {"messages": messages}
@@ -238,6 +271,14 @@ def _run_transformers_on_path(
     try:
         # framework_gen_config 对齐: 当前 hf_inference_check 只暴露 max_new_tokens/
         # thinking(do_sample=False), 其余 (temperature/top_p/top_k) 无法对齐 → 记录
+        def _is_bad(run: Dict[str, Any]) -> bool:
+            text = run.get("raw_text") or run.get("generated", "")
+            detected = detect_badcase(
+                text, run.get("thinking_truncated", False),
+                run.get("output_tokens", 0), bad_pattern,
+            )
+            return detected["reproduced"] is True
+
         results = hf_inference_check(
             model_path=model_path,
             devices=devices,
@@ -247,6 +288,9 @@ def _run_transformers_on_path(
             skip_ppl=True,
             thinking=thinking,
             verbose=verbose,
+            num_runs=num_runs,
+            concurrency=concurrency,
+            stop_predicate=_is_bad if stop_on_first_badcase else None,
         )
     finally:
         try:
@@ -257,11 +301,63 @@ def _run_transformers_on_path(
     if not results:
         raise RuntimeError(f"[{label}] hf_inference_check 未返回结果")
 
-    # hf_inference_check 返回 {messages, generated, thinking, input_tokens,
-    # output_tokens, time, thinking_truncated}
-    first = results[0]
-    first["__label__"] = label
-    return first
+    for run in results:
+        run["__label__"] = label
+    return results
+
+
+def _summarize_transformers_runs(
+    outputs: List[Dict[str, Any]], requested_runs: int, concurrency: int,
+    bad_pattern: Optional[Dict[str, Any]],
+) -> Tuple[Optional[bool], Dict[str, Any]]:
+    """逐次检测并汇总偶现 bad case；任一次命中即视为复现。"""
+    runs = []
+    bad_count = inconclusive_count = 0
+    first_bad_run = None
+    for index, output in enumerate(outputs, 1):
+        text = output.get("raw_text") or output.get("generated", "")
+        detected = detect_badcase(
+            text, output.get("thinking_truncated", False),
+            output.get("output_tokens", 0), bad_pattern,
+        )
+        if detected["reproduced"] is True:
+            bad_count += 1
+            first_bad_run = first_bad_run or output.get("run_index", index)
+        elif detected["reproduced"] is None:
+            inconclusive_count += 1
+        runs.append({
+            "run_index": output.get("run_index", index),
+            "output_full": text,
+            "answer": output.get("generated", ""),
+            "thinking": output.get("thinking", ""),
+            "thinking_truncated": output.get("thinking_truncated", False),
+            "input_tokens": output.get("input_tokens"),
+            "output_tokens": output.get("output_tokens"),
+            "batch_time": output.get("batch_time", output.get("time")),
+            "detect": detected,
+        })
+
+    completed = len(runs)
+    clean_count = completed - bad_count - inconclusive_count
+    reproduced = True if bad_count else (None if inconclusive_count else False)
+    representative = next(
+        (r for r in runs if r["detect"]["reproduced"] is True),
+        runs[0] if runs else {},
+    )
+    return reproduced, {
+        "requested_runs": requested_runs,
+        "completed_runs": completed,
+        "stopped_early": completed < requested_runs,
+        "concurrency": concurrency,
+        "badcase_runs": bad_count,
+        "clean_runs": clean_count,
+        "inconclusive_runs": inconclusive_count,
+        "badcase_rate": (bad_count / completed if completed else None),
+        "first_badcase_run": first_bad_run,
+        "output_preview": representative.get("output_full", "")[:200],
+        "output_full": representative.get("output_full", ""),
+        "runs": runs,
+    }
 
 
 def _check_tokenizer_consistency(
@@ -337,7 +433,8 @@ def run_boundary(
     prompt: Optional[str] = None,
     messages: Optional[List[Dict]] = None,
     prompt_file: Optional[str] = None,
-    max_new_tokens: int = 1024,
+    request_payload: Optional[Dict[str, Any]] = None,
+    max_new_tokens: Optional[int] = None,
     dtype: str = "bfloat16",
     thinking: str = "chat",
     # 框架侧 (部署框架已知坏 case)
@@ -351,6 +448,9 @@ def run_boundary(
     run_ref: bool = True,
     run_quant: bool = True,
     verbose: bool = True,
+    num_runs: int = 1,
+    concurrency: int = 1,
+    stop_on_first_badcase: bool = False,
 ) -> BoundaryResult:
     """定界主入口 — 区分 WEIGHT / INFERENCE_FRAMEWORK / BOTH / INCONCLUSIVE / INVALID_RUN。
 
@@ -370,6 +470,38 @@ def run_boundary(
       - 量化模型 → hf_inference_check 内 NPU 加速反量化路径 (CPU fallback 未回迁)
       - 非量化模型 → 直接 safetensors 加载
     """
+    request_payload = dict(request_payload or {})
+    if prompt_file and not request_payload:
+        try:
+            with open(prompt_file, encoding="utf-8") as f:
+                loaded = json.load(f)
+            request_payload = normalize_request_payload(loaded)
+        except Exception:
+            # 统一交给 _boundary_resolve_conversation 生成 INVALID_RUN。
+            pass
+    if request_payload:
+        request_payload = normalize_request_payload(request_payload)
+    if messages is None and isinstance(request_payload.get("messages"), list):
+        messages = request_payload["messages"]
+    if max_new_tokens is None:
+        max_new_tokens = int(
+            request_payload.get("max_new_tokens")
+            or request_payload.get("max_tokens")
+            or 1024
+        )
+    request_gen_config = {
+        key: request_payload[key]
+        for key in (
+            "temperature", "top_p", "top_k", "repetition_penalty",
+            "frequency_penalty", "presence_penalty", "seed", "tools",
+        )
+        if key in request_payload
+    }
+    if framework_gen_config is None:
+        framework_gen_config = request_gen_config or None
+    elif request_gen_config:
+        framework_gen_config = {**request_gen_config, **framework_gen_config}
+
     # ---- resolve single conversation ----
     messages, invalid_result = _boundary_resolve_conversation(
         messages, prompt, prompt_file, framework_name,
@@ -385,11 +517,15 @@ def run_boundary(
         "dtype": dtype,
         "max_new_tokens": max_new_tokens,
         "thinking": thinking,
+        "num_runs": num_runs,
+        "concurrency": concurrency,
+        "stop_on_first_badcase": stop_on_first_badcase,
         "generation_config": {
             "do_sample": False,  # hf_inference_check 当前固定 greedy
             "use_cache": True,
         },
         "framework_gen_config": framework_gen_config,
+        "request_model": request_payload.get("model"),
         "messages_preview": (messages[-1].get("content", "")[:120]
                              if messages else ""),
     }
@@ -411,14 +547,16 @@ def run_boundary(
     invalid_result, tq_reproduced = _boundary_run_quant(
         run_quant, quant_model_path, devices, dtype, messages, thinking,
         max_new_tokens, framework_gen_config, verbose, bad_pattern,
-        evidence, limitations, framework_name, framework_bad_reproduced, fw_reproduced)
+        evidence, limitations, framework_name, framework_bad_reproduced, fw_reproduced,
+        num_runs, concurrency, stop_on_first_badcase)
     if invalid_result is not None:
         return invalid_result
 
     # ---- transformers(ref) 路径 (可选) ----
     ref_reproduced = _boundary_run_ref(
         run_ref, ref_model_path, devices, dtype, messages, thinking,
-        max_new_tokens, framework_gen_config, verbose, bad_pattern, evidence, limitations)
+        max_new_tokens, framework_gen_config, verbose, bad_pattern, evidence, limitations,
+        num_runs, concurrency, stop_on_first_badcase)
 
     # ---- 分类 ----
     result_kind = classify_boundary(fw_reproduced, tq_reproduced, ref_reproduced)
@@ -528,30 +666,22 @@ def _boundary_run_quant(run_quant: bool, quant_model_path: str, devices: str,
                        evidence: Dict[str, Any], limitations: List[str],
                        framework_name: Optional[str],
                        framework_bad_reproduced: Optional[bool],
-                       fw_reproduced: Optional[bool]) -> Tuple[Optional[BoundaryResult], Optional[bool]]:
+                       fw_reproduced: Optional[bool], num_runs: int,
+                       concurrency: int,
+                       stop_on_first_badcase: bool) -> Tuple[Optional[BoundaryResult], Optional[bool]]:
     """transformers(quant) 路径运行; 成功时返回 (None, tq_reproduced),
     失败时返回 (_invalid 结果, None)"""
     if not run_quant:
         return None, None
     try:
-        qt_out = _run_transformers_on_path(
+        qt_outputs = _run_transformers_on_path(
             quant_model_path, devices, dtype, messages, thinking,
-            max_new_tokens, framework_gen_config, verbose, label="quant")
-        d_qt = detect_badcase(
-            qt_out.get("generated", ""),
-            thinking_truncated=qt_out.get("thinking_truncated", False),
-            output_tokens=qt_out.get("output_tokens", 0),
-            pattern=bad_pattern)
-        tq_reproduced = d_qt["reproduced"]
-        evidence["transformers_run"]["quant"] = {
-            "output_preview": (qt_out.get("generated") or "")[:200],
-            "output_full": qt_out.get("generated") or "",
-            "thinking_truncated": qt_out.get("thinking_truncated"),
-            "input_tokens": qt_out.get("input_tokens"),
-            "output_tokens": qt_out.get("output_tokens"),
-            "time": qt_out.get("time"),
-            "detect": d_qt,
-        }
+            max_new_tokens, framework_gen_config, verbose, label="quant",
+            num_runs=num_runs, concurrency=concurrency,
+            stop_on_first_badcase=stop_on_first_badcase, bad_pattern=bad_pattern)
+        tq_reproduced, summary = _summarize_transformers_runs(
+            qt_outputs, num_runs, concurrency, bad_pattern)
+        evidence["transformers_run"]["quant"] = summary
         return None, tq_reproduced
     except Exception as e:
         return _invalid(f"transformers(quant) 运行失败: {e}", framework_name,
@@ -565,27 +695,20 @@ def _boundary_run_ref(run_ref: bool, ref_model_path: Optional[str],
                      thinking: str, max_new_tokens: int,
                      framework_gen_config: Optional[Dict], verbose: bool,
                      bad_pattern: Optional[Dict], evidence: Dict[str, Any],
-                     limitations: List[str]) -> Optional[bool]:
+                     limitations: List[str], num_runs: int, concurrency: int,
+                     stop_on_first_badcase: bool) -> Optional[bool]:
     """transformers(ref) 路径运行 (可选); 失败时记录到 limitations 不中止"""
     if not (run_ref and ref_model_path):
         return None
     try:
-        ref_out = _run_transformers_on_path(
+        ref_outputs = _run_transformers_on_path(
             ref_model_path, devices, dtype, messages, thinking,
-            max_new_tokens, framework_gen_config, verbose, label="ref")
-        d_ref = detect_badcase(
-            ref_out.get("generated", ""),
-            thinking_truncated=ref_out.get("thinking_truncated", False),
-            output_tokens=ref_out.get("output_tokens", 0),
-            pattern=bad_pattern)
-        ref_reproduced = d_ref["reproduced"]
-        evidence["transformers_run"]["ref"] = {
-            "output_preview": (ref_out.get("generated") or "")[:200],
-            "output_full": ref_out.get("generated") or "",
-            "thinking_truncated": ref_out.get("thinking_truncated"),
-            "output_tokens": ref_out.get("output_tokens"),
-            "detect": d_ref,
-        }
+            max_new_tokens, framework_gen_config, verbose, label="ref",
+            num_runs=num_runs, concurrency=concurrency,
+            stop_on_first_badcase=stop_on_first_badcase, bad_pattern=bad_pattern)
+        ref_reproduced, summary = _summarize_transformers_runs(
+            ref_outputs, num_runs, concurrency, bad_pattern)
+        evidence["transformers_run"]["ref"] = summary
         return ref_reproduced
     except Exception as e:
         evidence["transformers_run"]["ref_error"] = str(e)
@@ -647,12 +770,14 @@ def run_boundary_cli(args):
     if args.framework_bad_reproduced is not None:
         fw_repro = (args.framework_bad_reproduced == "true")
 
+    request_payload = parse_request_json(args.request_json) if args.request_json else None
     result = run_boundary(
         quant_model_path=args.model_path,
         devices=args.devices,
         ref_model_path=args.ref_model_path,
         prompt=args.prompt,
         prompt_file=args.prompt_file,
+        request_payload=request_payload,
         max_new_tokens=args.max_new_tokens,
         dtype=args.dtype,
         thinking=args.thinking,
@@ -662,6 +787,9 @@ def run_boundary_cli(args):
         bad_pattern=bad_pattern,
         run_ref=(not args.no_ref),
         verbose=True,
+        num_runs=args.num_runs,
+        concurrency=args.concurrency,
+        stop_on_first_badcase=args.stop_on_first_badcase,
     )
 
     out = boundary_result_to_dict(result)
@@ -710,7 +838,7 @@ __all__ = [
     "WEIGHT_OR_QUANTIZATION", "INFERENCE_FRAMEWORK", "BOTH",
     "INCONCLUSIVE", "INVALID_RUN",
     "repeat_4gram_ratio", "nonprintable_ratio",
-    "detect_badcase",
+    "detect_badcase", "normalize_request_payload", "parse_request_json",
     "classify_boundary", "run_boundary", "boundary_result_to_dict",
     "run_boundary_cli", "print_boundary_verdict_explain",
 ]

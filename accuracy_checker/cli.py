@@ -22,13 +22,16 @@ def main():
     parser.add_argument("--devices", default="npu:0",
                         help="逻辑设备列表，如 npu:0,1,2,3")
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16"])
-    parser.add_argument("--max_new_tokens", type=int, default=2048)
+    parser.add_argument("--max_new_tokens", type=int, default=None,
+                        help="最大生成 token；boundary 未传时读取 prompt_file 的 max_tokens")
     parser.add_argument("--skip_ppl", action="store_true")
     parser.add_argument("--thinking", default="chat",
                         choices=["chat", "none"],
                         help="thinking 模式: chat=开思维链, none=关闭")
     parser.add_argument("--prompt_file", default=None,
                         help="JSON 文件，vLLM 请求格式或对话列表")
+    parser.add_argument("--request_json", default=None,
+                        help="直接粘贴完整 OpenAI/vLLM 请求 JSON")
     parser.add_argument("--use_cpu_dequant", action="store_true",
                         help="回退到旧 CPU 全量反量化流程")
     parser.add_argument("--noquit", action="store_true",
@@ -53,6 +56,12 @@ def main():
                         help="[boundary] 跳过 ref 运行 (默认 run_ref=True)")
     parser.add_argument("--json_out", action="store_true",
                         help="[boundary] 以 JSON 打印结构化结果 (供 Agent D 解析)")
+    parser.add_argument("--num_runs", type=int, default=1,
+                        help="[boundary] 同一 prompt 总运行次数")
+    parser.add_argument("--concurrency", type=int, default=1,
+                        help="[boundary] 每个 Transformers generate batch 的并发样本数")
+    parser.add_argument("--stop_on_first_badcase", action="store_true",
+                        help="[boundary] 首批检测到 bad case 后提前停止")
     args = parser.parse_args()
 
     if args.boundary and args.mode == "inference":
@@ -66,7 +75,7 @@ def main():
         model_path=args.model_path,
         devices=args.devices,
         dtype=args.dtype,
-        max_new_tokens=args.max_new_tokens,
+        max_new_tokens=args.max_new_tokens or 2048,
         prompt_file=args.prompt_file,
         skip_ppl=args.skip_ppl,
         thinking=args.thinking,

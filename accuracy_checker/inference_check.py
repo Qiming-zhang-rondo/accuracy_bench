@@ -31,7 +31,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -1617,80 +1617,66 @@ def _hf_verify_model_loaded(model: nn.Module, verbose: bool):
         logger.info("  所有参数已加载到设备 ✅")
 
 
-def _hf_generate_one_conversation(model, tokenizer, messages, request_tools,
-                                  thinking, max_new_tokens, first_device,
-                                  conv_idx: int):
-    """生成单个对话, 返回结果 dict"""
+def _hf_generate_conversation_batch(model, tokenizer, messages, request_tools, thinking,
+                                    max_new_tokens, first_device, conv_idx, batch_size, run_offset):
     processed = preprocess_messages(messages)
-
-    template_kwargs = dict(
-        conversation=processed, tokenize=False, add_generation_prompt=True,
-        enable_thinking=(thinking == "chat"),
-    )
-    if request_tools:
-        template_kwargs["tools"] = request_tools
-
+    template_kwargs = dict(conversation=processed, tokenize=False,
+                           add_generation_prompt=True, enable_thinking=(thinking == "chat"))
+    if request_tools: template_kwargs["tools"] = request_tools
     text = tokenizer.apply_chat_template(**template_kwargs)
     inputs = tokenizer(text, return_tensors="pt")
     input_ids = inputs["input_ids"].to(first_device)
+    batched_ids = input_ids.repeat(batch_size, 1)
+    attention_mask = inputs.get("attention_mask")
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(first_device).repeat(batch_size, 1)
 
     last_user = [m["content"] for m in messages if m["role"] == "user"][-1] \
         if any(m["role"] == "user" for m in messages) else f"对话{conv_idx+1}"
     logger.info(f"\n--- 对话 {conv_idx+1} (last user: {last_user[:60]}...) ---")
-    logger.info(f"  输入 token 数: {input_ids.shape[1]}")
+    logger.info(f"  输入 token 数: {input_ids.shape[1]}, batch={batch_size}, "
+                f"runs={run_offset + 1}-{run_offset + batch_size}")
 
     with torch.no_grad():
         t0 = time.time()
-        output = model.generate(
-            input_ids,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            use_cache=True,
-            output_scores=True,
-            return_dict_in_generate=True,
-        )
+        output = model.generate(batched_ids, attention_mask=attention_mask,
+                                max_new_tokens=max_new_tokens, do_sample=False,
+                                use_cache=True, return_dict_in_generate=True)
         gen_time = time.time() - t0
 
-    # Debug: print top-5 logits for first generated token
-    if hasattr(output, 'scores') and output.scores:
-        first_scores = output.scores[0]  # [1, vocab_size]
-        top5_vals, top5_ids = torch.topk(first_scores[0], 5)
-        top5_tokens = [tokenizer.decode([tid.item()]) for tid in top5_ids]
-        logger.info(f"  [DEBUG] first token top-5: {list(zip(top5_tokens, top5_vals.tolist()))}")
-
-    new_tokens = output.sequences[0][input_ids.shape[1]:]
-    decoded = decode_output(tokenizer, new_tokens)
-
-    if decoded["thinking_truncated"]:
-        logger.info(f"  生成 ({gen_time:.1f}s, {len(new_tokens)} tokens):")
-        logger.info(f"  [Thinking (截断)]: {decoded['thinking'][:500]}")
-        logger.info(f"  [WARNING] 思维链被截断，需要增大 max_new_tokens")
-    elif decoded["thinking"]:
-        logger.info(f"  生成 ({gen_time:.1f}s, {len(new_tokens)} tokens):")
-        logger.info(f"  [Thinking]: {decoded['thinking'][:500]}")
-        logger.info(f"  [Answer]: {decoded['answer'][:500]}")
-    else:
-        logger.info(f"  生成 ({gen_time:.1f}s, {len(new_tokens)} tokens): {decoded['answer'][:500]}")
-
-    return {
-        "messages": messages,
-        "generated": decoded["answer"],
-        "thinking": decoded["thinking"],
-        "input_tokens": input_ids.shape[1],
-        "output_tokens": len(new_tokens),
-        "time": gen_time,
-        "thinking_truncated": decoded["thinking_truncated"],
-    }
+    results = []
+    for batch_idx in range(batch_size):
+        new_tokens = output.sequences[batch_idx][input_ids.shape[1]:]
+        pad_id = tokenizer.pad_token_id
+        if pad_id is not None:
+            while len(new_tokens) and new_tokens[-1].item() == pad_id:
+                new_tokens = new_tokens[:-1]
+        decoded = decode_output(tokenizer, new_tokens)
+        run_index = run_offset + batch_idx + 1
+        preview = decoded["answer"] or decoded["thinking"]
+        logger.info(f"  run {run_index}: {len(new_tokens)} tokens, "
+                    f"{preview[:160] if preview else '(empty)'}")
+        results.append({
+            "run_index": run_index, "batch_index": batch_idx, "messages": messages,
+            "generated": decoded["answer"], "thinking": decoded["thinking"],
+            "raw_text": decoded["raw_text"], "input_tokens": input_ids.shape[1],
+            "output_tokens": len(new_tokens), "batch_time": gen_time, "time": gen_time,
+            "thinking_truncated": decoded["thinking_truncated"],
+        })
+    return results
 
 
 def _hf_run_generation(model, tokenizer, prompt_file, thinking, max_new_tokens,
-                       first_device, verbose: bool) -> List[Dict[str, Any]]:
-    """[6/6] 推理测试主循环"""
+                       first_device, verbose: bool, num_runs: int = 1,
+                       concurrency: int = 1,
+                       stop_predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
+                       conversations_override=None, request_tools_override=None):
     if verbose:
         logger.info("\n[6/6] 推理测试...")
-
-    # 加载 prompt
-    if prompt_file:
+    if conversations_override is not None:
+        conversations = conversations_override
+        request_tools = request_tools_override
+    elif prompt_file:
         conversations, request_tools = load_prompt_file(prompt_file)
     else:
         conversations = DEFAULT_CONVERSATIONS
@@ -1698,11 +1684,18 @@ def _hf_run_generation(model, tokenizer, prompt_file, thinking, max_new_tokens,
 
     results = []
     for i, messages in enumerate(conversations):
-        result = _hf_generate_one_conversation(
-            model, tokenizer, messages, request_tools,
-            thinking, max_new_tokens, first_device, i,
-        )
-        results.append(result)
+        completed = 0
+        while completed < num_runs:
+            batch_size = min(concurrency, num_runs - completed)
+            batch_results = _hf_generate_conversation_batch(
+                model, tokenizer, messages, request_tools, thinking,
+                max_new_tokens, first_device, i, batch_size, completed,
+            )
+            results.extend(batch_results)
+            completed += batch_size
+            if stop_predicate and any(stop_predicate(r) for r in batch_results):
+                logger.info(f"  检测到 bad case，提前停止于 run {completed}")
+                break
     return results
 
 
@@ -1753,6 +1746,11 @@ def hf_inference_check(
     verbose: bool = True,
     use_cpu_dequant: bool = False,
     noquit: bool = False,
+    num_runs: int = 1,
+    concurrency: int = 1,
+    stop_predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
+    conversations: Optional[List[List[Dict[str, Any]]]] = None,
+    request_tools: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """
     通用 HF 推理检查入口。
@@ -1778,6 +1776,8 @@ def hf_inference_check(
     """
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16}
     torch_dtype = dtype_map[dtype]
+    if num_runs < 1 or concurrency < 1:
+        raise ValueError("num_runs 和 concurrency 必须为正整数")
     device_list = parse_devices(devices)
 
     _hf_log_header(model_path, device_list, dtype, use_cpu_dequant, verbose)
@@ -1805,8 +1805,12 @@ def hf_inference_check(
     first_device = device_list[0]
 
     # ---- Step 6: 推理 ----
-    results = _hf_run_generation(model, tokenizer, prompt_file, thinking,
-                                 max_new_tokens, first_device, verbose)
+    results = _hf_run_generation(
+        model, tokenizer, prompt_file, thinking, max_new_tokens, first_device,
+        verbose, num_runs=num_runs, concurrency=concurrency,
+        stop_predicate=stop_predicate, conversations_override=conversations,
+        request_tools_override=request_tools,
+    )
 
     # PPL
     _hf_run_ppl(model, tokenizer, first_device, skip_ppl)

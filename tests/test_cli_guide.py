@@ -55,6 +55,9 @@ class TestCliGuide(unittest.TestCase):
             "dsparkSample", "kimiKdaField", "activationQuantType",
             "targetLayersField", "cacheDir", "mlaFine", "l2WorkflowNote",
             "paramSearch", "paramRows",
+            "boundaryFields", "promptFile", "requestJson", "numRuns", "concurrency",
+            "maxNewTokens", "noRef", "frameworkReproduced",
+            "stopOnFirstBadcase", "repeat4gramMax", "nonprintableMax",
         }
         self.assertTrue(required.issubset(self.parser.ids))
 
@@ -126,6 +129,18 @@ class TestCliGuide(unittest.TestCase):
         self.assertIn("_write_stage_report_artifacts(args, report, mode)", source)
         self.assertIn('"product_report.html"', source)
         self.assertIn('"report_data.json"', source)
+
+    def test_boundary_builder_supports_quant_only_batched_runs(self):
+        for marker in (
+            'line("--prompt_file"', 'line("--request_json"', 'line("--num_runs"',
+            'line("--concurrency"', 'line("--no_ref")',
+            'line("--framework_bad_reproduced"',
+            'line("--stop_on_first_badcase")',
+            '"boundary_runs.jsonl"',
+        ):
+            self.assertIn(marker, self.html if "boundary_runs" not in marker else RUN_SCRIPT.read_text(encoding="utf-8"))
+        self.assertIn("npu:\" + logicalIds.join", self.html)
+        self.assertIn("总结果仍为运行次数", self.html)
 
     def test_report_runs_are_archived_and_latest_opens_history(self):
         run_source = RUN_SCRIPT.read_text(encoding="utf-8")

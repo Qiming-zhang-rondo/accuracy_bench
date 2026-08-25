@@ -85,9 +85,29 @@ python3 run_accuracy_check.py --mode boundary \
   --ref_model <BF16_REF> --quant_model <QUANT_MODEL> --devices npu:0,1 \
   --messages '[{"role":"user","content":"比较 0.1 和 0.01"}]' \
   --thinking none --max_new_tokens 128
+
+# 4. 大模型独占 16 卡：Quant-only，多批并发复现偶现问题
+# request.json 可直接使用 {"model":..., "max_tokens":..., "messages":[...]} 格式
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 OMP_NUM_THREADS=8 \
+python3 run_accuracy_check.py --mode boundary \
+  --quant_model <GLM52_QUANT_MODEL> \
+  --devices npu:0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
+  --prompt_file request.json --no_ref \
+  --framework_name vllm-ascend --framework_bad_reproduced true \
+  --num_runs 100 --concurrency 10 --output_dir reports
 ```
 
-结果含义：`WEIGHT_OR_QUANTIZATION` = Transformers 量化基线也复现、ref 正常；`INFERENCE_FRAMEWORK` = Transformers 正常、部署框架复现；`BOTH` = ref/量化/框架均复现；`INCONCLUSIVE` = 输出过短或证据不足；`INVALID_RUN` = 某次模型运行未完成。没有 `--framework_bad_output` 时只能验证本地 ref/quant，不能单独证明部署框架有问题。
+`--num_runs` 是总结果数，`--concurrency` 是每个纯 Transformers generate batch 的样本数；上例会生成 100 条结果（约 10 批），不是 1000 条。完整逐次输出写入 `boundary_runs.jsonl`，汇总写入 `boundary_result.json`。`--stop_on_first_badcase` 可在首批命中后停止后续批次。请求 JSON 的 `max_tokens` 会在未显式指定 `--max_new_tokens` 时自动采用；`model` 只记录为证据，实际 checkpoint 始终由 `--quant_model` 指定。
+
+不想创建请求文件时，可把同一个对象直接传给 `--request_json`（参数指南页面也提供直接粘贴文本框）：
+
+```bash
+python3 run_accuracy_check.py --mode boundary --quant_model <QUANT> \
+  --devices npu:0,1 --no_ref --num_runs 10 --concurrency 2 \
+  --request_json '{"model":"glm-52","max_tokens":4096,"messages":[{"role":"user","content":"完整问题"}]}'
+```
+
+结果含义：`WEIGHT_OR_QUANTIZATION` = Transformers 量化基线也复现、ref 正常或未运行；`INFERENCE_FRAMEWORK` = Transformers 正常、部署框架复现；`BOTH` = ref/量化/框架均复现；`INCONCLUSIVE` = 输出过短或证据不足；`INVALID_RUN` = 某次模型运行未完成。没有部署框架坏输出时，也可用 `--framework_bad_reproduced true` 记录外部已确认的复现事实；两者都没有时不能单独证明框架有问题。
 
 ## 能力
 

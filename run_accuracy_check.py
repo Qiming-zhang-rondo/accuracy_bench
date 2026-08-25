@@ -8,7 +8,7 @@
     python run_accuracy_check.py --mode boundary      # 定界: 框架 vs 权重/量化
     python run_accuracy_check.py --mode l1            # L1 逐 block 对比
     python run_accuracy_check.py --mode l2 --target-layers 8,9   # L2 子图诊断
-    python run_accuracy_check.py --mode full          # L0→Boundary→L1→Top-K→L2→logits→JSON→HTML
+    python run_accuracy_check.py --mode full          # L0→L1→Top-K→L2→logits→JSON→HTML
     python run_accuracy_check.py --mode report --result-json r.json   # 从 JSON 生成 HTML
 
 支持 HF 模型 (GLM-5.1, Qwen3 系列)。
@@ -94,6 +94,10 @@ def parse_args():
                         help="对比用的输入文本")
     parser.add_argument("--messages", type=str, default=None,
                         help='Chat messages JSON, 走 apply_chat_template')
+    parser.add_argument("--prompt_file", type=str, default=None,
+                        help="[boundary] 完整 OpenAI/vLLM 请求 JSON 或对话列表文件")
+    parser.add_argument("--request_json", type=str, default=None,
+                        help="[boundary] 直接粘贴完整 OpenAI/vLLM 请求 JSON")
     parser.add_argument("--target_layers", type=str, default=None,
                         help="L2 只检查指定层 (逗号或空格分隔, 如 '8,9' 或 '8 9')")
     parser.add_argument("--target-layers", dest="target_layers_alt", type=str, default=None,
@@ -198,8 +202,8 @@ def parse_args():
     parser.add_argument("--devices", type=str, default=None,
                         help="[boundary] 逻辑设备列表 (如 'npu:0' / 'npu:0,1'); "
                              "缺省沿用 --device / 自动选择")
-    parser.add_argument("--max_new_tokens", type=int, default=1024,
-                        help="[boundary/full] 生成 token 数")
+    parser.add_argument("--max_new_tokens", type=parse_positive_int, default=None,
+                        help="[boundary/full] 生成 token 数；boundary 未传时读取请求 JSON 的 max_tokens")
     parser.add_argument("--thinking", type=str, default="chat",
                         choices=["chat", "none"],
                         help="[boundary] 思维链开关: chat=开, none=关")
@@ -207,6 +211,20 @@ def parse_args():
                         help="[boundary] 部署框架名 (vllm/mindie/...)")
     parser.add_argument("--framework_bad_output", type=str, default=None,
                         help="[boundary] 部署框架实际生成的坏文本")
+    parser.add_argument("--framework_bad_reproduced", choices=["true", "false"], default=None,
+                        help="[boundary] 外部确认部署框架是否复现，不会调用该框架")
+    parser.add_argument("--no_ref", action="store_true",
+                        help="[boundary] Quant-only；不加载参考模型")
+    parser.add_argument("--num_runs", type=parse_positive_int, default=1,
+                        help="[boundary] 同一 prompt 总运行次数")
+    parser.add_argument("--concurrency", type=parse_positive_int, default=1,
+                        help="[boundary] 每个纯 Transformers generate batch 的样本数")
+    parser.add_argument("--stop_on_first_badcase", action="store_true",
+                        help="[boundary] 首批检测到 bad case 后提前停止")
+    parser.add_argument("--repeat_4gram_max", type=float, default=None,
+                        help="[boundary] 4-gram 重复比阈值，默认 0.5")
+    parser.add_argument("--nonprintable_max", type=float, default=None,
+                        help="[boundary] 非可打印字符比阈值，默认 0.3")
     parser.add_argument("--top_k", type=int, default=1,
                         help="[full] L1 后自动选取 cos_sim 最低的 Top-K 层进入 L2")
     parser.add_argument("--logits", action="store_true",
@@ -262,6 +280,8 @@ def _parse_messages(args):
         msgs = json.loads(args.messages)
         if isinstance(msgs, list):
             return msgs
+        if isinstance(msgs, dict) and isinstance(msgs.get("messages"), list):
+            return msgs["messages"]
     except Exception:  # noqa: BLE001
         pass
     return None
@@ -603,25 +623,48 @@ def _mode_boundary(args):
     if not quant:
         return
     from accuracy_checker import run_boundary, boundary_result_to_dict
+    from accuracy_checker.boundary_check import parse_request_json
     devices = args.devices or args.quant_device or args.ref_device or "npu:0"
     logger.info("\n" + "=" * 70)
     logger.info("  Boundary: 框架 vs 权重/量化 定界")
     logger.info("=" * 70)
     logger.info(f"  量化模型: {quant}")
     logger.info(f"  设备: {devices}")
-    messages = _parse_messages(args)
+    try:
+        request_payload = parse_request_json(args.request_json) if args.request_json else None
+    except ValueError as exc:
+        logger.error(f"  Boundary 请求 JSON 无效: {exc}")
+        return None
+    messages = request_payload.get("messages") if request_payload else _parse_messages(args)
+    bad_pattern = {}
+    if args.repeat_4gram_max is not None:
+        bad_pattern["repeat_4gram_max"] = args.repeat_4gram_max
+    if args.nonprintable_max is not None:
+        bad_pattern["nonprintable_max"] = args.nonprintable_max
+    framework_reproduced = (
+        args.framework_bad_reproduced == "true"
+        if args.framework_bad_reproduced is not None else None
+    )
     result = run_boundary(
         quant_model_path=quant,
         devices=devices,
         ref_model_path=args.ref_model,
         prompt=args.prompt if messages is None else None,
         messages=messages,
+        prompt_file=args.prompt_file,
+        request_payload=request_payload,
         max_new_tokens=args.max_new_tokens,
         dtype=args.dtype,
         thinking=args.thinking,
         framework_name=args.framework_name,
         framework_bad_output=args.framework_bad_output,
+        framework_bad_reproduced=framework_reproduced,
+        bad_pattern=bad_pattern or None,
+        run_ref=not args.no_ref,
         verbose=True,
+        num_runs=args.num_runs,
+        concurrency=args.concurrency,
+        stop_on_first_badcase=args.stop_on_first_badcase,
     )
     d = boundary_result_to_dict(result)
     logger.info("\n  定界结果: " + d["boundary_result"])
@@ -629,14 +672,30 @@ def _mode_boundary(args):
                 f"framework_reproduced={d.get('framework_badcase_reproduced')} "
                 f"transformers_quant_reproduced={d.get('transformers_badcase_reproduced')} "
                 f"ref_reproduced={d.get('ref_badcase_reproduced')}")
+    quant_summary = d.get("evidence", {}).get("transformers_run", {}).get("quant", {})
+    if quant_summary:
+        logger.info(
+            f"    quant runs={quant_summary.get('completed_runs')}/"
+            f"{quant_summary.get('requested_runs')} bad={quant_summary.get('badcase_runs')} "
+            f"rate={quant_summary.get('badcase_rate')}"
+        )
     if d.get("limitations"):
         logger.info("    限制: " + "; ".join(d["limitations"])[:500])
-    if args.output_dir:
-        os.makedirs(args.output_dir, exist_ok=True)
-        bpath = os.path.join(args.output_dir, "boundary_result.json")
-        with open(bpath, "w") as f:
-            json.dump(d, f, ensure_ascii=False, indent=2)
-        logger.info(f"  Boundary 结果已保存: {bpath}")
+    out_dir = _resolve_report_run_dir(args, "boundary")
+    os.makedirs(out_dir, exist_ok=True)
+    bpath = os.path.join(out_dir, "boundary_result.json")
+    with open(bpath, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    runs_path = os.path.join(out_dir, "boundary_runs.jsonl")
+    transformers_runs = d.get("evidence", {}).get("transformers_run", {})
+    with open(runs_path, "w", encoding="utf-8") as f:
+        for model_kind in ("quant", "ref"):
+            for run in transformers_runs.get(model_kind, {}).get("runs", []):
+                f.write(json.dumps(
+                    {"model_kind": model_kind, **run}, ensure_ascii=False
+                ) + "\n")
+    logger.info(f"  Boundary 汇总: {bpath}")
+    logger.info(f"  Boundary 逐次结果: {runs_path}")
     # 写入 AlignmentReport (供 full 模式复用)
     return d
 
@@ -976,15 +1035,14 @@ def _full_assemble_and_write(args, l1_report, l2_results, boundary_dict,
 
 
 def _mode_full(args):
-    """L0 → Boundary → L1 → Top-K → L2 → logits → 推理对比 → JSON → HTML"""
+    """L0 → L1 → Top-K → L2 → logits → JSON → HTML。Boundary 独立运行。"""
     ref_device, target_device, dtype = _resolve_devices(args)
 
     # L0
     _full_run_l0(args)
 
-    # Boundary 已移至 scripts/forward_pass_nothink.py (16卡推理)
-    # full 模式只做 L1/L2/logits/HTML
-    logger.info("\n  [full] 跳过 Boundary (用 scripts/forward_pass_nothink.py 单独跑)")
+    # Boundary 的设备布局与 L1/L2 不同（例如 Quant-only 独占 16 卡），独立运行。
+    logger.info("\n  [full] 跳过 Boundary (请用 --mode boundary 单独跑)")
     boundary_dict = None
 
     # L1
@@ -1171,6 +1229,8 @@ def main():
         return
 
     mode = _resolve_mode(args)
+    if args.max_new_tokens is None and mode != "boundary":
+        args.max_new_tokens = 1024
 
     from accuracy_checker.dspark import is_dspark_checkpoint
     standalone_dspark = (
