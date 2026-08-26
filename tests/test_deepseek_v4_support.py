@@ -209,6 +209,27 @@ def test_official_v4_reader_uses_native_quant_descriptor(tmp_path):
     reader.close()
 
 
+def test_unindexed_v4_shards_are_discovered_from_metadata(tmp_path):
+    from accuracy_checker.model_loader import build_weight_index, load_quant_weights
+
+    first = tmp_path / "DeepSeek-V4-00001-of-00002.safetensors"
+    second = tmp_path / "DeepSeek-V4-00002-of-00002.safetensors"
+    save_file({"model.embed_tokens.weight": torch.zeros(2, 2)}, str(first))
+    save_file({"model.layers.0.ffn.experts.0.w1.weight": torch.zeros(2, 2)}, str(second))
+    index = build_weight_index(str(tmp_path))
+    assert index["model.embed_tokens.weight"] == first.name
+    assert index["model.layers.0.ffn.experts.0.w1.weight"] == second.name
+
+    quant_dir = tmp_path / "quant"
+    quant_dir.mkdir()
+    q1 = quant_dir / "quant_model_weights-00001-of-00002.safetensors"
+    q2 = quant_dir / "quant_model_weights-00002-of-00002.safetensors"
+    save_file({"a.weight": torch.ones(2, 2)}, str(q1))
+    save_file({"b.weight": torch.ones(2, 2)}, str(q2))
+    loaded = load_quant_weights(str(quant_dir))
+    assert set(loaded) == {"a.weight", "b.weight"}
+
+
 def test_boundary_aliases_official_v4_nonexpert_weights():
     from accuracy_checker.model_loader import add_deepseek_v4_checkpoint_aliases
 

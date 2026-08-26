@@ -517,18 +517,17 @@ def load_quant_weights(model_path: str) -> Dict[str, Tensor]:
     """加载所有量化权重 (从 safetensors)"""
     # 从 weight_index 找到所有分片文件
     index_path = os.path.join(model_path, "quant_model_weights.safetensors.index.json")
-    if not os.path.exists(index_path):
-        # 可能只有一个safetensors
+    shard_files = set()
+    if os.path.exists(index_path):
+        with open(index_path, 'r') as f:
+            index_data = json.load(f)
+        shard_files = set(index_data.get("weight_map", {}).values())
+    else:
+        # 可能只有一个标准命名的 safetensors 文件；如果没有则继续走
+        # ModelScope 的无 index 多分片回退，而不是提前返回空字典。
         single = os.path.join(model_path, "quant_model_weights.safetensors")
         if os.path.exists(single):
             return load_file(single)
-        return {}
-
-    with open(index_path, 'r') as f:
-        index_data = json.load(f)
-
-    weight_map = index_data.get("weight_map", {})
-    shard_files = set(weight_map.values())
 
     weights = {}
     for shard_file in shard_files:
@@ -537,6 +536,23 @@ def load_quant_weights(model_path: str) -> Dict[str, Tensor]:
             file_weights = load_file(file_path)
             weights.update(file_weights)
 
+    if weights:
+        return weights
+
+    # ModelScope's DeepSeek-V4 W8A8 export contains 74
+    # ``quant_model_weights-xxxxx-of-xxxxx.safetensors`` files but no index
+    # json.  Load each shard lazily at the file level, preserving the existing
+    # CPU dictionary contract used by the resident expert installer.
+    try:
+        shard_names = sorted(
+            name for name in os.listdir(model_path)
+            if name.startswith("quant_model_weights-")
+            and name.endswith(".safetensors")
+        )
+    except OSError:
+        shard_names = []
+    for shard_name in shard_names:
+        weights.update(load_file(os.path.join(model_path, shard_name)))
     return weights
 
 
@@ -745,13 +761,47 @@ def build_weight_index(model_path: str) -> Dict[str, str]:
         weight_map dict, key 是参数名, value 是 shard 文件名
         如果没有 index 文件，返回空 dict
     """
-    for index_name in ("model.safetensors.index.json",
-                       "quant_model_weights.safetensors.index.json"):
+    index_names = [
+        "model.safetensors.index.json",
+        "quant_model_weights.safetensors.index.json",
+    ]
+    # Some official exports keep a model-specific index filename (or omit the
+    # index entirely) while still using standard safetensors shards.
+    try:
+        index_names.extend(
+            name for name in sorted(os.listdir(model_path))
+            if name.endswith(".safetensors.index.json") and name not in index_names
+        )
+    except OSError:
+        pass
+    indexed_map = {}
+    for index_name in index_names:
         index_path = os.path.join(model_path, index_name)
         if os.path.exists(index_path):
             with open(index_path, 'r') as f:
                 index_data = json.load(f)
-            return index_data.get("weight_map", {})
+            indexed_map.update(index_data.get("weight_map", {}))
+    if indexed_map:
+        # Keep the index fast path, then fill any omitted keys from shard
+        # metadata.  This is needed for a few V4 exports whose index contains
+        # only the converted/runtime subset while the native ffn expert keys
+        # live in the same shard files.
+        try:
+            shard_names = sorted(
+                name for name in os.listdir(model_path)
+                if name.endswith(".safetensors")
+            )
+            indexed_files = set(indexed_map.values())
+            for shard_name in shard_names:
+                if shard_name in indexed_files:
+                    continue
+                shard_path = os.path.join(model_path, shard_name)
+                with safe_open(shard_path, framework="pt") as handle:
+                    for key in handle.keys():
+                        indexed_map.setdefault(key, shard_name)
+        except OSError:
+            pass
+        return indexed_map
     # Unsharded HF checkpoints do not carry an index.json.  Build the same
     # key->file view from safetensors metadata so indexed loading remains
     # lazy and works for small standalone drafts such as DSpark.
@@ -761,7 +811,20 @@ def build_weight_index(model_path: str) -> Dict[str, str]:
             continue
         with safe_open(single_path, framework="pt") as handle:
             return {key: single_name for key in handle.keys()}
-    return {}
+    # Last-resort discovery for unindexed multi-shard exports.  Opening a
+    # safetensors file only reads metadata, not the large tensor payload.
+    try:
+        discovered = {}
+        for shard_name in sorted(
+            name for name in os.listdir(model_path)
+            if name.endswith(".safetensors")
+        ):
+            with safe_open(os.path.join(model_path, shard_name), framework="pt") as handle:
+                for key in handle.keys():
+                    discovered.setdefault(key, shard_name)
+        return discovered
+    except OSError:
+        return {}
 
 
 class ShardWeightReader:

@@ -2453,6 +2453,12 @@ class ShardedBlockComparator:
                 or f"{gate}.weight_packed" in weight_map
             ):
                 return names
+            # ShardWeightReader can resolve an internal runtime name to the
+            # official DeepSeek-V4 native name even when the map was assembled
+            # from an unindexed multi-shard export.
+            resolver = getattr(sf_reader, "_resolve_key", None)
+            if callable(resolver) and resolver(f"{gate}.weight")[0] is not None:
+                return names
         return "gate_proj", "up_proj", "down_proj"
 
     @staticmethod
