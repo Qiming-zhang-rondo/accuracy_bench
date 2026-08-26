@@ -849,11 +849,21 @@ class ShardWeightReader:
 
     def _resolve_key(self, key: str):
         """Return ``(resolved_key, shard_file)`` including prefix fallback."""
-        fname = self.weight_map.get(key)
-        if fname is not None:
-            return key, fname
-        if key.startswith("model.model."):
-            alt_key = key[len("model."):]
+        direct_candidates = [key]
+        for prefix in ("model.model.", "model."):
+            if key.startswith(prefix):
+                direct_candidates.append(key[len(prefix):])
+        # DeepSeek-V4 ModelScope exports use ``layers.N.*``, ``embed.*`` and
+        # ``head.*`` without the Transformers ``model.`` container prefix.
+        if key.startswith("model.layers."):
+            direct_candidates.append(key[len("model."):])
+        if key == "model.embed_tokens.weight":
+            direct_candidates.append("embed.weight")
+        if key == "model.norm.weight":
+            direct_candidates.append("norm.weight")
+        if key == "lm_head.weight":
+            direct_candidates.append("head.weight")
+        for alt_key in direct_candidates:
             fname = self.weight_map.get(alt_key)
             if fname is not None:
                 return alt_key, fname
@@ -869,6 +879,10 @@ class ShardWeightReader:
         if not any(".attn." in name or ".ffn." in name
                    for name in self.weight_map):
             return None
+        if key == "model.embed_tokens.weight" and "embed.weight" in self.weight_map:
+            return "embed.weight"
+        if key == "model.norm.weight" and "norm.weight" in self.weight_map:
+            return "norm.weight"
         if key == "lm_head.weight" and "head.weight" in self.weight_map:
             return "head.weight"
         candidate = key
@@ -931,7 +945,13 @@ class ShardWeightReader:
                 candidate = candidate.replace(".gate_proj.", ".w1.")
                 candidate = candidate.replace(".down_proj.", ".w2.")
                 candidate = candidate.replace(".up_proj.", ".w3.")
-        return candidate if candidate in self.weight_map else None
+        if candidate in self.weight_map:
+            return candidate
+        if candidate.startswith("model."):
+            unprefixed = candidate[len("model."):]
+            if unprefixed in self.weight_map:
+                return unprefixed
+        return None
 
     def get_tensor(self, key: str):
         """读取单个 key 的 tensor，如果 key 不在 weight_map 中返回 None
@@ -1786,14 +1806,20 @@ def _quant_desc_type_for_reader(quant_desc: dict, key: str,
                                 sf_reader: ShardWeightReader) -> str:
     """Resolve a quant type through both runtime and official V4 names."""
     base = parse_base_name(key)
-    value = quant_desc.get(key, quant_desc.get(base))
-    if value is not None:
-        return value
+    candidates = [key, base]
+    for prefix in ("model.model.", "model."):
+        if key.startswith(prefix):
+            candidates.extend((key[len(prefix):], base[len(prefix):] if base.startswith(prefix) else base))
+    for candidate in candidates:
+        value = quant_desc.get(candidate)
+        if value is not None:
+            return value
     resolver = getattr(sf_reader, "_deepseek_v4_native_key", None)
     native = resolver(key) if callable(resolver) else None
     if native is None:
         return "FLOAT"
-    return quant_desc.get(native, quant_desc.get(parse_base_name(native), "FLOAT"))
+    native_base = parse_base_name(native)
+    return quant_desc.get(native, quant_desc.get(native_base, "FLOAT"))
 
 
 def _load_3d_expert_indexed_gate_up(name, param, sf_reader, expert_prefix,

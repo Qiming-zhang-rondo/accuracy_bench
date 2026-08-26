@@ -178,8 +178,17 @@ def _lookup_quant_descriptor(quant_desc: Optional[dict], weight_key: str,
     from .utils import parse_base_name, normalize_quant_type
 
     candidates = [weight_key, parse_base_name(weight_key)]
+    # DeepSeek-V4 ModelScope descriptors omit the Transformers container
+    # prefix (``layers.*`` instead of ``model.layers.*``).
+    for prefix in ("model.model.", "model."):
+        if weight_key.startswith(prefix):
+            candidates.append(weight_key[len(prefix):])
     if weight_key.endswith(".weight"):
         candidates.append(weight_key[:-len(".weight")])
+        for prefix in ("model.model.", "model."):
+            base_key = weight_key[:-len(".weight")]
+            if base_key.startswith(prefix):
+                candidates.append(base_key[len(prefix):])
     else:
         candidates.extend((
             f"{weight_key}.weight",

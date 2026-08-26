@@ -165,6 +165,29 @@ def test_official_v4_reader_maps_and_packs_split_experts(tmp_path):
     reader.close()
 
 
+def test_modelscope_v4_bare_prefixes_map_to_runtime_names(tmp_path):
+    from accuracy_checker.model_loader import ShardWeightReader
+
+    tensors = {
+        "embed.weight": torch.ones(2, 2),
+        "norm.weight": torch.ones(2),
+        "head.weight": torch.ones(2, 2),
+        "layers.0.ffn.experts.0.w1.weight": torch.ones(2, 2),
+    }
+    path = tmp_path / "quant_model_weights-00001-of-00001.safetensors"
+    save_file(tensors, str(path))
+    reader = ShardWeightReader(
+        str(tmp_path), {key: path.name for key in tensors}
+    )
+    assert reader.get_tensor("model.embed_tokens.weight") is not None
+    assert reader.get_tensor("model.norm.weight") is not None
+    assert reader.get_tensor("lm_head.weight") is not None
+    assert reader.get_tensor(
+        "model.layers.0.mlp.experts.0.gate_proj.weight"
+    ) is not None
+    reader.close()
+
+
 def test_official_v4_reader_uses_native_quant_descriptor(tmp_path):
     from accuracy_checker.model_loader import (
         ShardWeightReader,
