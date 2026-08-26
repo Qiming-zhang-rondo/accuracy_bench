@@ -786,8 +786,8 @@ function renderL1(){
   let html='<div class="card" style="border-left:3px solid '+C.bad+';background:rgba(194,85,85,0.05);padding:16px 18px">'
     +'<h3 style="margin:0 0 8px 0;color:'+C.bad+'">L1 诊断候选层: Layer '+L.layer_idx+'</h3>'
     +'<div class="l1-metrics">'
-    +'<div><div style="font-size:11px;color:var(--muted);margin-bottom:2px">cos_sim'+hIcon("cos_sim")+'</div><div style="font-size:18px;font-weight:700;color:'+tier+';display:flex;align-items:center;gap:6px"><span class="legend-chip" style="background:'+tier+'"></span>'+fix(L.cos_sim,4)+'</div></div>'
-    +'<div><div style="font-size:11px;color:var(--muted);margin-bottom:2px">rel_l2'+hIcon("rel_l2")+'</div><div style="font-size:16px;font-weight:600">'+fix(L.rel_l2,4)+'</div></div>'
+    +'<div><div style="font-size:11px;color:var(--muted);margin-bottom:2px">cos_sim'+hIcon("cos_sim")+'</div><div style="font-size:18px;font-weight:700;color:'+tier+';display:flex;align-items:center;gap:6px"><span class="legend-chip" style="background:'+tier+'"></span>'+fix(L.cos_sim,8)+'</div></div>'
+    +'<div><div style="font-size:11px;color:var(--muted);margin-bottom:2px">rel_l2'+hIcon("rel_l2")+'</div><div style="font-size:16px;font-weight:600">'+fix(L.rel_l2,8)+'</div></div>'
     +'<div><div style="font-size:11px;color:var(--muted);margin-bottom:2px">SNR(dB)'+hIcon("snr")+'</div><div style="font-size:16px;font-weight:600">'+fix(L.snr,2)+'</div></div>'
     +'<div><div style="font-size:11px;color:var(--muted);margin-bottom:2px">name</div><div style="font-size:12px;font-family:monospace;word-break:break-all">'+esc(L.layer_name||"")+'</div></div>'
     +'</div>'
@@ -810,8 +810,8 @@ function renderL1Table(){
   h+='<table class="grid-tbl"><thead><tr><th>Layer</th><th>name</th><th>cos_sim'+hIcon("cos_sim")+'</th><th>rel_l2'+hIcon("rel_l2")+'</th><th>SNR(dB)'+hIcon("snr")+'</th><th>标记</th></tr></thead><tbody>';
   Ls.forEach(l=>{let tags=[];if(l.is_first_divergence)tags.push('<span class="tag fd">首次发散</span>');if(l.is_max_error)tags.push('<span class="tag max">最大误差</span>');
     h+='<tr style="cursor:pointer" onclick="__selectL2('+(l.layer_idx==null?0:l.layer_idx)+')"><td>'+l.layer_idx+'</td><td>'+esc(l.layer_name)+'</td>'
-      +'<td><span class="legend-chip" style="background:'+cosTier(l.cos_sim)+'"></span>'+fix(l.cos_sim,4)+'</td>'
-      +'<td>'+fix(l.rel_l2,4)+'</td><td>'+fix(l.snr,2)+'</td><td>'+tags.join("")+'</td></tr>';});
+      +'<td><span class="legend-chip" style="background:'+cosTier(l.cos_sim)+'"></span>'+fix(l.cos_sim,8)+'</td>'
+      +'<td>'+fix(l.rel_l2,8)+'</td><td>'+fix(l.snr,2)+'</td><td>'+tags.join("")+'</td></tr>';});
   h+='</tbody></table>';
   h+='</div>';
   root.innerHTML=h;
@@ -942,7 +942,10 @@ function appendChart(root,s){const w=document.createElement("div");w.className="
 let curPos=-1;
 function renderLogits(){
   const root=el("logits");const L=R.logits;
-  if(!L||!L.token_positions||!L.token_positions.length){root.innerHTML='<div class="empty"><div class="empty-icon">—</div><div class="empty-text">未采集 logits 对比</div><div class="empty-hint">NPU 内存不足时跳过; 用 --collect-logits 采集</div></div>';return;}
+  if(!L||!L.token_positions||!L.token_positions.length){
+    const reason=(R.overview&&R.overview.logits_error)||"未采集 logits 对比";
+    root.innerHTML='<div class="empty"><div class="empty-icon">—</div><div class="empty-text">未采集 logits 对比</div><div class="empty-hint">'+esc(reason)+'</div></div>';return;
+  }
   if(curPos<0||curPos>=L.token_positions.length){
     curPos=L.position_mode==="prompt_prefill"?L.token_positions.length-1:0;
   }

@@ -476,6 +476,7 @@ def assemble_report(
         activation_quant_type=resolved_aq_type,
         activation_quant_backend=resolved_aq_backend,
         activation_quant_group_size=resolved_aq_group_size,
+        logits_error=(getattr(l1_report, "logits_error", None) if l1_report is not None else None),
         boundary_result=boundary_verdict,
         first_divergence_layer=first_div_idx,
         first_threshold_crossing_layer=first_threshold_idx,

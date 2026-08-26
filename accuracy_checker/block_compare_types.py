@@ -88,7 +88,7 @@ class BlockCompareResult:
         cs = self.metrics.get("cos_sim", 0)
         snr_val = self.metrics.get("snr", 0)
         re = self.metrics.get("relative_error", 0)
-        return f"[{status}] {self.layer_name}: cos_sim={cs:.6f}, snr={snr_val:.2f}dB, rel_err={re:.6f}"
+        return f"[{status}] {self.layer_name}: cos_sim={cs:.10f}, snr={snr_val:.2f}dB, rel_err={re:.8f}"
 
 
 @dataclass
@@ -155,6 +155,9 @@ class BlockCompareReport:
     activation_quant_type: str = ""
     activation_quant_backend: str = ""
     activation_quant_group_size: Optional[int] = None
+    # Concrete reason when logits were requested but unavailable (or skipped
+    # by --l1_target_layers); avoids a silent missing HTML panel.
+    logits_error: Optional[str] = None
     # 缓存的检测结果 (首次调用 _detect_bad_layers 后填充)
     _detection_cache: Optional[BadLayerDetection] = field(default=None, repr=False)
 
@@ -362,6 +365,9 @@ class BlockCompareReport:
             n_cos = sum(1 for x in self.logits_data.token_wise_cos if x is not None)
             lines.append(f"  Full logits: {n_pos} positions captured ({n_cos} cos metrics), "
                         f"via L1 forward (compare_logits 4-panel data ready)")
+            lines.append(f"{'='*70}")
+        elif self.logits_error:
+            lines.append(f"  Full logits unavailable: {self.logits_error}")
             lines.append(f"{'='*70}")
 
         detection = self._detect_bad_layers()

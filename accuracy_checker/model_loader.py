@@ -999,6 +999,23 @@ class ShardWeightReader:
             return "norm.weight"
         if key == "lm_head.weight" and "head.weight" in self.weight_map:
             return "head.weight"
+        # Released V4 checkpoints keep HyperHead tensors at the root, while
+        # Transformers exposes them below model.hc_head.  They are required
+        # by the final norm+head/logits pass.
+        hc_head_keys = {
+            "model.hc_head.hc_fn": "hc_head_fn",
+            "model.hc_head.hc_base": "hc_head_base",
+            "model.hc_head.hc_scale": "hc_head_scale",
+            "model.model.hc_head.hc_fn": "hc_head_fn",
+            "model.model.hc_head.hc_base": "hc_head_base",
+            "model.model.hc_head.hc_scale": "hc_head_scale",
+            "hc_head.hc_fn": "hc_head_fn",
+            "hc_head.hc_base": "hc_head_base",
+            "hc_head.hc_scale": "hc_head_scale",
+        }
+        native_hc_key = hc_head_keys.get(key)
+        if native_hc_key is not None and native_hc_key in self.weight_map:
+            return native_hc_key
         candidate = key
         replacements = (
             (".input_layernorm.", ".attn_norm."),

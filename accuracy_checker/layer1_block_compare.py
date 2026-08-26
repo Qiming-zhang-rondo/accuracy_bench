@@ -424,6 +424,9 @@ class ShardedBlockComparator:
         self._streaming_activation_logged = False
         self.collect_full_logits = collect_full_logits
         self.logits_max_positions = logits_max_positions
+        # Preserve the concrete reason when full-logits capture is unavailable
+        # so a missing HTML panel is diagnosable instead of silent.
+        self._last_logits_error = None
         self._activation_hooks = []  # track registered hooks for cleanup
 
         # Load rotation matrix (optional, for rotated quant models like GLM5.1 QuaRot)
@@ -539,6 +542,24 @@ class ShardedBlockComparator:
                     logger.info(
                         "  [DeepSeek-V4 keys] %s: %d native bare keys, %d optional "
                         "MTP/DSpark keys (mtp.0/1/2)", label, native, mtp,
+                    )
+                    model_path = self.ref_model_path if label == "ref" else self.quant_model_path
+                    try:
+                        with open(os.path.join(model_path, "config.json"), encoding="utf-8") as _cf:
+                            model_cfg = _json.load(_cf)
+                    except (OSError, ValueError):
+                        model_cfg = {}
+                    desc_name = (
+                        "quant_model_description.json"
+                        if os.path.exists(os.path.join(model_path, "quant_model_description.json"))
+                        else ("config.json expert_dtype=fp4" if
+                              str(model_cfg.get("expert_dtype", "")).lower() == "fp4"
+                              else "native/other")
+                    )
+                    logger.info(
+                        "  [DeepSeek-V4 source] %s: quantized=%s, compressed_tensors=%s, source=%s",
+                        label, (self._ref_is_quant if label == "ref" else self._quant_is_quant),
+                        (self._ref_is_ct if label == "ref" else self._quant_is_ct), desc_name,
                     )
 
         # quant_desc
@@ -1383,12 +1404,12 @@ class ShardedBlockComparator:
 
         from .logits_compare import LogitsCollection, compare_logits
 
-        self._materialize_norm_lm_head(ref_model, quant_model)
-        ref_norm_mod, quant_norm_mod, ref_head_w, quant_head_w = (
-            self._get_norm_modules_and_lm_head_weights(ref_model, quant_model)
-        )
-
+        self._last_logits_error = None
         try:
+            self._materialize_norm_lm_head(ref_model, quant_model)
+            ref_norm_mod, quant_norm_mod, ref_head_w, quant_head_w = (
+                self._get_norm_modules_and_lm_head_weights(ref_model, quant_model)
+            )
             ref_hidden_states = self._collapse_hc_streams(
                 ref_model, ref_hidden_states.detach().cpu())
             quant_hidden_states = self._collapse_hc_streams(
@@ -1420,6 +1441,7 @@ class ShardedBlockComparator:
             comparison = compare_logits(ref_c, quant_c, self.tokenizer, top_k=top_k)
             return comparison.to_logits_data()
         except Exception as e:
+            self._last_logits_error = f"{type(e).__name__}: {e}"
             logger.warning(f"[L1 logits] full logits 采集失败: {e}")
             return None
         finally:
@@ -3453,6 +3475,10 @@ class ShardedBlockComparator:
         if self.l1_target_layers is not None:
             logger.info(f"\n[Sharded L1] 目标层 {sorted(self.l1_target_layers)} 已全部缓存完毕。")
             logger.info(f"  现在可以运行 L2: --l2 --target_layers {' '.join(str(l) for l in sorted(self.l1_target_layers))}")
+            report.logits_error = (
+                "skipped: --l1_target_layers only forwards to the last target layer; "
+                "final hidden states are unavailable for logits capture"
+            )
             return report
         if self.verbose:
             logger.info(f"\n[Sharded L1] 计算 top-k token 对齐{' (CPU)' if use_cpu_topk else ''}...")
@@ -3473,7 +3499,10 @@ class ShardedBlockComparator:
         try:
             report.logits_data = self._collect_full_logits(
                 ref_model, quant_model, ref_hidden_states, quant_hidden_states)
+            if report.logits_data is None:
+                report.logits_error = self._last_logits_error or "not collected"
         except Exception as e:
+            report.logits_error = f"{type(e).__name__}: {e}"
             if self.verbose:
                 logger.warning(f"full logits 采集失败: {e}")
         return report

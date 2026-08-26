@@ -84,6 +84,7 @@ class OverviewData:
     activation_quant_type: str = ""          # AUTO / W4A4_DYNAMIC / ...
     activation_quant_backend: str = ""       # auto / npu / torch
     activation_quant_group_size: Optional[int] = None
+    logits_error: Optional[str] = None       # why L1 full logits is absent
 
 
 @dataclass
@@ -252,6 +253,7 @@ def _build_overview(d: Dict[str, Any]) -> OverviewData:
         activation_quant_type=d.get("activation_quant_type", ""),
         activation_quant_backend=d.get("activation_quant_backend", ""),
         activation_quant_group_size=activation_quant_group_size,
+        logits_error=d.get("logits_error"),
         boundary_result=d.get("boundary_result"),
         first_divergence_layer=d.get("first_divergence_layer"),
         first_threshold_crossing_layer=d.get("first_threshold_crossing_layer"),
