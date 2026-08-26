@@ -192,6 +192,32 @@ def distribute_model(model, device_list: List[str]) -> List[nn.Module]:
         target = device_list[min(i // layers_per_device, n_devices - 1)]
         layer.to(target)
 
+    # DeepSeek-V4 ModelScope checkpoints append three optional MTP/DSpark
+    # blocks.  Newer vendor runtimes expose them as a ModuleList; official HF
+    # V4 currently ignores the extra tensors.  If present, shard them as a
+    # small auxiliary layer stack instead of leaving them on CPU or silently
+    # pinning all three to one device.
+    auxiliary = None
+    auxiliary_name = None
+    text_model = components.text_model
+    for candidate in ("mtp", "nextn_predict_layers", "dspark"):
+        value = getattr(text_model, candidate, None)
+        if isinstance(value, (nn.ModuleList, list, tuple)) and value:
+            auxiliary = value
+            auxiliary_name = candidate
+            break
+    if auxiliary is not None:
+        aux_per_device = (len(auxiliary) + n_devices - 1) // n_devices
+        for i, block in enumerate(auxiliary):
+            block.to(device_list[min(i // aux_per_device, n_devices - 1)])
+        _register_layer_input_hooks(
+            auxiliary, device_list, aux_per_device, n_devices
+        )
+        logger.info(
+            "  DeepSeek-V4 %s: %d 个 MTP/DSpark block 已分布到 %d 张卡",
+            auxiliary_name, len(auxiliary), min(len(auxiliary), n_devices),
+        )
+
     # norm + lm_head → 最后一张卡
     if final_norm is not None:
         final_norm.to(device_list[-1])
@@ -1522,6 +1548,15 @@ def _hf_load_nonquant_weights(model: nn.Module, model_path: str,
             all_weights.update(shard)
     if verbose:
         logger.info(f"  加载 {len(all_weights)} 个权重 (非量化)")
+
+    # DeepSeek-V4 ModelScope exports use native bare names (``layers.*``,
+    # ``embed.*``, ``head.*``), while the Transformers module tree uses
+    # ``model.layers.*``.  Apply the same aliasing used by the quantized
+    # boundary path so a reference model cannot fail solely on key prefixes.
+    from .model_loader import add_deepseek_v4_checkpoint_aliases
+    alias_count = add_deepseek_v4_checkpoint_aliases(model, all_weights)
+    if verbose and alias_count:
+        logger.info("  DeepSeek-V4 checkpoint 映射: %d 个 runtime alias", alias_count)
 
     # 加载 parameters
     loaded_params = 0

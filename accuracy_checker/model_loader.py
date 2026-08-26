@@ -679,20 +679,17 @@ def _get_shards_for_layers(model_path: str, layers: List[int]) -> Tuple[set, dic
 
     for k, v in weight_map.items():
         # 收集层权重
-        if ".layers." in k:
-            parts = k.split(".layers.")
-            if len(parts) > 1:
-                try:
-                    layer_num = int(parts[1].split(".")[0])
-                    if layer_num in layer_set:
-                        shard_files.add(v)
-                        layer_to_shard[layer_num] = v
-                except (ValueError, IndexError):
-                    pass
+        import re
+        match = re.search(r"(?:^|\.)layers\.(\d+)\.", k)
+        if match is not None:
+            layer_num = int(match.group(1))
+            if layer_num in layer_set:
+                shard_files.add(v)
+                layer_to_shard[layer_num] = v
 
         # 收集基础权重 (embed_tokens, norm, lm_head)
         # 这些通常在第一个 shard 文件中
-        if any(x in k for x in ['embed_tokens', 'lm_head', '.norm.']):
+        if _is_non_layer_key(k):
             shard_files.add(v)
 
     # 如果没有找到任何 shard（层列表为空的情况），至少加载所有 shard
@@ -730,18 +727,15 @@ def _get_shards_for_layers_standard(model_path: str, layers: List[int]) -> Tuple
     all_shards = set(weight_map.values())
 
     for k, v in weight_map.items():
-        if ".layers." in k:
-            parts = k.split(".layers.")
-            if len(parts) > 1:
-                try:
-                    layer_num = int(parts[1].split(".")[0])
-                    if layer_num in layer_set:
-                        shard_files.add(v)
-                        layer_to_shard[layer_num] = v
-                except (ValueError, IndexError):
-                    pass
+        import re
+        match = re.search(r"(?:^|\.)layers\.(\d+)\.", k)
+        if match is not None:
+            layer_num = int(match.group(1))
+            if layer_num in layer_set:
+                shard_files.add(v)
+                layer_to_shard[layer_num] = v
 
-        if any(x in k for x in ['embed_tokens', 'lm_head', '.norm.']):
+        if _is_non_layer_key(k):
             shard_files.add(v)
 
     if not shard_files and all_shards:
@@ -791,10 +785,7 @@ def build_weight_index(model_path: str) -> Dict[str, str]:
                 name for name in os.listdir(model_path)
                 if name.endswith(".safetensors")
             )
-            indexed_files = set(indexed_map.values())
             for shard_name in shard_names:
-                if shard_name in indexed_files:
-                    continue
                 shard_path = os.path.join(model_path, shard_name)
                 with safe_open(shard_path, framework="pt") as handle:
                     for key in handle.keys():
@@ -1021,7 +1012,7 @@ class ShardWeightReader:
         """
         needed = set()
         for key in self.weight_map:
-            if '.layers.' in key:
+            if '.layers.' in key or key.startswith('layers.'):
                 _collect_layer_key(key, layer_indices, needed)
             elif include_non_layer and _is_non_layer_key(key):
                 needed.add(key)
@@ -1104,11 +1095,12 @@ def _collect_layer_key(key: str, layer_indices: List[int], needed: set):
 
     Helper extracted from ShardWeightReader.get_keys_for_layers to reduce block depth.
     """
-    parts = key.split('.layers.')
-    if len(parts) <= 1:
+    import re
+    match = re.search(r'(?:^|\.)layers\.(\d+)\.', key)
+    if match is None:
         return
     try:
-        layer_num = int(parts[1].split('.')[0])
+        layer_num = int(match.group(1))
     except (ValueError, IndexError):
         return
     if layer_num in layer_indices:
@@ -1117,17 +1109,30 @@ def _collect_layer_key(key: str, layer_indices: List[int], needed: set):
 
 def _is_non_layer_key(key: str) -> bool:
     """True if key refers to embed_tokens / lm_head / norm (non-layer weight)."""
-    return any(x in key for x in ['embed_tokens', 'lm_head', '.norm.'])
+    return (
+        any(x in key for x in ['embed_tokens', 'lm_head', '.norm.'])
+        or key.startswith(('embed.', 'norm.', 'head.'))
+    )
+
+
+def _is_auxiliary_predictor_name(name: str) -> bool:
+    """Whether a parameter belongs to optional V4 MTP/DSpark predictor blocks."""
+    parts = name.split('.')
+    return any(part in {"mtp", "nextn_predict_layers", "dspark"}
+               for part in parts)
 
 
 def _decide_should_load(name: str, layer_idx: Optional[int], layer_set: set,
                         load_embed_only: bool, load_norm_head_only: bool,
-                        verbose: bool, param=None) -> bool:
+                        verbose: bool, param=None,
+                        include_auxiliary: bool = False) -> bool:
     """Decide whether a parameter should be loaded given the layer selection mode.
 
     Extracted from load_layer_weights_indexed to reduce cyclomatic complexity.
     When `param` is provided and mode=load_embed_only, emits the original DEBUG EMBED log.
     """
+    if not include_auxiliary and _is_auxiliary_predictor_name(name):
+        return False
     if load_embed_only:
         if layer_idx is None and "norm" not in name and "lm_head" not in name:
             if verbose and 'embed' in name and param is not None:
@@ -1136,6 +1141,8 @@ def _decide_should_load(name: str, layer_idx: Optional[int], layer_set: set,
         return False
     if load_norm_head_only:
         return layer_idx is None and ("norm" in name or "lm_head" in name)
+    if include_auxiliary and _is_auxiliary_predictor_name(name):
+        return True
     return layer_idx is not None and layer_idx in layer_set
 
 
@@ -1414,7 +1421,8 @@ def _load_named_buffers(model: nn.Module, sf_reader: ShardWeightReader,
                         layer_set: set, load_embed_only: bool,
                         load_norm_head_only: bool,
                         strict_embed_buffer_ids: Optional[set] = None,
-                        strict_final_buffer_ids: Optional[set] = None) -> int:
+                        strict_final_buffer_ids: Optional[set] = None,
+                        include_auxiliary: bool = False) -> int:
     """Load register_buffer tensors (e.g. e_score_correction_bias). Returns loaded count.
 
     Extracted from load_layer_weights_indexed.
@@ -1444,6 +1452,7 @@ def _load_named_buffers(model: nn.Module, sf_reader: ShardWeightReader,
             else _decide_should_load(
                 bname, b_layer_idx, layer_set,
                 load_embed_only, load_norm_head_only, False,
+                include_auxiliary=include_auxiliary,
             )
         )
         if not should_load:
@@ -1544,6 +1553,7 @@ def load_layer_weights_indexed(
     skip_routed_experts: bool = False,
     strict_embed_only: bool = False,
     strict_final_only: bool = False,
+    include_auxiliary: bool = False,
     verbose: bool = True,
 ) -> int:
     """按需加载指定层权重 (使用 safe_open + get_tensor，避免 load_file 读整个 shard)
@@ -1571,6 +1581,8 @@ def load_layer_weights_indexed(
         strict_embed_only: layers=[] 时只加载实际 text embedding 模块，跳过视觉/projector
         strict_final_only: layers=[-1] 时只加载结构解析得到的 final norm/lm_head，
             避免 Kimi streaming 骨架中其他顶层 meta norm 被名称匹配误加载
+        include_auxiliary: 完整模型加载时同时加载 V4 的 ``mtp``/DSpark
+            predictor 模块；分片 L1 默认关闭，避免把可选预测头当作主干层
         verbose: 是否打印进度
 
     Returns:
@@ -1649,6 +1661,7 @@ def load_layer_weights_indexed(
             else _decide_should_load(
                 name, layer_idx, layer_set, load_embed_only,
                 load_norm_head_only, verbose, param,
+                include_auxiliary=include_auxiliary,
             )
         )
         if not should_load:
@@ -1679,6 +1692,7 @@ def load_layer_weights_indexed(
         model, sf_reader, layer_set, load_embed_only, load_norm_head_only,
         strict_embed_buffer_ids=strict_embed_buffer_ids,
         strict_final_buffer_ids=strict_final_buffer_ids,
+        include_auxiliary=include_auxiliary,
     )
 
     if verbose:
@@ -2656,7 +2670,8 @@ def load_model_for_comparison(
         num_layers = model.config.num_hidden_layers
         all_layers = list(range(num_layers))
         load_layer_weights_indexed(model, model_path, all_layers, single_device, dtype,
-                                   weight_map, reader, is_quant=is_quant, verbose=verbose)
+                                   weight_map, reader, is_quant=is_quant,
+                                   include_auxiliary=True, verbose=verbose)
         reader.close()
         model = model.to(single_device)
         return model, True

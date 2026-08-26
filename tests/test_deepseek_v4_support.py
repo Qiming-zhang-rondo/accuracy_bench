@@ -188,6 +188,26 @@ def test_modelscope_v4_bare_prefixes_map_to_runtime_names(tmp_path):
     reader.close()
 
 
+def test_v4_bare_expert_prefix_index_and_mtp_filter():
+    from accuracy_checker.layer1_block_compare import ShardedBlockComparator
+    from accuracy_checker.model_loader import _decide_should_load
+
+    reader = SimpleNamespace(weight_map={
+        "layers.0.ffn.experts.0.w1.weight": "shard.safetensors",
+    })
+    index = ShardedBlockComparator._expert_prefix_index(reader)
+    assert index[(0, "ffn")] == "layers.0.ffn.experts"
+    assert not _decide_should_load(
+        "model.mtp.0.attn.wq_a.weight", None, set(),
+        load_embed_only=True, load_norm_head_only=False, verbose=False,
+    )
+    assert _decide_should_load(
+        "model.mtp.0.attn.wq_a.weight", None, set(),
+        load_embed_only=True, load_norm_head_only=False, verbose=False,
+        include_auxiliary=True,
+    )
+
+
 def test_official_v4_reader_uses_native_quant_descriptor(tmp_path):
     from accuracy_checker.model_loader import (
         ShardWeightReader,

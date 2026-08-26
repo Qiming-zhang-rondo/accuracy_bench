@@ -232,7 +232,22 @@ def _build_v4_split_store(prefix: str, quant_weights: Mapping, device: str,
     all experts as BF16.  Quantized weights and their metadata stay in their
     original compact dtype on the owning NPU (or CPU fallback).
     """
-    native_prefix = prefix.replace(".mlp.experts", ".ffn.experts")
+    # Transformers names the module ``model.layers.N.mlp.experts`` while the
+    # ModelScope files use the native bare prefix ``layers.N.ffn.experts``.
+    # Keep both container-prefixed and bare candidates; selecting by actual
+    # key presence avoids silently building an empty store.
+    native_prefixes = []
+    for candidate in (
+        prefix.replace(".mlp.experts", ".ffn.experts"),
+        prefix.replace(".block_sparse_moe.experts", ".ffn.experts"),
+        prefix.replace(".moe.experts", ".ffn.experts"),
+    ):
+        native_prefixes.extend((candidate, candidate.removeprefix("model.")))
+    native_prefix = next(
+        (candidate for candidate in dict.fromkeys(native_prefixes)
+         if any(key.startswith(candidate + ".") for key in quant_weights)),
+        native_prefixes[0],
+    )
     projection_map = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
     grouped: dict[str, dict[int, torch.Tensor]] = {}
     desc_aliases = dict(quant_desc)

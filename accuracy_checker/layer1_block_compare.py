@@ -426,10 +426,11 @@ class ShardedBlockComparator:
         if self.num_layers is None:
             text_config = config.get('text_config', {})
             self.num_layers = text_config.get('num_hidden_layers', 64)
-        # NOTE: num_nextn_predict_layers (MTP) 在 config 里有, 但模型权重里
-        # 没有对应的 MTP 层 (safetensors 里无 mtp/nextn 相关 key).
-        # L1 只对比 model.layers ModuleList 中的层 (0..num_hidden_layers-1).
-        # MTP 层是推理框架在 decode 阶段动态加的, 不在静态模型权重里.
+        # V4 ModelScope files also contain three optional ``mtp.N``/DSpark
+        # predictor blocks.  L1 deliberately compares only the main
+        # ``model.layers`` stack; the loader filters MTP names from each
+        # sharded pass unless a complete boundary model explicitly requests
+        # ``include_auxiliary=True``.
 
     def _plan_shards(self, layers_per_shard: int = None) -> List[Tuple[int, int]]:
         """规划分片：返回 [(layer_start, layer_end), ...]"""
@@ -490,6 +491,21 @@ class ShardedBlockComparator:
         self._quant_weight_map = build_weight_index(self.quant_model_path)
         self._ref_reader = ShardWeightReader(self.ref_model_path, self._ref_weight_map)
         self._quant_reader = ShardWeightReader(self.quant_model_path, self._quant_weight_map)
+
+        if str(self._model_config.get("model_type", "")).lower() == "deepseek_v4":
+            for label, weight_map in (("ref", self._ref_weight_map),
+                                      ("quant", self._quant_weight_map)):
+                native = sum(
+                    key.startswith("layers.") or key.startswith("embed.")
+                    or key.startswith("head.") or key.startswith("norm.")
+                    for key in weight_map
+                )
+                mtp = sum(key.startswith("mtp.") for key in weight_map)
+                if self.verbose:
+                    logger.info(
+                        "  [DeepSeek-V4 keys] %s: %d native bare keys, %d optional "
+                        "MTP/DSpark keys (mtp.0/1/2)", label, native, mtp,
+                    )
 
         # quant_desc
         self._ref_quant_desc = None
@@ -2802,21 +2818,23 @@ class ShardedBlockComparator:
             return cached
 
         index = {}
-        layer_marker = ".layers."
+        # Runtime names normally contain ``model.layers.N``.  The official
+        # ModelScope V4 export drops the container prefix and uses
+        # ``layers.N.ffn.experts`` instead, so parse both forms.
+        import re
+        layer_pattern = re.compile(r"(?:^|\.)layers\.(\d+)\.(.+)$")
         candidate_attrs = ("block_sparse_moe", "mlp", "moe", "ffn")
         for key in getattr(sf_reader, "weight_map", {}):
-            if layer_marker not in key:
+            match = layer_pattern.search(key)
+            if match is None:
                 continue
-            root, tail = key.split(layer_marker, 1)
-            layer_text, separator, remainder = tail.partition(".")
-            if not separator or not layer_text.isdigit():
-                continue
+            layer_text, remainder = match.groups()
             for attr in candidate_attrs:
                 marker = f"{attr}.experts."
                 if remainder.startswith(marker):
                     index.setdefault(
                         (int(layer_text), attr),
-                        f"{root}{layer_marker}{layer_text}.{attr}.experts",
+                        key[:match.start(2)] + f"{attr}.experts",
                     )
                     break
         try:
