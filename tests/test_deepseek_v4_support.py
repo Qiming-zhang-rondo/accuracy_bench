@@ -208,6 +208,19 @@ def test_v4_bare_expert_prefix_index_and_mtp_filter():
     )
 
 
+def test_v4_descriptor_lookup_accepts_runtime_and_native_expert_names():
+    from accuracy_checker.layer1_block_compare import _lookup_quant_descriptor
+
+    assert _lookup_quant_descriptor(
+        {"model.layers.0.mlp.experts.0.gate_proj.weight": "W8A8_DYNAMIC"},
+        "layers.0.ffn.experts.0.w1.weight",
+    ) == "W8A8_DYNAMIC"
+    assert _lookup_quant_descriptor(
+        {"layers.0.ffn.experts.0.w2.weight": "W8A8_DYNAMIC"},
+        "model.layers.0.mlp.experts.0.down_proj.weight",
+    ) == "W8A8_DYNAMIC"
+
+
 def test_official_v4_reader_uses_native_quant_descriptor(tmp_path):
     from accuracy_checker.model_loader import (
         ShardWeightReader,

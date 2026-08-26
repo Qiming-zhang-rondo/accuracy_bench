@@ -194,6 +194,39 @@ def _lookup_quant_descriptor(quant_desc: Optional[dict], weight_key: str,
             f"{weight_key}.weight",
             parse_base_name(f"{weight_key}.weight"),
         ))
+
+    # DeepSeek-V4 has two independent naming conversions in the wild:
+    # ModelScope's native ``layers.*.ffn.experts.*.w{1,2,3}`` and the
+    # Transformers runtime's ``model.layers.*.mlp.experts.*.{gate,down,up}_proj``.
+    # Quant descriptions are not always exported in the same namespace as the
+    # safetensors keys, so probe both directions here as well.
+    v4_candidates = []
+    for candidate in tuple(candidates):
+        suffix = ""
+        base = candidate
+        for marker in (".weight_scale", ".weight_offset", ".weight"):
+            if base.endswith(marker):
+                base, suffix = base[:-len(marker)], marker
+                break
+        if ".ffn.experts." in base:
+            runtime_base = base.replace(".ffn.experts.", ".mlp.experts.")
+            runtime_base = runtime_base.replace(".w1", ".gate_proj")
+            runtime_base = runtime_base.replace(".w2", ".down_proj")
+            runtime_base = runtime_base.replace(".w3", ".up_proj")
+            bare_runtime = runtime_base.removeprefix("model.")
+            v4_candidates.extend((runtime_base + suffix,
+                                  "model." + bare_runtime + suffix,
+                                  "model.model." + bare_runtime + suffix))
+        if ".mlp.experts." in base:
+            native_base = base.replace(".mlp.experts.", ".ffn.experts.")
+            native_base = native_base.replace(".gate_proj", ".w1")
+            native_base = native_base.replace(".down_proj", ".w2")
+            native_base = native_base.replace(".up_proj", ".w3")
+            bare_native = native_base.removeprefix("model.")
+            v4_candidates.extend((native_base + suffix,
+                                  bare_native + suffix,
+                                  "model." + bare_native + suffix))
+    candidates.extend(v4_candidates)
     for candidate in candidates:
         quant_type = quant_desc.get(candidate)
         if isinstance(quant_type, str):
@@ -2258,9 +2291,31 @@ class ShardedBlockComparator:
                     del w, scale
                     return fp
             if not w.dtype.is_floating_point:
+                # A few DeepSeek-V4 reference exports contain integer expert
+                # tensors but omit/rename the corresponding descriptor keys.
+                # Infer the safe dynamic format from the scale row count
+                # rather than treating an integer matrix as FLOAT.
+                scale = reader.get_tensor(f"{quant_name}.weight_scale")
+                inferred_type = None
+                if scale is not None and w.dim() == 2:
+                    scale_rows = scale.shape[0] if scale.dim() > 0 else 1
+                    if scale_rows == w.shape[0]:
+                        inferred_type = "W8A8_DYNAMIC"
+                    elif scale_rows == 2 * w.shape[0]:
+                        inferred_type = "W4A8_DYNAMIC"
+                if inferred_type is not None:
+                    dequant_reader = reader
+                    if dequant_on_target:
+                        w = w.to(device, non_blocking=True)
+                        dequant_reader = _DeviceTensorReader(reader, device)
+                    fp, status = _dequant_msslim_weight(
+                        w, inferred_type, quant_name, dequant_reader, self.dtype
+                    )
+                    if fp is not None and status == "loaded":
+                        return fp if dequant_on_target else fp.to(device)
                 raise ValueError(
                     "integer streaming expert was classified as FLOAT; "
-                    f"quantization metadata is missing for {weight_key}"
+                    f"quantization metadata is missing or incompatible for {weight_key}"
                 )
             fp = w.to(device=device, dtype=self.dtype)
             del w
