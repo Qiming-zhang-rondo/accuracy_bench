@@ -1,5 +1,7 @@
 """Structural regressions for the official DeepSeek-V4 integration."""
 
+import json
+
 from types import SimpleNamespace
 
 import torch
@@ -215,6 +217,33 @@ def test_v4_descriptor_lookup_accepts_runtime_and_native_expert_names():
         {"model.layers.0.mlp.experts.0.gate_proj.weight": "W8A8_DYNAMIC"},
         "layers.0.ffn.experts.0.w1.weight",
     ) == "W8A8_DYNAMIC"
+
+
+def test_official_v4_fp4_config_and_decode(tmp_path):
+    from accuracy_checker.model_loader import (
+        dequantize_deepseek_v4_fp4,
+        is_quantized_model,
+        native_quant_description,
+    )
+
+    (tmp_path / "config.json").write_text(json.dumps({
+        "model_type": "deepseek_v4", "expert_dtype": "fp4",
+        "quantization_config": {"quant_method": "fp8"},
+    }))
+    assert is_quantized_model(str(tmp_path))
+    assert native_quant_description(str(tmp_path)) == {
+        "__acc_deepseek_v4_fp4__": "DEEPSEEK_FP4"
+    }
+
+    # low nibble=+0.5, high nibble=-1.0; scale=2 produces [+1, -2].
+    # V4 scales one 32-logical-column group, thus 16 packed int8 columns.
+    packed = torch.zeros((1, 16), dtype=torch.int8)
+    packed[0, 0] = -95
+    scale = torch.tensor([[2.0]])
+    decoded = dequantize_deepseek_v4_fp4(packed, scale, torch.float32)
+    expected = torch.zeros((1, 32))
+    expected[0, :2] = torch.tensor([1.0, -2.0])
+    torch.testing.assert_close(decoded, expected)
     assert _lookup_quant_descriptor(
         {"layers.0.ffn.experts.0.w2.weight": "W8A8_DYNAMIC"},
         "model.layers.0.mlp.experts.0.down_proj.weight",

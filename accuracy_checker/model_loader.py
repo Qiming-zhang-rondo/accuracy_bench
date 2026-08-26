@@ -32,6 +32,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 _INFERRED_QUANT_WARNINGS = set()
+_DEEPSEEK_V4_FP4_MARKER = "__acc_deepseek_v4_fp4__"
 
 # ============================================================================
 # 运行时注册 glm_moe_dsa (transformers < 5.5 可能没有)
@@ -170,9 +171,44 @@ def is_quantized_model(model_path: str) -> bool:
                 qconfig = config.get("text_config", {}).get("quantization_config", {})
             if qconfig.get("quant_method") == "compressed-tensors":
                 return True
+            # The official DeepSeek-V4-Flash reference checkpoint stores
+            # routed experts as packed E2M1 FP4 (with ``.scale`` tensors),
+            # despite advertising an FP8 conversion config for deployment.
+            if (
+                str(config.get("model_type", "")).lower() == "deepseek_v4"
+                and str(config.get("expert_dtype", "")).lower() == "fp4"
+            ):
+                return True
         except Exception as e:
             logger.debug(f"is_quantized_model config parse failed: {e}")
     return False
+
+
+def is_deepseek_v4_fp4_model(model_path: str) -> bool:
+    """Whether this is the official DeepSeek-V4 packed-FP4 reference format."""
+    config_path = os.path.join(model_path, "config.json")
+    try:
+        with open(config_path, encoding="utf-8") as handle:
+            config = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        str(config.get("model_type", "")).lower() == "deepseek_v4"
+        and str(config.get("expert_dtype", "")).lower() == "fp4"
+    )
+
+
+def native_quant_description(model_path: str) -> Optional[dict]:
+    """Return a synthetic descriptor for native checkpoint formats.
+
+    Most exports carry ``quant_model_description.json``.  The official V4
+    reference does not: its routed experts are packed FP4 and use per-group
+    ``.scale`` keys, so a small marker keeps the generic indexed loader on the
+    correct decode path.
+    """
+    if is_deepseek_v4_fp4_model(model_path):
+        return {_DEEPSEEK_V4_FP4_MARKER: "DEEPSEEK_FP4"}
+    return None
 
 
 def is_compressed_tensors_model(model_path: str) -> bool:
@@ -310,6 +346,93 @@ def dequantize_weight_mx(
         return dequantize_weight_mxfp4(weight_data, weight_scale_u8, block_size, dtype)
     else:
         return dequantize_weight_mxfp8(weight_data, weight_scale_u8, block_size, dtype)
+
+
+_DEEPSEEK_FP4_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                         0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+
+
+def dequantize_deepseek_v4_fp4(
+    packed_weight: Tensor,
+    scale: Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+) -> Tensor:
+    """Decode DeepSeek-V4's packed E2M1 expert matrix to BF16/FP16.
+
+    The official checkpoint stores two E2M1 values per int8 and a floating
+    E8M0 multiplier for every 32 logical input columns.  This is distinct
+    from msModelSlim W4A8: metadata is named ``.scale`` and no zero-point is
+    present.  The formula follows the vendor's released ``inference/convert``
+    implementation before its optional FP8 conversion step.
+    """
+    if packed_weight.dim() != 2 or scale.dim() != 2:
+        raise ValueError(
+            "DeepSeek-V4 FP4 requires 2-D packed weight and 2-D scale; got "
+            f"{tuple(packed_weight.shape)} and {tuple(scale.shape)}"
+        )
+    out_features, packed_columns = packed_weight.shape
+    logical_columns = packed_columns * 2
+    if scale.shape[0] != out_features or logical_columns % scale.shape[1] != 0:
+        raise ValueError(
+            "DeepSeek-V4 FP4 scale shape is incompatible with packed weight: "
+            f"weight={tuple(packed_weight.shape)}, scale={tuple(scale.shape)}"
+        )
+    group_size = logical_columns // scale.shape[1]
+    if group_size != 32:
+        raise ValueError(
+            "DeepSeek-V4 FP4 expects 32-column scale groups; got "
+            f"group_size={group_size} for weight={tuple(packed_weight.shape)}, "
+            f"scale={tuple(scale.shape)}"
+        )
+    packed = packed_weight.to(torch.uint8)
+    values = torch.tensor(
+        _DEEPSEEK_FP4_VALUES, dtype=torch.float32, device=packed.device
+    )
+    low = values[(packed & 0x0F).long()]
+    high = values[((packed >> 4) & 0x0F).long()]
+    unpacked = torch.stack((low, high), dim=-1).flatten(1)
+    expanded_scale = scale.to(device=packed.device, dtype=torch.float32)
+    expanded_scale = expanded_scale.repeat_interleave(group_size, dim=1)
+    return (unpacked * expanded_scale).to(dtype)
+
+
+def dequantize_deepseek_v4_fp8(
+    weight: Tensor,
+    scale: Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+) -> Tensor:
+    """Decode V4 block-FP8 matrices carrying E8M0 ``.scale`` tensors."""
+    if weight.dim() != 2 or scale.dim() != 2:
+        raise ValueError(
+            "DeepSeek-V4 FP8 requires 2-D weight and 2-D scale; got "
+            f"{tuple(weight.shape)} and {tuple(scale.shape)}"
+        )
+    out_features, in_features = weight.shape
+    if out_features % scale.shape[0] or in_features % scale.shape[1]:
+        raise ValueError(
+            "DeepSeek-V4 FP8 scale shape is incompatible with weight: "
+            f"weight={tuple(weight.shape)}, scale={tuple(scale.shape)}"
+        )
+    expanded_scale = scale.to(device=weight.device, dtype=torch.float32)
+    expanded_scale = expanded_scale.repeat_interleave(
+        out_features // scale.shape[0], dim=0
+    ).repeat_interleave(in_features // scale.shape[1], dim=1)
+    return (weight.to(torch.float32) * expanded_scale).to(dtype)
+
+
+def dequantize_deepseek_v4_native_weight(
+    weight: Tensor,
+    scale: Optional[Tensor],
+    dtype: torch.dtype = torch.bfloat16,
+) -> Optional[Tensor]:
+    """Decode an official V4 FP4 expert or FP8 dense matrix when applicable."""
+    if scale is None or weight.dim() != 2:
+        return None
+    if weight.dtype == torch.int8:
+        return dequantize_deepseek_v4_fp4(weight, scale, dtype=dtype)
+    if str(weight.dtype).startswith("torch.float8"):
+        return dequantize_deepseek_v4_fp8(weight, scale, dtype=dtype)
+    return None
 
 
 def _canonical_dynamic_qparam(
@@ -1183,6 +1306,14 @@ def _dequant_msslim_weight(weight_data: Tensor, quant_type: str, quant_name: str
     Extracted from load_layer_weights_indexed to reduce cyclomatic complexity.
     """
     quant_type = normalize_quant_type(quant_type)
+    if quant_type == "DEEPSEEK_FP4":
+        scale = sf_reader.get_tensor(f"{quant_name}.scale")
+        if scale is None:
+            return None, "skipped"
+        decoded = dequantize_deepseek_v4_native_weight(
+            weight_data, scale, dtype=dtype
+        )
+        return (decoded, "loaded") if decoded is not None else (None, "skipped")
     if quant_type in ("W8A8_DYNAMIC", "W8A8_MIX"):
         weight_scale = sf_reader.get_tensor(f"{quant_name}.weight_scale")
         weight_offset = sf_reader.get_tensor(f"{quant_name}.weight_offset")
@@ -1343,6 +1474,27 @@ def _load_msslim_quant_param(name: str, param, sf_reader: ShardWeightReader,
         weight_key = name
     else:
         weight_key = f"{name}.weight"
+
+    # Official DeepSeek-V4 reference weights have no msModelSlim descriptor.
+    # Their packed-FP4 experts and block-FP8 dense projections both use a
+    # sibling ``.scale`` tensor, so decode them before the generic FLOAT path.
+    if quant_desc_str.get(_DEEPSEEK_V4_FP4_MARKER) == "DEEPSEEK_FP4":
+        weight_data = sf_reader.get_tensor(name)
+        if weight_data is None:
+            weight_data = sf_reader.get_tensor(weight_key)
+        if weight_data is not None:
+            quant_name = weight_key.rsplit(".", 1)[0]
+            decoded = dequantize_deepseek_v4_native_weight(
+                weight_data,
+                sf_reader.get_tensor(f"{quant_name}.scale"),
+                dtype=dtype,
+            )
+            if decoded is not None:
+                _assign_param_checked(
+                    name, param, decoded, "official DeepSeek-V4 FP4/FP8 decode"
+                )
+                param._acc_quant_type = "DEEPSEEK_FP4"
+                return True
     quant_type = normalize_quant_type(
         _quant_desc_type_for_reader(quant_desc_str, weight_key, sf_reader)
     )

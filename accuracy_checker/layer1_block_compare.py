@@ -512,7 +512,8 @@ class ShardedBlockComparator:
     def _build_weight_index_and_reader(self):
         """Build weight index and reader for ref/quant models."""
         from .model_loader import (build_weight_index, ShardWeightReader,
-                                   is_quantized_model, is_compressed_tensors_model)
+                                   is_quantized_model, is_compressed_tensors_model,
+                                   native_quant_description)
         from .utils import normalize_quant_desc_values
         import json as _json
 
@@ -550,12 +551,26 @@ class ShardedBlockComparator:
                     self._ref_quant_desc = normalize_quant_desc_values(
                         _json.load(_f)
                     )
+            if self._ref_quant_desc is None:
+                self._ref_quant_desc = native_quant_description(self.ref_model_path)
+                if self._ref_quant_desc is not None and self.verbose:
+                    logger.info(
+                        "  [DeepSeek-V4 ref] detected official packed FP4 experts "
+                        "(.scale, 32-column groups)"
+                    )
         if self._quant_is_quant and not self._quant_is_ct:
             _desc_path = os.path.join(self.quant_model_path, "quant_model_description.json")
             if os.path.exists(_desc_path):
                 with open(_desc_path, 'r') as _f:
                     self._quant_quant_desc = normalize_quant_desc_values(
                         _json.load(_f)
+                    )
+            if self._quant_quant_desc is None:
+                self._quant_quant_desc = native_quant_description(self.quant_model_path)
+                if self._quant_quant_desc is not None and self.verbose:
+                    logger.info(
+                        "  [DeepSeek-V4 quant] detected official packed FP4 experts "
+                        "(.scale, 32-column groups)"
                     )
 
     def _init_rotary_emb(self, model, device: str):
@@ -2231,6 +2246,12 @@ class ShardedBlockComparator:
     def _streaming_quant_type(quant_desc_str, weight_key, default="FLOAT"):
         """Look up quant type for both Parameter and Linear-style keys."""
         from .utils import normalize_quant_type
+        if (
+            quant_desc_str
+            and quant_desc_str.get("__acc_deepseek_v4_fp4__") == "DEEPSEEK_FP4"
+            and ".experts." in weight_key
+        ):
+            return "DEEPSEEK_FP4"
         return _lookup_quant_descriptor(
             quant_desc_str, weight_key, normalize_quant_type(default)
         )
@@ -2245,7 +2266,10 @@ class ShardedBlockComparator:
         ``ACC_STREAM_DEQUANT_DEVICE=cpu`` only as a compatibility escape hatch
         for an accelerator runtime that lacks one of the required torch ops.
         """
-        from .model_loader import dequantize_weight_mx, _dequant_msslim_weight
+        from .model_loader import (
+            dequantize_weight_mx, _dequant_msslim_weight,
+            dequantize_deepseek_v4_fp4,
+        )
         reader = (
             _ExpertSliceReader(sf_reader, expert_id, num_experts)
             if expert_id is not None and num_experts is not None
@@ -2278,6 +2302,18 @@ class ShardedBlockComparator:
                 return fp
         if w is None:
             raise KeyError(f"streaming expert weight not found: {weight_key}")
+        if w_type == "DEEPSEEK_FP4":
+            # The official V4 reference scale uses float8 E8M0, a dtype that
+            # some Ascend builds cannot materialize directly.  Decode one
+            # selected expert on CPU, then transfer only its BF16 matrix.
+            scale = reader.get_tensor(f"{quant_name}.scale")
+            if scale is None:
+                raise ValueError(
+                    f"DeepSeek-V4 FP4 scale is missing for {weight_key}"
+                )
+            fp = dequantize_deepseek_v4_fp4(w, scale, dtype=self.dtype)
+            del w, scale
+            return fp.to(device, non_blocking=True)
         if w_type == "FLOAT":
             if is_ct and not w.dtype.is_floating_point:
                 scale = reader.get_tensor(f"{quant_name}.weight_scale")
