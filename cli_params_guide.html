@@ -823,13 +823,13 @@
             <div class="wide" id="promptField">
               <label for="prompt">Prompt</label>
               <textarea id="prompt">Write a poem in the style of a limerick about a programmer debugging at 3 AM.</textarea>
-              <span class="hint">应填写部署时真实收到的输入；不要把模型已经生成的 Thinking Process 拼回来。</span>
+              <span class="hint">普通模式填写部署时真实收到的输入；boundary 模式请选择下方的“请求文件”，可填 JSON 或包含 Jinja/ChatML 标记的原始 TXT。</span>
             </div>
           </div>
 
           <div id="boundaryFields" class="grid-3 hidden" aria-hidden="true">
             <div class="wide">
-              <label for="promptFile">请求文件 <span class="optional">JSON 或原始 TXT</span></label>
+              <label for="promptFile">Boundary 请求文件 <span class="optional">JSON / 原始 TXT / Jinja</span></label>
               <input id="promptFile" type="text" autocomplete="off" placeholder="/path/to/request.json 或 /path/to/prompt.txt">
               <span class="hint">已有文件时填写；不想创建文件可直接使用下方文本框。</span>
             </div>
@@ -1379,7 +1379,7 @@
           warnings.push("同时填写了直接 JSON 与文件路径，将优先使用直接 JSON");
         }
         if (mode === "boundary" && promptFile && !isAbsoluteLinuxPath(promptFile)) {
-          addIssue(errors, "promptFile", "完整请求 JSON 必须是 Linux 绝对路径");
+          addIssue(errors, "promptFile", "请求文件必须是 Linux 绝对路径（支持 .json、.txt、.prompt）");
         }
         if (mode === "boundary" && (!/^\d+$/.test(el.numRuns.value) || Number(el.numRuns.value) < 1)) {
           addIssue(errors, "numRuns", "num_runs 必须是大于 0 的整数");
