@@ -710,6 +710,9 @@ def _mode_l1(args):
     if not args.ref_model:
         logger.info("\n  L1需要指定 --ref_model")
         return None
+    if args.prompt_file and args.prompt_file.lower().endswith((".txt", ".text", ".prompt")):
+        with open(args.prompt_file, encoding="utf-8") as prompt_handle:
+            args.prompt = prompt_handle.read()
     ref_device, target_device, dtype = _resolve_devices(args)
     return run_hf_l1(args, ref_device, target_device, dtype)
 

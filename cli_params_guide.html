@@ -825,6 +825,11 @@
               <textarea id="prompt">Write a poem in the style of a limerick about a programmer debugging at 3 AM.</textarea>
               <span class="hint">普通模式填写部署时真实收到的输入；boundary 模式请选择下方的“请求文件”，可填 JSON 或包含 Jinja/ChatML 标记的原始 TXT。</span>
             </div>
+            <div class="wide hidden" id="rawPromptFileField">
+              <label for="rawPromptFile">原始 Prompt 文件 <span class="optional">L1 / full · TXT/Jinja</span></label>
+              <input id="rawPromptFile" type="text" autocomplete="off" placeholder="/path/to/prompt.txt">
+              <span class="hint">填写后会生成 <code>--prompt_file</code>；文件内容原样作为 tokenizer 输入，适合很长的已渲染 prompt。</span>
+            </div>
           </div>
 
           <div id="boundaryFields" class="grid-3 hidden" aria-hidden="true">
@@ -1024,7 +1029,7 @@
         "modelSizeB", "perDeviceMemory", "refDevices", "quantDevices",
         "compareMode", "kimiKdaBackend", "layersPerShard",
         "quantMethod", "dtype", "activationQuantType", "activationQuantBackend", "activationQuantGroupSize", "cacheTopK", "cacheDir", "mlaFine",
-        "outputDir", "prompt", "promptFile", "requestJson", "numRuns", "concurrency",
+        "outputDir", "prompt", "rawPromptFile", "promptFile", "requestJson", "numRuns", "concurrency",
         "maxNewTokens", "noRef", "frameworkReproduced", "stopOnFirstBadcase",
         "repeat4gramMax", "nonprintableMax",
         "dsparkSample", "dsparkSeed", "dsparkAnchors", "rotationMatrix",
@@ -1040,7 +1045,8 @@
       var copyCommand = document.getElementById("copyCommand");
       var applyRecommendation = document.getElementById("applyRecommendation");
       var dsparkFields = document.getElementById("dsparkFields");
-      var promptField = document.getElementById("promptField");
+        var promptField = document.getElementById("promptField");
+      var rawPromptFileField = document.getElementById("rawPromptFileField");
       var boundaryFields = document.getElementById("boundaryFields");
       var kimiKdaField = document.getElementById("kimiKdaField");
       var refDevicesLabel = document.getElementById("refDevicesLabel");
@@ -1198,6 +1204,7 @@
         setFieldVisibility("expertChunkField", mode === "boundary" || (l1Flow && grouped && !dspark));
         setFieldVisibility("frameworkBadOutputField", mode === "boundary");
         setFieldVisibility("boundaryFields", mode === "boundary");
+        setFieldVisibility("rawPromptFileField", ["l1", "full"].indexOf(mode) !== -1 && !dspark);
         setFieldVisibility("advancedOptions", mode === "boundary" || (l1Flow && grouped && !dspark));
         var kimiL1 = type === "kimi_k3" && l1Flow;
         setFieldVisibility("kimiKdaField", kimiL1);
@@ -1351,7 +1358,7 @@
         if (!dspark && ["l1", "l2", "full"].indexOf(mode) !== -1 && rotation && !isAbsoluteLinuxPath(rotation)) {
           addIssue(errors, "rotationMatrix", "旋转矩阵必须是以 / 开头的 Linux 绝对路径");
         }
-        var promptFile = el.promptFile.value.trim();
+        var promptFile = el.promptFile.value.trim() || el.rawPromptFile.value.trim();
         var directRequest = el.requestJson.value.trim();
         if (mode === "boundary" && directRequest) {
           try {
@@ -1393,7 +1400,7 @@
         if (mode === "boundary" && el.maxNewTokens.value && Number(el.maxNewTokens.value) * Number(el.concurrency.value) > 65536) {
           warnings.push("max_new_tokens × concurrency 很大，请确认 16 卡 KV cache 余量");
         }
-        if (mode !== "screening" && type !== "dspark" && !el.prompt.value.trim() && !(mode === "boundary" && (promptFile || directRequest))) {
+        if (mode !== "screening" && type !== "dspark" && !el.prompt.value.trim() && !el.rawPromptFile.value.trim() && !(mode === "boundary" && (promptFile || directRequest))) {
           addIssue(errors, "prompt", "该模式需要非空 Prompt");
         }
         var outputDir = el.outputDir.value.trim();
@@ -1572,6 +1579,8 @@
           args.push(line("--request_json_stdin"));
         } else if (mode === "boundary" && el.promptFile.value.trim()) {
           args.push(line("--prompt_file", shellQuote(el.promptFile.value, "<REQUEST_JSON>")));
+        } else if (["l1", "full"].indexOf(mode) !== -1 && el.rawPromptFile.value.trim()) {
+          args.push(line("--prompt_file", shellQuote(el.rawPromptFile.value, "<PROMPT_FILE>")));
         } else if (mode !== "screening") {
           args.push(line("--prompt", shellQuote(el.prompt.value, "<PROMPT>")));
         }
