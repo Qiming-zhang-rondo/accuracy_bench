@@ -680,6 +680,7 @@
                 <option value="qwen3_vl">qwen3_vl</option>
                 <option value="kimi_k3">kimi_k3</option>
                 <option value="glm_moe_dsa">glm_moe_dsa</option>
+                <option value="deepseek_v4">deepseek_v4</option>
                 <option value="glm_mla">glm_mla</option>
                 <option value="moe">moe</option>
                 <option value="dense">dense</option>
@@ -991,7 +992,7 @@
             <tr><td><code>--expert_chunk_size</code></td><td>L1 自动；boundary 8</td><td>L1 grouped_dual 或 boundary resident expert 的临时反量化分块；越小越省峰值显存。</td></tr>
             <tr><td><code>--kimi_kda_backend</code></td><td>auto</td><td>auto / torch / chunk / fused_recurrent；auto 在 Ascend 上预装纯 torch import shim，无需 fla-core，并使用等价的 torch KDA recurrence。</td></tr>
             <tr><td><code>--output_dir</code></td><td>自动</td><td>单次报告目录；留空或填写 reports 时自动创建带时间戳目录。重复使用已有非空目录时自动创建同级归档，避免覆盖历史。</td></tr>
-            <tr><td><code>--model_type</code></td><td>auto</td><td>支持 dense、moe、GLM、Qwen3 系列、Qwen3.6、Kimi K3 与 dspark。</td></tr>
+            <tr><td><code>--model_type</code></td><td>auto</td><td>支持 dense、moe、GLM、DeepSeek-V4、Qwen3 系列、Qwen3.6、Kimi K3 与 dspark。V4 建议 transformers&gt;=5.12.0；长 prefill 自动使用分块 indexer/attention。</td></tr>
             <tr><td><code>--dspark_sample</code></td><td>空（必需）</td><td>DSpark verifier hidden-state .pt；包含 input_ids、hidden_states、loss_mask 等。</td></tr>
             <tr><td><code>--dspark_seed</code></td><td>0</td><td>DSpark anchor/noise 确定性采样 seed。</td></tr>
             <tr><td><code>--dspark_max_anchors</code></td><td>8</td><td>DSpark 单次诊断最大 anchor 数，工具会按样本和 config 自动下调。</td></tr>
@@ -1061,6 +1062,7 @@
         moe: "通用 MoE",
         glm_mla: "GLM MLA",
         glm_moe_dsa: "GLM MoE + DSA",
+        deepseek_v4: "DeepSeek-V4 MoE",
         qwen3: "Qwen3",
         qwen3_moe: "Qwen3 MoE",
         qwen3_5_moe: "Qwen3.5 MoE",
@@ -1086,12 +1088,13 @@
         if (p.indexOf("qwen3") !== -1 && (p.indexOf("moe") !== -1 || p.indexOf("a3b") !== -1)) return "qwen3_moe";
         if (p.indexOf("qwen3") !== -1) return "qwen3";
         if (p.indexOf("glm") !== -1 && (p.indexOf("moe") !== -1 || p.indexOf("glm-5") !== -1 || p.indexOf("glm5") !== -1)) return "glm_moe_dsa";
+        if (p.indexOf("deepseek") !== -1 && p.indexOf("v4") !== -1) return "deepseek_v4";
         if (p.indexOf("glm") !== -1) return "glm_mla";
         return "auto";
       }
 
       function isMoe(type) {
-        return ["moe", "glm_moe_dsa", "qwen3_moe", "qwen3_5_moe", "qwen3_6", "qwen3_6_moe", "kimi_k3"].indexOf(type) !== -1;
+        return ["moe", "glm_moe_dsa", "deepseek_v4", "qwen3_moe", "qwen3_5_moe", "qwen3_6", "qwen3_6_moe", "kimi_k3"].indexOf(type) !== -1;
       }
 
       function inferredModelSizeB() {
@@ -1120,7 +1123,9 @@
         } else if (mode === "l2" || type === "dspark") {
           cards = 2;
         } else if (isMoe(type)) {
-          var familyBase = (type === "kimi_k3" || type === "glm_moe_dsa") ? 8 : 4;
+          var familyBase = type === "deepseek_v4"
+            ? 16
+            : ((type === "kimi_k3" || type === "glm_moe_dsa") ? 8 : 4);
           if (sizeInfo && sizeInfo.value > 80) familyBase = Math.max(familyBase, 8);
           cards = evenAtLeastTwo(familyBase * 64 / memory);
         } else if (sizeInfo) {

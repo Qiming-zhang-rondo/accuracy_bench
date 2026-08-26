@@ -508,7 +508,7 @@ def _load_l1_cache(
 
 
 def _unpack_l1_cache_entry(entry):
-    """Return ``(hidden_states, layer_state)`` for v3 tensor/dict caches."""
+    """Return ``(hidden_states, layer_state)`` for legacy/v4 caches."""
     if isinstance(entry, dict):
         return entry.get("hidden_states"), entry.get("layer_state")
     return entry, None
@@ -640,6 +640,11 @@ def _capture_subgraph_outputs(
         def hook(mod, inp, out):
             t = out[0] if isinstance(out, tuple) else out
             store[name] = t.detach()
+            if (
+                name.endswith(".gate") and isinstance(out, tuple)
+                and len(out) >= 3 and isinstance(out[2], torch.Tensor)
+            ):
+                store[f"{name}.__indices"] = out[2].detach()
         return hook
 
     hooks = []
@@ -689,7 +694,7 @@ def _patch_subgraph(
 
 
 def detect_model_type(layer: torch.nn.Module) -> str:
-    """检测层结构类型: dense / moe / glm_mla / glm_moe_dsa / qwen3_5_moe.
+    """检测层结构类型: dense / moe / glm_mla / glm_moe_dsa / deepseek_v4 / qwen3_5_moe.
 
     GLM-5 (glm_moe_dsa) 的 MoE 挂在 layer.mlp 下:
       - layer.mlp 是 GlmMoeDsaMoE (有 gate/shared_experts/experts)
@@ -704,6 +709,14 @@ def detect_model_type(layer: torch.nn.Module) -> str:
     """
     if is_kimi_k3_layer(layer):
         return 'kimi_k3'
+
+    # DeepSeek-V4 uses HCA/CSA attention and hash/router MoE modules; do not
+    # mistake its ``mlp`` for GLM-MoE-DSA merely because both are sparse MoE.
+    layer_name = type(layer).__name__.lower()
+    attn_name = type(getattr(layer, 'self_attn', None)).__name__.lower()
+    if 'deepseekv4' in layer_name or 'deepseekv4' in attn_name \
+            or hasattr(getattr(layer, 'self_attn', None), 'compressor'):
+        return 'deepseek_v4'
 
     mlp = getattr(layer, 'mlp', None)
     has_mlp_gate_experts = (
@@ -815,6 +828,39 @@ def _get_glm_moe_dsa_subgraph_names(layer: torch.nn.Module, mla_fine: bool) -> L
     return names
 
 
+def _get_deepseek_v4_subgraph_names(layer: torch.nn.Module, mla_fine: bool) -> List[str]:
+    """DeepSeek-V4 HCA/CSA attention, mHC boundary and hash/top-k MoE."""
+    names = ["self_attn"]
+    attn = getattr(layer, "self_attn", None)
+    if mla_fine and attn is not None:
+        for child in (
+            "q_a_proj", "q_a_norm", "q_b_proj", "q_b_norm",
+            "kv_proj", "kv_norm", "o_a_proj", "o_b_proj",
+        ):
+            if hasattr(attn, child):
+                names.append(f"self_attn.{child}")
+        compressor = getattr(attn, "compressor", None)
+        if compressor is not None:
+            names.append("self_attn.compressor")
+            for child in ("kv_proj", "gate_proj", "kv_norm"):
+                if hasattr(compressor, child):
+                    names.append(f"self_attn.compressor.{child}")
+            indexer = getattr(compressor, "indexer", None)
+            if indexer is not None:
+                names.append("self_attn.compressor.indexer")
+                for child in ("kv_proj", "gate_proj", "kv_norm", "q_b_proj", "scorer"):
+                    if hasattr(indexer, child):
+                        names.append(f"self_attn.compressor.indexer.{child}")
+                if hasattr(getattr(indexer, "scorer", None), "weights_proj"):
+                    names.append("self_attn.compressor.indexer.scorer.weights_proj")
+    mlp = getattr(layer, "mlp", None)
+    if mlp is not None:
+        for child in ("gate", "shared_experts", "experts"):
+            if hasattr(mlp, child):
+                names.append(f"mlp.{child}")
+    return names
+
+
 def _get_qwen3_5_moe_subgraph_names(layer: torch.nn.Module, mla_fine: bool) -> List[str]:
     """子图名 for Qwen3.5/3.6 MoE (标准/线性注意力 + mlp 挂 MoE)."""
     # self_attn (整体) 或 linear_attn (整体), 取存在的那个
@@ -913,6 +959,7 @@ def _get_glm_mla_subgraph_names(layer: torch.nn.Module, mla_fine: bool) -> List[
 # Each helper takes (layer, mla_fine) and returns the list of subgraph names.
 _SUBGRAPH_NAME_DISPATCH = {
     'glm_moe_dsa': _get_glm_moe_dsa_subgraph_names,
+    'deepseek_v4': _get_deepseek_v4_subgraph_names,
     'qwen3_5_moe': _get_qwen3_5_moe_subgraph_names,
     'qwen3_6': _get_qwen3_5_moe_subgraph_names,
     'qwen3_6_moe': _get_qwen3_5_moe_subgraph_names,
@@ -1145,9 +1192,12 @@ def _compute_flip_rates(subgraph_names, ref_sub, quant_sub):
     indexer_flip_rate = None
     experts_routing_flip = None
 
-    if 'self_attn.indexer' in subgraph_names:
-        ref_indexer_out = ref_sub.get('self_attn.indexer')
-        quant_indexer_out = quant_sub.get('self_attn.indexer')
+    indexer_name = next((name for name in (
+        'self_attn.indexer', 'self_attn.compressor.indexer'
+    ) if name in subgraph_names), None)
+    if indexer_name is not None:
+        ref_indexer_out = ref_sub.get(indexer_name)
+        quant_indexer_out = quant_sub.get(indexer_name)
         if ref_indexer_out is not None and quant_indexer_out is not None:
             indexer_flip_rate = _compute_topk_flip_rate(ref_indexer_out, quant_indexer_out)
 
@@ -1158,8 +1208,8 @@ def _compute_flip_rates(subgraph_names, ref_sub, quant_sub):
         None,
     )
     if gate_name is not None:
-        ref_gate_out = ref_sub.get(gate_name)
-        quant_gate_out = quant_sub.get(gate_name)
+        ref_gate_out = ref_sub.get(f"{gate_name}.__indices", ref_sub.get(gate_name))
+        quant_gate_out = quant_sub.get(f"{gate_name}.__indices", quant_sub.get(gate_name))
         if ref_gate_out is not None and quant_gate_out is not None:
             experts_routing_flip = _compute_topk_flip_rate(ref_gate_out, quant_gate_out)
 
@@ -1665,6 +1715,9 @@ def diagnose_layers(
                 quant_model_path, prompt, layer_idx, "quant", quant_method, quant_device)
             ref_hidden, ref_layer_state = _unpack_l1_cache_entry(ref_cache)
             quant_hidden, quant_layer_state = _unpack_l1_cache_entry(quant_cache)
+            cached_input_ids = (
+                ref_cache.get("input_ids") if isinstance(ref_cache, dict) else None
+            )
 
             if ref_hidden is None or quant_hidden is None:
                 logger.info(f"  [SKIP] Layer {layer_idx}: no V1 L1 cache found. "
@@ -1696,6 +1749,7 @@ def diagnose_layers(
                 quant_hidden_override=quant_hidden,
                 ref_layer_state_override=ref_layer_state,
                 quant_layer_state_override=quant_layer_state,
+                input_ids_override=cached_input_ids,
             )
 
             r = diagnose_layer(handle, model_type=model_type, mla_fine=mla_fine, R=R, rot_mats=rot_mats, quant_desc=quant_desc, model_config=model_config)

@@ -2,7 +2,7 @@
 
 > 量化精度对齐工具 — 开源精简版
 > 分支: `accuracy_checker_v2_clean`
-> 最后更新: 2026-08-05
+> 最后更新: 2026-08-26
 
 ---
 
@@ -25,7 +25,7 @@ L1 定位"哪一层有问题"，L2 在问题层内定位"哪个子图有问题"�
 |---|---|---|
 | V2 代码组织 | 独立 `accuracy_checker_v2/` 目录 | **合并进 `accuracy_checker/`** |
 | PatchUnit / LocalPatchRunner | dataclass + Runner 类 | **重构为函数式** (`diagnose_layer(s)`) |
-| Custom 路径 (DeepSeek V4/V3.2) | ✅ | ❌ 移除 |
+| DeepSeek-V4 官方 Transformers 路径 | ✅ | **已合入** |
 | L0 模型完整性校验 | ✅ | ❌ 移除 |
 | HF inference_check | ✅ | ❌ 移除 |
 | msmodelslim 依赖 | ✅ | ❌ 移除 (third_party 可选) |
@@ -106,6 +106,7 @@ acc_bench/
 | `dense` | 默认 (Qwen3, LLaMA) | `self_attn` \| `mlp` |
 | `moe` | `layer.moe` / `block_sparse_moe` 存在 | `self_attn` \| `moe.gate` \| `moe.shared_expert(s)` \| `moe.experts` |
 | `glm_moe_dsa` | `layer.mlp` 有 `gate` + `experts` (GLM-5) | `self_attn` \| `mlp.gate` \| `mlp.shared_experts` \| `mlp.experts` |
+| `deepseek_v4` | V4 HCA/CSA attention + packed hash/top-k MoE | HCA/CSA projections/indexer \| `mlp.gate` \| `mlp.shared_experts` \| `mlp.experts` |
 | `glm_mla` | `self_attn` 有 `q_a_proj`/`kv_a_proj_with_mqa` (dense MLP 层) | `self_attn` \| `mlp` |
 | `qwen3_5_moe` / Qwen3.6 alias | `mlp.gate+experts`，attention 为 `self_attn` 或 `linear_attn` | attention \| `mlp.gate` \| `mlp.shared_expert` \| `mlp.experts` |
 | `kimi_k3` | AttnRes / KDA / Stable LatentMoE 结构标记 | KDA/MLA \| `block_sparse_moe.*` \| AttnRes projections |
@@ -205,12 +206,13 @@ QuaRot 模型权重融合了旋转矩阵 R，不同子图输出落在不同旋�
 | 模型 | 路径 | L1 | L2 | 备注 |
 |------|------|----|----|------|
 | GLM-5.1 | HF | ✅ | ✅ | MLA + DSA + MoE, 78 层, 3D packed experts |
+| DeepSeek-V4 | HF official | ✅ | ✅ | mHC + HCA/CSA + hash/top-k MoE；长 prefill 分块执行 |
 | Qwen3 | HF | ✅ | ✅ | dense |
 | Qwen3VL | HF | ✅ | ✅ | dense |
 | Qwen3MoE | HF | ✅ | ✅ | MoE |
 | Qwen3.5 MoE | HF | ✅ | ✅ | MoE (Qwen35MoEAdapter) |
 
-Custom 路径（DeepSeek V4/V3.2）在开源版已移除。
+DeepSeek-V4 使用 Transformers 官方模型类；缺少 `transformers.models.deepseek_v4` 时会在创建骨架前给出明确升级提示，不会回退成其他架构。V3.2 专用 remote-code 路径仍未包含。
 
 ---
 

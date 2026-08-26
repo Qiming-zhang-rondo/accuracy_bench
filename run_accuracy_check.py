@@ -183,11 +183,13 @@ def parse_args():
     parser.add_argument("--model_type", type=str, default="auto",
                         choices=["auto", "dense", "moe",
                                  "glm_mla", "glm_moe_dsa",
+                                 "deepseek_v4",
                                  "qwen3", "qwen3_moe", "qwen3_5_moe", "qwen3_vl",
                                  "qwen3_6", "qwen3_6_moe", "kimi_k3", "dspark"],
                         help="L2: 模型类型 (默认 auto 自动检测; 偶尔需手动覆盖; "
                              "qwen3=Qwen3/Qwen2, qwen3_moe=Qwen3 MoE, "
                              "qwen3_5_moe=Qwen3.5/3.6 official model_type, "
+                             "deepseek_v4=DeepSeek-V4 official Transformers model, "
                              "qwen3_6=Qwen3.6 alias, kimi_k3=Kimi K3, "
                              "dspark=standalone DSpark draft)")
     parser.add_argument("--dspark_sample", type=str, default=None,
@@ -449,7 +451,9 @@ def run_hf_l1(args, ref_device, target_device, dtype):
 
     from transformers import AutoTokenizer
     from accuracy_checker.glm_dsa_blockwise import install_glm_dsa_blockwise_indexer
+    from accuracy_checker.deepseek_v4_blockwise import install_deepseek_v4_blockwise_runtime
     install_glm_dsa_blockwise_indexer()
+    install_deepseek_v4_blockwise_runtime()
     from accuracy_checker import ShardedBlockComparator
 
     logger.info("\n" + "=" * 70)

@@ -73,7 +73,7 @@ def install_glm_dsa_blockwise_indexer(
         scale = self.softmax_scale
         for q_start in range(0, seq_len, query_block):
             q_end = min(seq_len, q_start + query_block)
-            q_tile = q[q_start:q_end].float()
+            q_tile = q[:, q_start:q_end].float()
             w_tile = weights[:, q_start:q_end]
             running_values = torch.full(
                 (batch_size, q_end - q_start, topk), float("-inf"),

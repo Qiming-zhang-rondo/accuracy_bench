@@ -195,6 +195,10 @@ def distribute_model(model, device_list: List[str]) -> List[nn.Module]:
     # norm + lm_head → 最后一张卡
     if final_norm is not None:
         final_norm.to(device_list[-1])
+    # DeepSeek-V4 collapses its hc_mult residual streams before final norm.
+    hc_head = getattr(components.text_model, "hc_head", None)
+    if hc_head is not None:
+        hc_head.to(device_list[-1])
     if lm_head is not None:
         lm_head.to(device_list[-1])
         if n_devices > 1:
@@ -1393,13 +1397,15 @@ def _hf_detect_streaming_mode(model: nn.Module, model_path: str,
         )
         for n, p in model.named_parameters()
     )
-    # streaming MoE forward 目前只支持 GLM (GlmMoeDsaNaiveMoe)
-    # Qwen3.6 等其他 MoE 模型走全量反量化 (expert 参数量较小, 不会 OOM)
-    is_glm_moe = (
+    # GLM and DeepSeek-V4 both use large 3D packed experts.  Expanding all
+    # expert weights to BF16 would defeat layer sharding and usually OOM.
+    supports_streaming = (
         'glm' in type(model).__name__.lower() or
-        'glm' in str(getattr(model.config, 'model_type', '')).lower()
+        'glm' in str(getattr(model.config, 'model_type', '')).lower() or
+        'deepseekv4' in type(model).__name__.lower() or
+        str(getattr(model.config, 'model_type', '')).lower() == 'deepseek_v4'
     )
-    use_streaming = is_quant and has_3d_experts and is_glm_moe
+    use_streaming = is_quant and has_3d_experts and supports_streaming
     return has_3d_experts, use_streaming
 
 
@@ -1408,6 +1414,8 @@ def _hf_create_skeleton(model_path: str, torch_dtype: torch.dtype,
     """[2/6] 创建模型骨架，处理 streaming expert placeholders"""
     if verbose:
         logger.info("\n[2/6] 创建模型骨架...")
+    from .deepseek_v4_blockwise import install_deepseek_v4_blockwise_runtime
+    install_deepseek_v4_blockwise_runtime()
     model = create_model_skeleton(model_path, dtype=torch_dtype, verbose=verbose)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -1455,6 +1463,16 @@ def _hf_load_quant_weights(model: nn.Module, model_path: str, torch_dtype: torch
     quant_desc = {k: v for k, v in quant_desc_raw.items()
                   if k not in meta_keys and isinstance(v, str)}
     quant_desc = normalize_quant_desc_values(quant_desc)
+
+    # Official DeepSeek-V4 files use native attn/ffn names.  Our boundary
+    # loader works directly from the tensor dictionary, so expose the runtime
+    # aliases that Transformers' regular loader would otherwise create.
+    from .model_loader import add_deepseek_v4_checkpoint_aliases
+    alias_count = add_deepseek_v4_checkpoint_aliases(
+        model, quant_weights, quant_desc
+    )
+    if verbose and alias_count:
+        logger.info("  DeepSeek-V4 checkpoint 映射: %d 个 runtime alias", alias_count)
 
     if use_cpu_dequant:
         # 旧流程: CPU 全量反量化 → 再搬 NPU
@@ -1751,6 +1769,11 @@ def hf_inference_check(
     if verbose:
         logger.info(f"\n[3/6] 分布模型骨架到 {len(device_list)} 个设备...")
     distribute_model(model, device_list)
+    # ``to_empty`` leaves non-persistent RoPE buffers uninitialized.  Rebuild
+    # them after sharding so global, compressor and indexer rotary modules stay
+    # on their owning devices (DeepSeek-V4 has main + compress RoPE for each).
+    from .model_loader import _initialize_rotary_modules
+    _initialize_rotary_modules(model)
 
     # ---- Step 4: 加载权重 + 反量化 ----
     _hf_load_weights(model, model_path, torch_dtype, device_list,

@@ -16,8 +16,9 @@ Usage:
 from __future__ import annotations
 
 import gc
+import os
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -33,6 +34,7 @@ from accuracy_checker.model_loader import (
     load_layer_weights_indexed,
     move_layers_to_device,
     unload_layers_to_meta,
+    _initialize_rotary_modules,
 )
 from accuracy_checker.utils import (
     get_decoder_layers,
@@ -74,15 +76,19 @@ class ReplayProvider:
         self.verbose = verbose
 
         if verbose:
-            logger.info(f"[ReplayProvider] Creating model skeletons...")
+            logger.info("[ReplayProvider] Creating model skeletons...")
+        from .deepseek_v4_blockwise import install_deepseek_v4_blockwise_runtime
+        install_deepseek_v4_blockwise_runtime()
 
         # --- ref skeleton ---
         self.ref_model = create_model_skeleton(ref_model_path, dtype, verbose)
         self.ref_model.eval()
+        _initialize_rotary_modules(self.ref_model)
 
         # --- quant skeleton ---
         self.quant_model = create_model_skeleton(quant_model_path, dtype, verbose)
         self.quant_model.eval()
+        _initialize_rotary_modules(self.quant_model)
 
         # --- weight index ---
         self.ref_weight_map = build_weight_index(ref_model_path)
@@ -137,6 +143,7 @@ class ReplayProvider:
         quant_hidden_override: Optional[torch.Tensor] = None,
         ref_layer_state_override: Optional[torch.Tensor] = None,
         quant_layer_state_override: Optional[torch.Tensor] = None,
+        input_ids_override: Optional[torch.Tensor] = None,
     ) -> "LayerReplayHandle":
         """
         获取目标层的 replay handle。
@@ -230,17 +237,19 @@ class ReplayProvider:
             ref_hidden, quant_hidden, _ = self._prepare_inputs(
                 prompt, device, quant_device, layer_idx,
             )
+            if input_ids_override is None:
+                input_ids_override = getattr(self, "_last_input_ids", None)
 
         # 获取 ref/quant 的目标层 module
         ref_layer = self.ref_layers[layer_idx]
         quant_layer = self.quant_layers[layer_idx]
         ref_layer_kwargs = self._build_layer_kwargs(
             self.ref_model, ref_hidden.to(device), device,
-            ref_layer, ref_layer_state_override,
+            ref_layer, ref_layer_state_override, input_ids_override,
         )
         quant_layer_kwargs = self._build_layer_kwargs(
             self.quant_model, quant_hidden.to(quant_device), quant_device,
-            quant_layer, quant_layer_state_override,
+            quant_layer, quant_layer_state_override, input_ids_override,
         )
 
         return LayerReplayHandle(
@@ -307,6 +316,7 @@ class ReplayProvider:
     def _build_layer_kwargs(
         self, model, hidden: torch.Tensor, device: str,
         layer: nn.Module, layer_state: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """构建位置参数和模型特定的跨层状态参数。"""
         from accuracy_checker.utils import get_rotary_emb_module
@@ -314,15 +324,40 @@ class ReplayProvider:
         batch_size, seq_len = hidden.shape[:2]
         position_ids = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0).expand(batch_size, -1)
         position_embeddings = None
+        is_v4 = "deepseekv4" in type(layer).__name__.lower()
         if rotary is not None:
             # Qwen3.6 ForConditionalGeneration: rotary_emb 参数可能在 CPU，需要移到 device
             rotary = rotary.to(device)
-            position_embeddings = rotary(hidden, position_ids)
+            if is_v4:
+                base = hidden[:, :, 0, :] if hidden.dim() == 4 else hidden
+                position_embeddings = {
+                    "main": rotary(base, position_ids=position_ids, layer_type="main"),
+                    "compress": rotary(base, position_ids=position_ids, layer_type="compress"),
+                }
+            else:
+                position_embeddings = rotary(hidden, position_ids)
         kwargs = {
             "position_embeddings": position_embeddings,
             "position_ids": position_ids,
         }
         attention_mask = build_replay_attention_mask(layer, hidden)
+        if is_v4:
+            if input_ids is None and getattr(getattr(layer, "mlp", None), "is_hash", False):
+                raise RuntimeError(
+                    "DeepSeek-V4 hash-MoE L2 replay requires a v4 L1 cache; rerun L1 to store input_ids"
+                )
+            if input_ids is not None:
+                kwargs["input_ids"] = input_ids.to(device)
+            threshold = int(os.getenv("ACC_DEEPSEEK_V4_BLOCKWISE_THRESHOLD", "8192"))
+            if seq_len <= threshold:
+                window = int(getattr(layer.self_attn, "sliding_window", seq_len))
+                query = position_ids[:, :, None]
+                key = torch.arange(seq_len, device=device).view(1, 1, -1)
+                valid = (key <= query) & (key > query - window)
+                attention_mask = torch.zeros(
+                    batch_size, 1, seq_len, seq_len,
+                    dtype=hidden.dtype, device=device,
+                ).masked_fill(~valid[:, None], float("-inf"))
         if attention_mask is not None:
             kwargs["attention_mask"] = attention_mask
         state_name = get_layer_state_kwarg(layer)
@@ -400,6 +435,12 @@ class ReplayProvider:
         batch_size, seq_len = 1, 8
         ref_hidden = torch.randn(batch_size, seq_len, hidden_size, dtype=self.dtype, device=device)
         quant_hidden = torch.randn(batch_size, seq_len, hidden_size, dtype=self.dtype, device=quant_device)
+        self._last_input_ids = torch.zeros(batch_size, seq_len, dtype=torch.long)
+        text_config = get_text_config(self.ref_model.config)
+        if str(getattr(text_config, "model_type", "")).lower() == "deepseek_v4":
+            hc_mult = int(getattr(text_config, "hc_mult", 4))
+            ref_hidden = ref_hidden.unsqueeze(2).expand(-1, -1, hc_mult, -1).contiguous()
+            quant_hidden = quant_hidden.unsqueeze(2).expand(-1, -1, hc_mult, -1).contiguous()
 
         # 生成 position_ids + position_embeddings
         position_ids = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0).expand(batch_size, -1)
@@ -427,6 +468,7 @@ class ReplayProvider:
         )
         inputs = tokenizer(prompt, return_tensors="pt")
         input_ids = inputs["input_ids"]
+        self._last_input_ids = input_ids.detach().cpu()
         batch_size, seq_len = input_ids.shape
 
         # ref hidden — 确保 embed module 在目标 device
@@ -438,6 +480,12 @@ class ReplayProvider:
         quant_embed = self.quant_model.get_input_embeddings()
         quant_embed = quant_embed.to(quant_device)
         quant_hidden = quant_embed(input_ids.to(quant_device))
+
+        text_config = get_text_config(self.ref_model.config)
+        if str(getattr(text_config, "model_type", "")).lower() == "deepseek_v4":
+            hc_mult = int(getattr(text_config, "hc_mult", 4))
+            ref_hidden = ref_hidden.unsqueeze(2).expand(-1, -1, hc_mult, -1).contiguous()
+            quant_hidden = quant_hidden.unsqueeze(2).expand(-1, -1, hc_mult, -1).contiguous()
 
         # position_ids + position_embeddings
         position_ids = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0).expand(batch_size, -1)

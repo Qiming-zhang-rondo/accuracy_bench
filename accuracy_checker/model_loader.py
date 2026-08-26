@@ -53,6 +53,58 @@ def _ensure_glm_moe_dsa_registered():
 _ensure_glm_moe_dsa_registered()
 
 
+def _ensure_deepseek_v4_registered():
+    """Register official DeepSeek-V4 classes when an older Transformers build omitted the mapping."""
+    if "deepseek_v4" in CONFIG_MAPPING:
+        return
+    try:
+        from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+        from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
+        CONFIG_MAPPING.register("deepseek_v4", DeepseekV4Config)
+        MODEL_FOR_CAUSAL_LM_MAPPING.register(DeepseekV4Config, DeepseekV4ForCausalLM)
+        logger.info("  registered Transformers model_type=deepseek_v4")
+    except ImportError:
+        # The installed Transformers package predates DeepSeek-V4; report the
+        # actionable error at AutoConfig time instead of masking the import.
+        pass
+
+
+_ensure_deepseek_v4_registered()
+
+
+def require_model_runtime_support(model_path: str) -> None:
+    """Fail early with an actionable error for architectures missing in HF.
+
+    ``trust_remote_code`` cannot help DeepSeek-V4 checkpoints that only ship a
+    standard ``config.json``: the actual implementation must exist in the
+    installed Transformers package.
+    """
+    config_path = os.path.join(model_path, "config.json")
+    try:
+        with open(config_path, "r", encoding="utf-8") as handle:
+            model_type = str(json.load(handle).get("model_type", "")).lower()
+    except (OSError, json.JSONDecodeError):
+        return
+    if model_type != "deepseek_v4":
+        return
+    try:
+        from transformers.models.deepseek_v4.configuration_deepseek_v4 import (  # noqa: F401
+            DeepseekV4Config,
+        )
+        from transformers.models.deepseek_v4.modeling_deepseek_v4 import (  # noqa: F401
+            DeepseekV4ForCausalLM,
+        )
+    except ImportError as exc:
+        import transformers
+        raise RuntimeError(
+            "检测到 model_type=deepseek_v4，但当前 Transformers "
+            f"{transformers.__version__} 不包含官方 DeepSeek-V4 实现。"
+            "请升级到包含 transformers.models.deepseek_v4 的版本"
+            "（建议 transformers>=5.12.0），然后重新运行；本工具不会把 V4 "
+            "错误地回退成 V3/GLM 结构。"
+        ) from exc
+
+
 # ============================================================================
 # Symlink 工具
 # ============================================================================
@@ -742,7 +794,81 @@ class ShardWeightReader:
             fname = self.weight_map.get(alt_key)
             if fname is not None:
                 return alt_key, fname
+        native_key = self._deepseek_v4_native_key(key)
+        if native_key is not None:
+            fname = self.weight_map.get(native_key)
+            if fname is not None:
+                return native_key, fname
         return None, None
+
+    def _deepseek_v4_native_key(self, key: str) -> Optional[str]:
+        """Map the official in-memory V4 names to released checkpoint names."""
+        if not any(".attn." in name or ".ffn." in name
+                   for name in self.weight_map):
+            return None
+        if key == "lm_head.weight" and "head.weight" in self.weight_map:
+            return "head.weight"
+        candidate = key
+        replacements = (
+            (".input_layernorm.", ".attn_norm."),
+            (".post_attention_layernorm.", ".ffn_norm."),
+            (".attn_hc.fn", ".hc_attn_fn"),
+            (".attn_hc.base", ".hc_attn_base"),
+            (".attn_hc.scale", ".hc_attn_scale"),
+            (".ffn_hc.fn", ".hc_ffn_fn"),
+            (".ffn_hc.base", ".hc_ffn_base"),
+            (".ffn_hc.scale", ".hc_ffn_scale"),
+        )
+        for source, target in replacements:
+            candidate = candidate.replace(source, target)
+        if ".self_attn.compressor.indexer." in candidate:
+            candidate = candidate.replace(
+                ".self_attn.compressor.indexer.", ".attn.indexer."
+            )
+            for source, target in (
+                ("scorer.weights_proj.", "weights_proj."),
+                ("q_b_proj.", "wq_b."),
+                ("kv_proj.", "compressor.wkv."),
+                ("gate_proj.", "compressor.wgate."),
+                ("kv_norm.", "compressor.norm."),
+                ("position_bias", "compressor.ape"),
+            ):
+                candidate = candidate.replace(source, target)
+        elif ".self_attn.compressor." in candidate:
+            candidate = candidate.replace(
+                ".self_attn.compressor.", ".attn.compressor."
+            )
+            for source, target in (
+                ("kv_proj.", "wkv."), ("gate_proj.", "wgate."),
+                ("kv_norm.", "norm."), ("position_bias", "ape"),
+            ):
+                candidate = candidate.replace(source, target)
+        elif ".self_attn." in candidate:
+            candidate = candidate.replace(".self_attn.", ".attn.")
+            for source, target in (
+                ("q_a_proj.", "wq_a."), ("q_b_proj.", "wq_b."),
+                ("q_a_norm.", "q_norm."), ("kv_proj.", "wkv."),
+                ("kv_norm.", "norm."), ("o_a_proj.", "wo_a."),
+                ("o_b_proj.", "wo_b."), ("sinks", "attn_sink"),
+            ):
+                candidate = candidate.replace(source, target)
+        if ".mlp." in candidate:
+            candidate = candidate.replace(".mlp.", ".ffn.")
+            for source, target in (
+                ("shared_experts.gate_proj.", "shared_experts.w1."),
+                ("shared_experts.down_proj.", "shared_experts.w2."),
+                ("shared_experts.up_proj.", "shared_experts.w3."),
+                ("gate.e_score_correction_bias", "gate.bias"),
+            ):
+                candidate = candidate.replace(source, target)
+            # Released V4 checkpoints keep every routed expert as three
+            # independent projections.  Transformers converts these names and
+            # packs all experts into gate_up_proj/down_proj while loading.
+            if ".experts." in candidate:
+                candidate = candidate.replace(".gate_proj.", ".w1.")
+                candidate = candidate.replace(".down_proj.", ".w2.")
+                candidate = candidate.replace(".up_proj.", ".w3.")
+        return candidate if candidate in self.weight_map else None
 
     def get_tensor(self, key: str):
         """读取单个 key 的 tensor，如果 key 不在 weight_map 中返回 None
@@ -752,21 +878,10 @@ class ShardWeightReader:
           query key:      "model.model.language_model.layers..."
         尝试去掉一个 "model." 前缀作为 fallback
         """
-        fname = self.weight_map.get(key)
-        if fname is not None:
-            sf = self._get_sf(fname)
-            return sf.get_tensor(key)
-
-        # Fallback: 去掉一层 "model." 前缀重试
-        # "model.model.language_model.layers..." → "model.language_model.layers..."
-        if key.startswith("model.model."):
-            alt_key = key[len("model."):]
-            fname = self.weight_map.get(alt_key)
-            if fname is not None:
-                sf = self._get_sf(fname)
-                return sf.get_tensor(alt_key)
-
-        return None
+        resolved_key, fname = self._resolve_key(key)
+        if fname is None:
+            return None
+        return self._get_sf(fname).get_tensor(resolved_key)
 
     def get_tensor_shape(self, key: str):
         """Return a tensor shape from safetensors metadata without loading it."""
@@ -846,6 +961,59 @@ class ShardWeightReader:
 
     def __del__(self):
         self.close()
+
+
+def add_deepseek_v4_checkpoint_aliases(
+    model: nn.Module,
+    weights: Dict[str, torch.Tensor],
+    quant_desc: Optional[dict] = None,
+) -> int:
+    """Expose official DeepSeek-V4 checkpoint names under runtime names.
+
+    Transformers normally performs this conversion in its checkpoint loader.
+    Boundary mode deliberately bypasses that loader, so it must expose the same
+    aliases before generic dequantization.  Tensor storage is shared and routed
+    experts remain compact for the streaming loader.
+    """
+    if not any(".attn." in key or ".ffn." in key for key in weights):
+        return 0
+    resolver = ShardWeightReader("", {key: "" for key in weights})
+    runtime_names = {
+        name for name, _ in model.named_parameters()
+    } | {
+        name for name, _ in model.named_buffers()
+    }
+    metadata_suffixes = (
+        "weight_scale", "weight_offset", "deq_scale", "input_scale",
+    )
+    added = 0
+    for runtime_name in runtime_names:
+        if ".mlp.experts.gate_up_proj" in runtime_name or \
+                ".mlp.experts.down_proj" in runtime_name:
+            continue
+        native_name = resolver._deepseek_v4_native_key(runtime_name)
+        if native_name is None:
+            continue
+        if runtime_name not in weights:
+            weights[runtime_name] = weights[native_name]
+            added += 1
+        if quant_desc is not None:
+            qtype = quant_desc.get(
+                native_name, quant_desc.get(parse_base_name(native_name))
+            )
+            if qtype is not None:
+                quant_desc.setdefault(runtime_name, qtype)
+        if not runtime_name.endswith(".weight"):
+            continue
+        runtime_base = runtime_name[:-7]
+        native_base = native_name[:-7]
+        for suffix in metadata_suffixes:
+            runtime_meta = f"{runtime_base}.{suffix}"
+            native_meta = f"{native_base}.{suffix}"
+            if runtime_meta not in weights and native_meta in weights:
+                weights[runtime_meta] = weights[native_meta]
+                added += 1
+    return added
 
 
 def _collect_layer_key(key: str, layer_indices: List[int], needed: set):
@@ -1085,9 +1253,8 @@ def _load_msslim_quant_param(name: str, param, sf_reader: ShardWeightReader,
         weight_key = name
     else:
         weight_key = f"{name}.weight"
-    base_name = parse_base_name(weight_key)
     quant_type = normalize_quant_type(
-        quant_desc_str.get(weight_key, quant_desc_str.get(base_name, "FLOAT"))
+        _quant_desc_type_for_reader(quant_desc_str, weight_key, sf_reader)
     )
 
     # FLOAT 或未知类型: 直接读 tensor 赋值 (与原 FLOAT/unknown 合并分支一致)
@@ -1348,10 +1515,12 @@ def load_layer_weights_indexed(
     strict_final_param_ids = None
     strict_final_buffer_ids = None
     if load_norm_head_only and strict_final_only:
-        from .utils import get_norm_module, get_lm_head_module
+        from .utils import get_norm_module, get_lm_head_module, get_model_components
+        text_model = get_model_components(model).text_model
         final_modules = tuple(
             module for module in (
-                get_norm_module(model), get_lm_head_module(model)
+                get_norm_module(model), get_lm_head_module(model),
+                getattr(text_model, "hc_head", None),
             ) if module is not None
         )
         if not final_modules:
@@ -1542,11 +1711,26 @@ def _count_experts_in_map(sf_reader: ShardWeightReader, test_key_tmpl: str) -> i
     num_experts = 0
     for i in range(300):
         test_key = test_key_tmpl.format(i=i)
-        if test_key in sf_reader.weight_map:
+        resolved_key, _ = sf_reader._resolve_key(test_key)
+        if resolved_key is not None:
             num_experts = i + 1
         elif num_experts > 0:
             break
     return num_experts
+
+
+def _quant_desc_type_for_reader(quant_desc: dict, key: str,
+                                sf_reader: ShardWeightReader) -> str:
+    """Resolve a quant type through both runtime and official V4 names."""
+    base = parse_base_name(key)
+    value = quant_desc.get(key, quant_desc.get(base))
+    if value is not None:
+        return value
+    resolver = getattr(sf_reader, "_deepseek_v4_native_key", None)
+    native = resolver(key) if callable(resolver) else None
+    if native is None:
+        return "FLOAT"
+    return quant_desc.get(native, quant_desc.get(parse_base_name(native), "FLOAT"))
 
 
 def _load_3d_expert_indexed_gate_up(name, param, sf_reader, expert_prefix,
@@ -1587,14 +1771,14 @@ def _fill_gate_up_slice_i(i: int, expert_prefix: str, quant_desc_str: dict,
     """
     g_key = f"{expert_prefix}.{i}.gate_proj.weight"
     g_base = parse_base_name(g_key)
-    g_type = quant_desc_str.get(g_key, quant_desc_str.get(g_base, "FLOAT"))
+    g_type = _quant_desc_type_for_reader(quant_desc_str, g_key, sf_reader)
     g_data = _dequant_single_expert_indexed(g_key, g_type, sf_reader, dtype, use_fake_quant)
     if g_data is None:
         return False
     packed[i, :intermediate_dim, :] = g_data
 
     u_key = f"{expert_prefix}.{i}.up_proj.weight"
-    u_type = quant_desc_str.get(u_key, quant_desc_str.get(g_base, "FLOAT"))
+    u_type = _quant_desc_type_for_reader(quant_desc_str, u_key, sf_reader)
     u_data = _dequant_single_expert_indexed(u_key, u_type, sf_reader, dtype, use_fake_quant)
     if u_data is None:
         return False
@@ -1621,8 +1805,7 @@ def _load_3d_expert_indexed_down(name, param, sf_reader, expert_prefix,
 
     for i in range(num_experts):
         d_key = f"{expert_prefix}.{i}.down_proj.weight"
-        d_base = parse_base_name(d_key)
-        d_type = quant_desc_str.get(d_key, quant_desc_str.get(d_base, "FLOAT"))
+        d_type = _quant_desc_type_for_reader(quant_desc_str, d_key, sf_reader)
         d_data = _dequant_single_expert_indexed(d_key, d_type, sf_reader, dtype, use_fake_quant)
         if d_data is None:
             return False
@@ -1653,7 +1836,7 @@ def _load_3d_expert_indexed(name, param, sf_reader, quant_desc_str, dtype, use_f
 
     # Detect W4 packed quant type to adjust dim
     g0_key = f"{expert_prefix}.0.gate_proj.weight" if is_gate_up else f"{expert_prefix}.0.down_proj.weight"
-    g0_type = quant_desc_str.get(g0_key, quant_desc_str.get(parse_base_name(g0_key), "FLOAT"))
+    g0_type = _quant_desc_type_for_reader(quant_desc_str, g0_key, sf_reader)
     is_w4_packed = g0_type in _MXFP4_QUANT_TYPES
     is_w4_unpack = g0_type in (
         "W4A8_DYNAMIC", "W4A16", "W4A8", "W4A4_DYNAMIC", "W4A4_LAOS",
@@ -1854,11 +2037,21 @@ def _create_dspark_model_from_config(model_path: str, dtype: torch.dtype):
     return model, config
 
 
-def _initialize_rotary_modules(model: nn.Module, device: str) -> None:
-    """Rebuild non-persistent RoPE buffers after ``to_empty`` materialization."""
+def _initialize_rotary_modules(model: nn.Module,
+                               device: Optional[str] = None) -> None:
+    """Rebuild non-persistent RoPE buffers after ``to_empty`` materialization.
+
+    With ``device=None`` every rotary module remains on the device assigned by
+    layer sharding.  DeepSeek-V4 owns several rotary modules and keeps separate
+    ``main``/``compress`` frequency buffers, all of which must be rebuilt.
+    """
     seen = set()
     for module in model.modules():
-        if id(module) in seen or not hasattr(module, "inv_freq"):
+        has_frequency_buffer = (
+            hasattr(module, "inv_freq")
+            or bool(getattr(module, "layer_types", None))
+        )
+        if id(module) in seen or not has_frequency_buffer:
             continue
         seen.add(id(module))
         config = getattr(module, "config", None)
@@ -1866,9 +2059,31 @@ def _initialize_rotary_modules(model: nn.Module, device: str) -> None:
         rope_init_fn = getattr(module, "rope_init_fn", None)
         if config is None or (compute is None and not callable(rope_init_fn)):
             continue
-        module.to(device)
+        target_device = device
+        if target_device is None:
+            tensors = tuple(module.parameters()) + tuple(module.buffers())
+            materialized = [tensor for tensor in tensors if not tensor.is_meta]
+            target_device = str(materialized[0].device) if materialized else "cpu"
+        module.to(target_device)
+        layer_types = getattr(module, "layer_types", None)
+        if layer_types:
+            for layer_type in layer_types:
+                rope_type = getattr(module, "rope_type", {}).get(layer_type, "default")
+                if rope_type == "default":
+                    initializer = compute
+                else:
+                    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+                    initializer = ROPE_INIT_FUNCTIONS[rope_type]
+                inv_freq, attention_scaling = initializer(
+                    config, device=target_device, layer_type=layer_type
+                )
+                setattr(module, f"{layer_type}_inv_freq", inv_freq)
+                if hasattr(module, f"{layer_type}_original_inv_freq"):
+                    setattr(module, f"{layer_type}_original_inv_freq", inv_freq.clone())
+                setattr(module, f"{layer_type}_attention_scaling", attention_scaling)
+            continue
         initializer = compute if compute is not None else rope_init_fn
-        inv_freq, attention_scaling = initializer(config, device=device)
+        inv_freq, attention_scaling = initializer(config, device=target_device)
         module.inv_freq = inv_freq
         if hasattr(module, "attention_scaling"):
             module.attention_scaling = attention_scaling
@@ -2110,6 +2325,7 @@ def create_model_skeleton(
     from .dspark import is_dspark_checkpoint
     from .kimi_fla_shim import is_kimi_k3_checkpoint
 
+    require_model_runtime_support(model_path)
     is_dspark = is_dspark_checkpoint(model_path)
     use_kimi_streaming_skeleton = (
         streaming_experts and is_kimi_k3_checkpoint(model_path)

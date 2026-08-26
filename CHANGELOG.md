@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-08-26 — DeepSeek-V4 end-to-end support
+
+- L1 完整接入官方 DeepSeek-V4：mHC 多流 hidden state、HCA/CSA、hash/top-k MoE、原生 split experts、SwiGLU clamp 和最终 `hc_head` 均按官方执行契约对齐。
+- L2 cache format 升级为 v4 并保存 hash routing 所需的 input ids；replay 支持 V4 双 RoPE、sliding mask、router/indexer flip 与细粒度 HCA/CSA 子图。
+- Boundary 可直接读取发布 checkpoint 的 `attn.*` / `ffn.experts.N.w1|w2|w3` 命名；W4/W8 专家保持紧凑格式并按层常驻对应 NPU，显存不足时自动回退 CPU compact streaming。
+- 长 prefill 自动启用精确分块 indexer 和 attention：维持全局 top-k、局部窗口、压缩 KV、causal 规则与 attention sink，避免构造完整 query×compressed-KV 中间张量。
+- 16 卡参数页按可见卡自动拆成 ref/quant 各 8 卡；缺少官方 V4 模块时在加载前明确提示升级 Transformers（建议 `>=5.12.0`）。
+
 ## 2026-08-17 — INT4 per-group activation diagnostics
 
 - 新增 `W4A4_INT4_PER_GROUP` 激活伪量化类型和 `--activation_quant_group_size`，按每个 token 的 hidden feature group 独立计算对称 INT4 scale。

@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from .model_loader import (
     _MX_QUANT_TYPES,
@@ -77,6 +78,305 @@ class ResidentExpertStore:
         while len(self.bf16_cache) > self.cache_limit:
             _, evicted = self.bf16_cache.popitem(last=False)
             del evicted
+
+
+@dataclass
+class PackedExpertStore:
+    """DeepSeek-V4 packed expert tensors, compact on CPU or owning NPU."""
+
+    prefix: str
+    device: str
+    tensors: dict[str, torch.Tensor]
+    bytes_on_device: int
+
+    def get(self, key: str):
+        return self.tensors.get(key)
+
+
+def _packed_projection_key(source: PackedExpertStore, projection: str):
+    for key in (
+        f"{source.prefix}.{projection}",
+        f"{source.prefix}.{projection}.weight",
+    ):
+        if source.get(key) is not None:
+            return key
+    raise KeyError(f"missing packed expert projection: {source.prefix}.{projection}")
+
+
+def _packed_qparam(source: PackedExpertStore, quant_name: str, suffix: str):
+    for key in (f"{quant_name}.{suffix}", f"{quant_name}_{suffix}"):
+        value = source.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _select_packed_qparam(value, ids: torch.Tensor, batch: int, rows: int,
+                          num_experts: int):
+    if value is None:
+        return None
+    selected = (
+        value.index_select(0, ids.to(value.device))
+        if value.dim() > 0 and value.shape[0] == num_experts
+        else value
+    )
+    if selected.dim() == 0:
+        selected = selected.reshape(1).expand(batch)
+    if selected.dim() == 1:
+        if selected.numel() == 1:
+            selected = selected.expand(batch)
+        if selected.numel() == rows:
+            return selected.repeat(batch)
+        if selected.numel() != batch:
+            return selected
+        return selected.repeat_interleave(rows)
+    if selected.shape[0] == 1 and batch > 1:
+        selected = selected.expand(batch, *selected.shape[1:])
+    if selected.dim() >= 2 and selected.shape[1] == rows:
+        return selected.reshape(batch * rows, *selected.shape[2:])
+    return selected
+
+
+def _dequant_packed_projection(source: PackedExpertStore, projection: str,
+                               expert_ids: list[int], quant_desc: Mapping[str, str],
+                               dtype: torch.dtype, target_device: str):
+    key = _packed_projection_key(source, projection)
+    quant_name = key[:-7] if key.endswith(".weight") else key
+    quant_type = quant_desc.get(
+        key,
+        quant_desc.get(
+            quant_name,
+            quant_desc.get(
+                parse_base_name(key),
+                quant_desc.get(parse_base_name(quant_name), "FLOAT"),
+            ),
+        ),
+    )
+    weight = source.get(key)
+    num_experts = weight.shape[0]
+    ids = torch.tensor(expert_ids, dtype=torch.long, device=weight.device)
+    selected = weight.index_select(0, ids).to(target_device, non_blocking=True)
+    if quant_type == "FLOAT":
+        if not selected.dtype.is_floating_point:
+            raise ValueError(f"integer packed expert classified as FLOAT: {key}")
+        return selected.to(dtype)
+
+    batch, packed_rows, input_cols = selected.shape
+    scale = _packed_qparam(source, quant_name, "weight_scale")
+    offset = _packed_qparam(source, quant_name, "weight_offset")
+    if quant_type in ("W4A8_DYNAMIC", "W4A8", "W4A16"):
+        flat_weight = unpack_int4_to_int8(selected.reshape(batch * packed_rows, input_cols))
+        rows = packed_rows * 2
+    else:
+        rows = packed_rows
+        flat_weight = selected.reshape(batch * rows, input_cols)
+    flat_scale = _select_packed_qparam(scale, ids, batch, rows, num_experts)
+    flat_offset = _select_packed_qparam(offset, ids, batch, rows, num_experts)
+    if flat_scale is not None:
+        flat_scale = flat_scale.to(target_device, non_blocking=True)
+    if flat_offset is not None:
+        flat_offset = flat_offset.to(target_device, non_blocking=True)
+
+    if quant_type in {
+        "W4A8_DYNAMIC", "W4A8", "W4A16", "W8A8_DYNAMIC", "W8A8_MIX"
+    } and flat_scale is not None:
+        result = dequantize_weight_dynamic(
+            flat_weight, flat_scale, flat_offset, dtype
+        )
+        return result.reshape(batch, rows, input_cols)
+    if quant_type in _MX_QUANT_TYPES and flat_scale is not None:
+        result = dequantize_weight_mx(
+            flat_weight, flat_scale, quant_type, dtype=dtype
+        )
+        return result.reshape(batch, rows, input_cols)
+    deq_scale = _packed_qparam(source, quant_name, "deq_scale")
+    input_scale = _packed_qparam(source, quant_name, "input_scale")
+    if deq_scale is not None:
+        result, _ = dequantize_weight_static(
+            flat_weight,
+            _select_packed_qparam(
+                deq_scale, ids, batch, rows, num_experts).to(target_device),
+            (_select_packed_qparam(
+                input_scale, ids, batch, rows, num_experts).to(target_device)
+             if input_scale is not None else None),
+            dtype=dtype,
+        )
+        return result.reshape(batch, rows, input_cols)
+    raise ValueError(f"unsupported packed expert quantization: {quant_type} ({key})")
+
+
+def _build_packed_store(prefix: str, quant_weights: Mapping, device: str,
+                        resident: bool) -> PackedExpertStore:
+    keys = [key for key in quant_weights if key.startswith(f"{prefix}.")]
+    if not keys:
+        raise KeyError(f"no packed expert tensors found for {prefix}")
+    target = device if resident else "cpu"
+    tensors = {}
+    total = 0
+    for key in keys:
+        tensor = quant_weights[key].to(target, non_blocking=resident)
+        tensors[key] = tensor
+        if resident:
+            total += tensor.numel() * tensor.element_size()
+    store = PackedExpertStore(prefix, target, tensors, total)
+    _packed_projection_key(store, "gate_up_proj")
+    _packed_projection_key(store, "down_proj")
+    return store
+
+
+def _build_v4_split_store(prefix: str, quant_weights: Mapping, device: str,
+                          resident: bool, quant_desc: Mapping[str, str]):
+    """Stack released ``ffn.experts.N.w{1,2,3}`` tensors compactly.
+
+    This mirrors Transformers' checkpoint conversion without ever materializing
+    all experts as BF16.  Quantized weights and their metadata stay in their
+    original compact dtype on the owning NPU (or CPU fallback).
+    """
+    native_prefix = prefix.replace(".mlp.experts", ".ffn.experts")
+    projection_map = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
+    grouped: dict[str, dict[int, torch.Tensor]] = {}
+    desc_aliases = dict(quant_desc)
+    pattern = re.compile(
+        rf"^{re.escape(native_prefix)}\.(?P<eid>\d+)\."
+        rf"(?P<proj>w[123])\.(?P<tail>weight|weight_scale|weight_offset|deq_scale|input_scale)$"
+    )
+    expert_ids = set()
+    for key, tensor in quant_weights.items():
+        match = pattern.match(key)
+        if match is None:
+            continue
+        expert_id = int(match.group("eid"))
+        expert_ids.add(expert_id)
+        projection = projection_map[match.group("proj")]
+        tail = f"{projection}.{match.group('tail')}"
+        grouped.setdefault(tail, {})[expert_id] = tensor
+        if match.group("tail") == "weight":
+            runtime_key = f"{prefix}.{expert_id}.{projection}.weight"
+            qtype = quant_desc.get(key, quant_desc.get(parse_base_name(key)))
+            if qtype is not None:
+                desc_aliases[runtime_key] = qtype
+    if not expert_ids:
+        raise KeyError(f"no official split expert tensors found for {native_prefix}")
+    ordered_ids = sorted(expert_ids)
+    if ordered_ids != list(range(len(ordered_ids))):
+        raise ValueError(f"non-contiguous DeepSeek-V4 expert ids for {native_prefix}")
+    required = {"gate_proj.weight", "up_proj.weight", "down_proj.weight"}
+    if not required.issubset(grouped):
+        raise KeyError(f"incomplete DeepSeek-V4 experts for {native_prefix}")
+    target = device if resident else "cpu"
+    tensors = {}
+    total = 0
+    for tail, values in grouped.items():
+        if any(expert_id not in values for expert_id in ordered_ids):
+            # Optional metadata may legitimately be absent for FLOAT weights,
+            # but a partially present suffix is unsafe.
+            raise ValueError(f"partial expert metadata: {native_prefix}.{tail}")
+        stacked = torch.stack([values[i] for i in ordered_ids], dim=0)
+        stacked = stacked.to(target, non_blocking=resident)
+        tensors[tail] = stacked
+        if resident:
+            total += stacked.numel() * stacked.element_size()
+    return (
+        ResidentExpertStore(prefix, target, len(ordered_ids), tensors, total),
+        desc_aliases,
+    )
+
+
+def _install_deepseek_v4_packed_experts(model, quant_weights, quant_desc, dtype,
+                                         chunk_size, verbose):
+    try:
+        from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Experts
+    except ImportError:
+        return 0, [], 0
+    modules = [(module, name) for name, module in model.named_modules()
+               if isinstance(module, DeepseekV4Experts)]
+    if not modules:
+        return 0, [], 0
+    resident_enabled = os.getenv("ACC_BOUNDARY_RESIDENT_EXPERTS", "1") != "0"
+    stores = []
+    resident_count = 0
+    resident_bytes = 0
+    for expert_module, prefix in modules:
+        device = _module_device(expert_module)
+        source_desc = quant_desc
+        try:
+            try:
+                source = _build_packed_store(
+                    prefix, quant_weights, device, resident_enabled
+                )
+            except KeyError:
+                source, source_desc = _build_v4_split_store(
+                    prefix, quant_weights, device, resident_enabled, quant_desc
+                )
+            if resident_enabled:
+                resident_count += 1
+                resident_bytes += source.bytes_on_device
+        except Exception as exc:  # NPU OOM or unsupported placement -> compact CPU
+            logger.warning("  %s packed expert 回退到 CPU compact streaming: %s", prefix, exc)
+            gc.collect()
+            if device.startswith("npu") and hasattr(torch, "npu"):
+                torch.npu.empty_cache()
+            try:
+                source = _build_packed_store(prefix, quant_weights, device, False)
+            except KeyError:
+                source, source_desc = _build_v4_split_store(
+                    prefix, quant_weights, device, False, quant_desc
+                )
+        expert_module._resident_streaming = {
+            "source": source, "quant_desc": source_desc, "dtype": dtype,
+            "chunk_size": max(1, int(chunk_size)), "prefix": prefix,
+        }
+        stores.append(source)
+
+    original_forward = getattr(
+        DeepseekV4Experts, "_acc_original_forward", DeepseekV4Experts.forward
+    )
+    DeepseekV4Experts._acc_original_forward = original_forward
+
+    def packed_forward(self, hidden_states, top_k_index, top_k_weights):
+        cfg = getattr(self, "_resident_streaming", None)
+        if cfg is None:
+            return original_forward(self, hidden_states, top_k_index, top_k_weights)
+        final = torch.zeros_like(hidden_states)
+        mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
+        active = torch.greater(mask.sum(dim=(-1, -2)), 0).nonzero().flatten().tolist()
+        for start in range(0, len(active), cfg["chunk_size"]):
+            expert_ids = active[start:start + cfg["chunk_size"]]
+            if isinstance(cfg["source"], PackedExpertStore):
+                gate_up = _dequant_packed_projection(
+                    cfg["source"], "gate_up_proj", expert_ids,
+                    cfg["quant_desc"], cfg["dtype"], str(hidden_states.device)
+                )
+                down = _dequant_packed_projection(
+                    cfg["source"], "down_proj", expert_ids,
+                    cfg["quant_desc"], cfg["dtype"], str(hidden_states.device)
+                )
+            else:
+                triplets = _dequant_resident_chunk(
+                    cfg["prefix"], expert_ids, cfg["source"],
+                    cfg["quant_desc"], cfg["dtype"], str(hidden_states.device),
+                    cache_result=False,
+                )
+                gate_up = torch.stack([value[0] for value in triplets])
+                down = torch.stack([value[1] for value in triplets])
+            for offset, expert_id in enumerate(expert_ids):
+                top_pos, token_idx = torch.where(mask[expert_id])
+                gate, up = F.linear(hidden_states[token_idx], gate_up[offset]).chunk(2, dim=-1)
+                gate = gate.clamp(max=self.limit)
+                up = up.clamp(min=-self.limit, max=self.limit)
+                current = F.linear(self.act_fn(gate) * up, down[offset])
+                current = current * top_k_weights[token_idx, top_pos, None]
+                final.index_add_(0, token_idx, current.to(final.dtype))
+            del gate_up, down
+        return final
+
+    DeepseekV4Experts.forward = packed_forward
+    if verbose:
+        logger.info(
+            "  DeepSeek-V4 packed expert: %d/%d 层紧凑权重常驻 NPU, %.1f GiB, chunk=%d",
+            resident_count, len(modules), resident_bytes / 2**30, chunk_size,
+        )
+    return len(modules), stores, resident_bytes
 
 
 class _ExpertView:
@@ -228,7 +528,8 @@ def _dequant_resident_projection_batch(prefix: str, expert_ids: list[int],
                                         projection: str,
                                         source: ResidentExpertStore,
                                         quant_desc: Mapping[str, str],
-                                        dtype: torch.dtype):
+                                        dtype: torch.dtype,
+                                        target_device: str):
     """Vectorized common W4/W8 dynamic dequant for one resident chunk."""
     quant_types = set()
     for expert_id in expert_ids:
@@ -247,10 +548,13 @@ def _dequant_resident_projection_batch(prefix: str, expert_ids: list[int],
     if weight is None or scale is None:
         return None
     ids = torch.tensor(expert_ids, dtype=torch.long, device=weight.device)
-    selected = weight.index_select(0, ids)
-    selected_scale = scale.index_select(0, ids)
+    selected = weight.index_select(0, ids).to(target_device, non_blocking=True)
+    selected_scale = scale.index_select(0, ids).to(target_device, non_blocking=True)
     offset = source.tensors.get(f"{projection}.weight_offset")
-    selected_offset = offset.index_select(0, ids) if offset is not None else None
+    selected_offset = (
+        offset.index_select(0, ids).to(target_device, non_blocking=True)
+        if offset is not None else None
+    )
 
     batch_size, packed_rows, input_cols = selected.shape
     if quant_type.startswith("W4"):
@@ -289,11 +593,14 @@ def _dequant_resident_chunk(prefix: str, expert_ids: list[int],
 
     if missing_ids:
         gate = _dequant_resident_projection_batch(
-            prefix, missing_ids, "gate_proj", source, quant_desc, dtype)
+            prefix, missing_ids, "gate_proj", source, quant_desc, dtype,
+            target_device)
         up = _dequant_resident_projection_batch(
-            prefix, missing_ids, "up_proj", source, quant_desc, dtype)
+            prefix, missing_ids, "up_proj", source, quant_desc, dtype,
+            target_device)
         down = _dequant_resident_projection_batch(
-            prefix, missing_ids, "down_proj", source, quant_desc, dtype)
+            prefix, missing_ids, "down_proj", source, quant_desc, dtype,
+            target_device)
         if gate is not None and up is not None and down is not None:
             for batch_idx, (position, expert_id) in enumerate(
                     zip(missing_positions, missing_ids)):
@@ -352,12 +659,28 @@ def install_resident_streaming_moe(
     verbose: bool = True,
 ) -> None:
     """Install resident packed-expert forward, with CPU compact fallback."""
-    from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaNaiveMoe
+    v4_count, v4_sources, _ = _install_deepseek_v4_packed_experts(
+        model, quant_weights, quant_desc, dtype, chunk_size, verbose
+    )
+    try:
+        from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaNaiveMoe
+    except ImportError:
+        if v4_count:
+            model._resident_expert_sources = v4_sources
+            quant_weights.clear()
+            gc.collect()
+            return
+        raise
 
     modules = [(module, name) for name, module in model.named_modules()
                if isinstance(module, GlmMoeDsaNaiveMoe)]
     if not modules:
-        logger.warning("  未找到 GlmMoeDsaNaiveMoe, 无法安装 resident expert")
+        if v4_count:
+            model._resident_expert_sources = v4_sources
+            quant_weights.clear()
+            gc.collect()
+            return
+        logger.warning("  未找到受支持的 packed expert 模块, 无法安装 resident expert")
         return
     chunk_size = max(1, int(chunk_size))
     key_groups = _group_expert_keys(quant_weights.keys(), {name for _, name in modules})
@@ -440,7 +763,7 @@ def install_resident_streaming_moe(
         return final
 
     GlmMoeDsaNaiveMoe.forward = resident_forward
-    model._resident_expert_sources = [
+    model._resident_expert_sources = v4_sources + [
         module._resident_streaming["source"] for module, _ in modules]
     if verbose:
         logger.info(

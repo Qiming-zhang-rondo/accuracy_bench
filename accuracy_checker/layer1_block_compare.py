@@ -501,19 +501,40 @@ class ShardedBlockComparator:
                     )
 
     def _init_rotary_emb(self, model, device: str):
-        """Initialize rotary embedding for a model."""
-        from .utils import get_rotary_emb_module
-        rotary = get_rotary_emb_module(model)
-        if rotary is None:
+        """Initialize global and compressor-owned rotary embeddings."""
+        rotary_modules = [
+            module for module in model.modules()
+            if "rotaryembedding" in type(module).__name__.lower()
+            and hasattr(module, "config")
+            and hasattr(module, "compute_default_rope_parameters")
+        ]
+        if not rotary_modules:
             return
         single_dev = device.split(',')[0] if ',' in device else device
-        rotary_tensors = tuple(rotary.parameters()) + tuple(rotary.buffers())
-        if any(tensor.is_meta for tensor in rotary_tensors):
-            rotary.to_empty(device=single_dev)
-        else:
-            rotary.to(single_dev)
-        if hasattr(rotary, 'config') and hasattr(rotary, 'compute_default_rope_parameters'):
-            inv_freq, attn_scaling = type(rotary).compute_default_rope_parameters(rotary.config, device=single_dev)
+        for rotary in rotary_modules:
+            rotary_tensors = tuple(rotary.parameters()) + tuple(rotary.buffers())
+            if any(tensor.is_meta for tensor in rotary_tensors):
+                rotary.to_empty(device=single_dev)
+            else:
+                rotary.to(single_dev)
+            layer_types = getattr(rotary, "layer_types", None)
+            if layer_types:
+                for layer_type in layer_types:
+                    rope_type = getattr(rotary, "rope_type", {}).get(layer_type, "default")
+                    if rope_type == "default":
+                        init_fn = type(rotary).compute_default_rope_parameters
+                    else:
+                        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+                        init_fn = ROPE_INIT_FUNCTIONS[rope_type]
+                    inv_freq, scaling = init_fn(
+                        rotary.config, device=single_dev, layer_type=layer_type
+                    )
+                    setattr(rotary, f"{layer_type}_inv_freq", inv_freq)
+                    setattr(rotary, f"{layer_type}_original_inv_freq", inv_freq.clone())
+                    setattr(rotary, f"{layer_type}_attention_scaling", scaling)
+                continue
+            inv_freq, attn_scaling = type(rotary).compute_default_rope_parameters(
+                rotary.config, device=single_dev)
             rotary.inv_freq = inv_freq
             if hasattr(rotary, 'attention_scaling'):
                 rotary.attention_scaling = attn_scaling
@@ -646,6 +667,12 @@ class ShardedBlockComparator:
 
             ref_hidden = ref_emb_out.to(ref_device)
             quant_hidden = quant_emb_out.to(quant_device)
+            if str(self._model_config.get("model_type", "")).lower() == "deepseek_v4":
+                hc_mult = int(self._model_config.get("hc_mult", 4))
+                ref_hidden = ref_hidden.unsqueeze(2).expand(
+                    -1, -1, hc_mult, -1).contiguous()
+                quant_hidden = quant_hidden.unsqueeze(2).expand(
+                    -1, -1, hc_mult, -1).contiguous()
             return ref_hidden, quant_hidden, False
         else:
             ref_hidden = ref_hidden_states.to(ref_device) if ref_hidden_states is not None else None
@@ -687,10 +714,12 @@ class ShardedBlockComparator:
         seqlen = ref_input.shape[1]
         p1 = l2_save_cache(self.ref_model_path, self._prompt_text,
                            seqlen, layer_idx, "ref", self.quant_method, ref_input,
-                           layer_state=ref_layer_state)
+                           layer_state=ref_layer_state,
+                           input_ids=getattr(self, "_input_ids", None))
         p2 = l2_save_cache(self.quant_model_path, self._prompt_text,
                            seqlen, layer_idx, "quant", self.quant_method, quant_input,
-                           layer_state=quant_layer_state)
+                           layer_state=quant_layer_state,
+                           input_ids=getattr(self, "_input_ids", None))
         del ref_input, quant_input
 
         if self.l1_target_layers is not None:
@@ -807,10 +836,13 @@ class ShardedBlockComparator:
         for model, device in [(ref_model, ref_device), (quant_model, quant_device)]:
             norm_mod = get_norm_module(model)
             head_mod = get_lm_head_module(model)
+            hc_head = self._get_hc_head(model)
             if norm_mod is not None:
                 norm_mod.to(device)
             if head_mod is not None:
                 head_mod.to(device)
+            if hc_head is not None:
+                hc_head.to(device)
         self._restore_tied_lm_head(
             ref_model, self._ref_weight_map, "ref", ref_device)
         self._restore_tied_lm_head(
@@ -820,6 +852,8 @@ class ShardedBlockComparator:
         quant_hidden = quant_hidden_states.to(quant_device)
 
         with torch.no_grad():
+            ref_hidden = self._collapse_hc_streams(ref_model, ref_hidden)
+            quant_hidden = self._collapse_hc_streams(quant_model, quant_hidden)
             # final_norm
             ref_norm_mod = get_norm_module(ref_model)
             quant_norm_mod = get_norm_module(quant_model)
@@ -863,10 +897,13 @@ class ShardedBlockComparator:
         for model in [ref_model, quant_model]:
             norm_mod = get_norm_module(model)
             head_mod = get_lm_head_module(model)
+            hc_head = self._get_hc_head(model)
             if norm_mod is not None:
                 norm_mod.to('cpu')
             if head_mod is not None:
                 head_mod.to('cpu')
+            if hc_head is not None:
+                hc_head.to('cpu')
 
         import gc
         gc.collect()
@@ -897,6 +934,23 @@ class ShardedBlockComparator:
             ref_topk_tokens=ref_topk_tokens,
             quant_topk_tokens=quant_topk_tokens,
         )
+
+    @staticmethod
+    def _get_hc_head(model):
+        """Return DeepSeek-V4's final hyper-connection collapse module."""
+        from .utils import get_model_components
+        return getattr(get_model_components(model).text_model, "hc_head", None)
+
+    @classmethod
+    def _collapse_hc_streams(cls, model, hidden_states):
+        if hidden_states.dim() != 4:
+            return hidden_states
+        hc_head = cls._get_hc_head(model)
+        if hc_head is None:
+            raise RuntimeError(
+                "4D hidden streams require DeepSeek-V4 model.hc_head before logits"
+            )
+        return hc_head(hidden_states.to(next(hc_head.parameters()).device))
 
     @staticmethod
     def _has_explicit_lm_head(model, head_mod, weight_map) -> bool:
@@ -1013,7 +1067,10 @@ class ShardedBlockComparator:
         from .utils import get_norm_module, get_lm_head_module
 
         for model in (ref_model, quant_model):
-            for module in (get_norm_module(model), get_lm_head_module(model)):
+            for module in (
+                get_norm_module(model), get_lm_head_module(model),
+                ShardedBlockComparator._get_hc_head(model),
+            ):
                 if module is None:
                     continue
                 tensors = tuple(module.parameters()) + tuple(module.buffers())
@@ -1043,10 +1100,13 @@ class ShardedBlockComparator:
         for model in [ref_model, quant_model]:
             norm_mod = get_norm_module(model)
             head_mod = get_lm_head_module(model)
+            hc_head = self._get_hc_head(model)
             if norm_mod is not None:
                 norm_mod.to('cpu')
             if head_mod is not None:
                 head_mod.to('cpu')
+            if hc_head is not None:
+                hc_head.to('cpu')
         self._restore_tied_lm_head(ref_model, self._ref_weight_map, "ref", 'cpu')
         self._restore_tied_lm_head(quant_model, self._quant_weight_map, "quant", 'cpu')
 
@@ -1056,10 +1116,13 @@ class ShardedBlockComparator:
         for model in [ref_model, quant_model]:
             norm_mod = get_norm_module(model)
             head_mod = get_lm_head_module(model)
+            hc_head = self._get_hc_head(model)
             if norm_mod is not None:
                 norm_mod.to_empty(device='meta')
             if head_mod is not None:
                 head_mod.to_empty(device='meta')
+            if hc_head is not None:
+                hc_head.to_empty(device='meta')
 
     def _compute_logits_topk_cpu(
         self,
@@ -1080,6 +1143,10 @@ class ShardedBlockComparator:
         quant_head_w = self._validated_lm_head_weight(quant_model, "quant")
 
         with torch.no_grad():
+            ref_hidden_states = self._collapse_hc_streams(
+                ref_model, ref_hidden_states.detach().cpu())
+            quant_hidden_states = self._collapse_hc_streams(
+                quant_model, quant_hidden_states.detach().cpu())
             ref_h = self._apply_real_final_norm(
                 ref_hidden_states, ref_norm_mod, self.dtype)
             quant_h = self._apply_real_final_norm(
@@ -1157,10 +1224,13 @@ class ShardedBlockComparator:
         for model in [ref_model, quant_model]:
             norm_mod = get_norm_module(model)
             head_mod = get_lm_head_module(model)
+            hc_head = self._get_hc_head(model)
             if norm_mod is not None:
                 norm_mod.to('cpu')
             if head_mod is not None:
                 head_mod.to('cpu')
+            if hc_head is not None:
+                hc_head.to('cpu')
         self._restore_tied_lm_head(ref_model, self._ref_weight_map, "ref", 'cpu')
         self._restore_tied_lm_head(quant_model, self._quant_weight_map, "quant", 'cpu')
 
@@ -1201,17 +1271,20 @@ class ShardedBlockComparator:
             N = n
         return ref_logits_np, quant_logits_np, N
 
-    @staticmethod
-    def _unload_norm_lm_head(ref_model, quant_model):
+    @classmethod
+    def _unload_norm_lm_head(cls, ref_model, quant_model):
         """卸载 norm+lm_head 回 meta, 释放 CPU 内存。"""
         from .utils import get_norm_module, get_lm_head_module
         for model in [ref_model, quant_model]:
             norm_mod = get_norm_module(model)
             head_mod = get_lm_head_module(model)
+            hc_head = cls._get_hc_head(model)
             if norm_mod is not None:
                 norm_mod.to_empty(device='meta')
             if head_mod is not None:
                 head_mod.to_empty(device='meta')
+            if hc_head is not None:
+                hc_head.to_empty(device='meta')
         import gc; gc.collect()
         from .utils import clear_device_cache
         clear_device_cache()
@@ -1243,6 +1316,10 @@ class ShardedBlockComparator:
         )
 
         try:
+            ref_hidden_states = self._collapse_hc_streams(
+                ref_model, ref_hidden_states.detach().cpu())
+            quant_hidden_states = self._collapse_hc_streams(
+                quant_model, quant_hidden_states.detach().cpu())
             ref_logits_np, quant_logits_np, N = self._compute_logits_np(
                 ref_hidden_states, quant_hidden_states,
                 ref_norm_mod, quant_norm_mod,
@@ -1693,7 +1770,8 @@ class ShardedBlockComparator:
                 layer, hidden_states, devices, chunk_size,
                 layer_idx=lidx, sf_reader=sf_rdr,
                 quant_desc_str=q_desc, is_quant=is_q, is_ct=is_ct,
-                apply_activation_quant=apply_activation_quant)
+                apply_activation_quant=apply_activation_quant,
+                input_ids=kwargs.get("input_ids"))
         return _chunked_mlp_forward
 
     def _patch_moe_forward_for_layer(self, ref_layer, quant_layer, layer_idx,
@@ -1959,6 +2037,7 @@ class ShardedBlockComparator:
         is_quant: bool = False,
         is_ct: bool = False,
         apply_activation_quant: bool = False,
+        input_ids: Optional[Tensor] = None,
     ) -> Tensor:
         """手动拆解 MoE forward，expert chunk 轮询分发到 devices。
 
@@ -1990,7 +2069,8 @@ class ShardedBlockComparator:
             out = mlp(hidden_states)
             return out[0] if isinstance(out, tuple) else out
 
-        router_logits, precomputed_scores, precomputed_indices = self._resolve_gate_output(gate, hidden_states)
+        router_logits, precomputed_scores, precomputed_indices = self._resolve_gate_output(
+            gate, hidden_states, input_ids=input_ids)
         num_experts_per_tok = self._resolve_num_experts_per_tok(mlp, gate)
 
         # ---- MoE router scoring ----
@@ -2243,7 +2323,7 @@ class ShardedBlockComparator:
         if (
             self.activation_quant
             and apply_activation_quant
-            and self.verbose
+            and getattr(self, "verbose", False)
             and not getattr(self, "_streaming_activation_logged", False)
         ):
             logger.info(
@@ -2389,15 +2469,31 @@ class ShardedBlockComparator:
             if linear_beta is not None:
                 up = float(linear_beta) * torch.tanh(up / float(linear_beta))
             return (gate * up).to(gate_out.dtype)
+        experts = getattr(mlp, "experts", None)
+        limit = getattr(experts, "limit", getattr(mlp, "limit", None))
+        if limit is not None:
+            gate_out = gate_out.clamp(max=float(limit))
+            up_out = up_out.clamp(min=-float(limit), max=float(limit))
+        act_fn = getattr(experts, "act_fn", None)
+        if callable(act_fn):
+            return act_fn(gate_out) * up_out
         return torch.nn.functional.silu(gate_out) * up_out
 
     # ---- MoE chunked forward 辅助方法 (Extract Method 降圈复杂度) ----
 
-    def _resolve_gate_output(self, gate, hidden_states):
+    def _resolve_gate_output(self, gate, hidden_states, input_ids=None):
         """解析 GLM/Qwen3.6/Kimi K3 router 的不同返回约定。"""
         precomputed_scores = None
         precomputed_indices = None
-        gate_out = gate(hidden_states)
+        if hasattr(gate, "tid2eid"):
+            if input_ids is None:
+                input_ids = getattr(self, "_input_ids", None)
+            if input_ids is None:
+                raise RuntimeError("DeepSeek-V4 hash router requires input_ids")
+            input_ids = input_ids.to(hidden_states.device)
+            gate_out = gate(hidden_states, input_ids)
+        else:
+            gate_out = gate(hidden_states)
         if isinstance(gate_out, tuple):
             # Kimi K3 returns (topk_indices, topk_weights), without logits.
             if (
@@ -2537,6 +2633,10 @@ class ShardedBlockComparator:
                                    num_experts_per_tok):
         """MoE router scoring 总入口: sigmoid 或 softmax(fallback)。"""
         routed_scaling_factor = getattr(mlp, 'routed_scaling_factor', None)
+        if precomputed_scores is not None and precomputed_indices is not None:
+            # Modern HF routers (including DeepSeek-V4 hash/top-k) already
+            # return normalized, scaled weights and the exact selected ids.
+            return precomputed_scores, precomputed_indices, routed_scaling_factor
         if router_logits is None:
             if precomputed_scores is None or precomputed_indices is None:
                 raise RuntimeError("Router returned no logits and no precomputed top-k")
@@ -2638,7 +2738,12 @@ class ShardedBlockComparator:
         gate_up_out = torch.nn.functional.linear(x_for_gate_up, gate_up_e)
         gate_out = gate_up_out[..., :intermediate_dim]
         up_out = gate_up_out[..., intermediate_dim:]
-        act_out = torch.nn.functional.silu(gate_out) * up_out
+        limit = getattr(experts_mod, "limit", None)
+        if limit is not None:
+            gate_out = gate_out.clamp(max=float(limit))
+            up_out = up_out.clamp(min=-float(limit), max=float(limit))
+        act_fn = getattr(experts_mod, "act_fn", torch.nn.functional.silu)
+        act_out = act_fn(gate_out) * up_out
         if self.activation_quant and apply_activation_quant:
             down_activation_type = _activation_quant_for_weight(
                 down_quant_type, self.activation_quant_type
@@ -2683,7 +2788,7 @@ class ShardedBlockComparator:
 
         index = {}
         layer_marker = ".layers."
-        candidate_attrs = ("block_sparse_moe", "mlp", "moe")
+        candidate_attrs = ("block_sparse_moe", "mlp", "moe", "ffn")
         for key in getattr(sf_reader, "weight_map", {}):
             if layer_marker not in key:
                 continue
@@ -2727,7 +2832,7 @@ class ShardedBlockComparator:
         # Infer the owning layer attribute from the checkpoint.  This supports
         # both Qwen/GLM ``mlp.experts`` and Kimi ``block_sparse_moe.experts``.
         if sf_reader is not None:
-            candidate_attrs = ('block_sparse_moe', 'mlp', 'moe')
+            candidate_attrs = ('block_sparse_moe', 'mlp', 'moe', 'ffn')
             prefix_index = self._expert_prefix_index(sf_reader)
             expert_prefix = next(
                 (prefix_index[(layer_idx, attr)] for attr in candidate_attrs
@@ -2899,8 +3004,21 @@ class ShardedBlockComparator:
         ref_rotary = get_rotary_emb_module(ref_model)
         quant_rotary = get_rotary_emb_module(quant_model)
         if ref_rotary is not None and quant_rotary is not None:
-            ref_pe = ref_rotary(ref_hidden, ref_position_ids)
-            quant_pe = quant_rotary(quant_hidden, quant_position_ids)
+            is_v4 = str(self._model_config.get("model_type", "")).lower() == "deepseek_v4"
+            if is_v4:
+                ref_base = ref_hidden[:, :, 0, :] if ref_hidden.dim() == 4 else ref_hidden
+                quant_base = quant_hidden[:, :, 0, :] if quant_hidden.dim() == 4 else quant_hidden
+                ref_pe = {
+                    "main": ref_rotary(ref_base, position_ids=ref_position_ids, layer_type="main"),
+                    "compress": ref_rotary(ref_base, position_ids=ref_position_ids, layer_type="compress"),
+                }
+                quant_pe = {
+                    "main": quant_rotary(quant_base, position_ids=quant_position_ids, layer_type="main"),
+                    "compress": quant_rotary(quant_base, position_ids=quant_position_ids, layer_type="compress"),
+                }
+            else:
+                ref_pe = ref_rotary(ref_hidden, ref_position_ids)
+                quant_pe = quant_rotary(quant_hidden, quant_position_ids)
         else:
             ref_pe = None
             quant_pe = None
@@ -3019,17 +3137,34 @@ class ShardedBlockComparator:
         quant_group = self._normalized_device_group(getattr(self, "quant_devices", ()))
         return bool(ref_group and quant_group and ref_group.isdisjoint(quant_group))
 
-    @staticmethod
     def _build_single_layer_forward_kwargs(
-        layer, hidden_states, position_ids, position_embeddings, previous_state
+        self, layer, hidden_states, position_ids, position_embeddings, previous_state
     ):
         kwargs = {"position_ids": position_ids}
         if position_embeddings is not None:
             kwargs["position_embeddings"] = position_embeddings
-        attention_mask = build_replay_attention_mask(layer, hidden_states)
+        is_v4 = "deepseekv4" in type(layer).__name__.lower()
+        attention_mask = None
+        if is_v4:
+            seq_len = hidden_states.shape[1]
+            threshold = int(os.getenv("ACC_DEEPSEEK_V4_BLOCKWISE_THRESHOLD", "8192"))
+            if seq_len <= threshold:
+                window = int(getattr(getattr(layer, "self_attn", None), "sliding_window", seq_len))
+                query = position_ids[:, :, None]
+                key = torch.arange(seq_len, device=hidden_states.device).view(1, 1, -1)
+                valid = (key <= query) & (key > query - window)
+                attention_mask = torch.zeros(
+                    hidden_states.shape[0], 1, seq_len, seq_len,
+                    device=hidden_states.device, dtype=hidden_states.dtype,
+                ).masked_fill(~valid[:, None], float("-inf"))
+            input_ids = getattr(self, "_input_ids", None)
+            if input_ids is not None:
+                kwargs["input_ids"] = input_ids.to(hidden_states.device)
+        else:
+            attention_mask = build_replay_attention_mask(layer, hidden_states)
         if attention_mask is not None:
             kwargs["attention_mask"] = attention_mask
-        kwargs.update(ShardedBlockComparator._build_cross_layer_state_kwargs(
+        kwargs.update(self._build_cross_layer_state_kwargs(
             layer, previous_state, hidden_states
         ))
         return kwargs
@@ -3253,6 +3388,7 @@ class ShardedBlockComparator:
             if cache_prompt is not None
             else f"{input_ids.shape[1]}_tokens"
         )
+        self._input_ids = input_ids.detach().cpu()
         if self.compare_mode == "grouped_dual":
             return self._compare_grouped_dual(input_ids, layers_per_shard=layers_per_shard, **kwargs)
         return self._compare_dual_sharded(input_ids, layers_per_shard=layers_per_shard, **kwargs)

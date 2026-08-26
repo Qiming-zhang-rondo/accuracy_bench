@@ -152,7 +152,8 @@ python3 run_accuracy_check.py --mode boundary \\
 
 ## 支持范围
 
-- **模型**: GLM-5.1 (MLA + DSA + MoE, QuaRot) / Qwen3 / Qwen3MoE / Qwen3VL / Qwen3.5 MoE / **Qwen3.6** / **Kimi K3** / **DeepSpec、Speculators DSpark standalone draft（专用 L1）**
+- **模型**: GLM-5.1/5.2 / **DeepSeek-V4** / Qwen3 / Qwen3MoE / Qwen3VL / Qwen3.5 MoE / **Qwen3.6** / **Kimi K3** / **DeepSpec、Speculators DSpark standalone draft（专用 L1）**
+  > DeepSeek-V4 使用 Transformers 官方实现（建议 `transformers>=5.12.0`）。L1 支持 4 路 mHC、HCA/CSA、hash/top-k MoE、packed experts 与最终 `hc_head`；L2 cache 会保存 hash routing 所需的 input ids；boundary 对 W4/W8 packed experts 使用紧凑权重常驻/流式反量化。超过 8192 token 时默认启用 memory-bounded indexer/attention，避免构造完整 query×compressed-KV 矩阵。可用 `ACC_DEEPSEEK_V4_BLOCKWISE_THRESHOLD`、`ACC_DEEPSEEK_V4_QUERY_BLOCK`、`ACC_DEEPSEEK_V4_KEY_BLOCK` 调整。
   > Kimi K3 已支持 text backbone 的 KDA/MLA、Stable LatentMoE、AttnRes、SiTU 和嵌套 MXFP4 配置。`--kimi_kda_backend auto` 在 Ascend 上会在加载 remote code 前安装纯 PyTorch import shim，并使用原生 PyTorch/NPU 短卷积、gated RMSNorm 和 KDA recurrence；该路径不要求安装 `fla-core`，也不会进入 CANN 8.5.1 无法编译的 FLA Triton 路径。确认环境内核兼容后可显式选 `chunk` 或 `fused_recurrent`。
   > Kimi K3 官方 896-expert `ModuleList` 必须用 `--compare_mode grouped_dual` 跑 L1。该模式在骨架构造阶段每层只保留一个无权重 expert 占位，仅流式读取 router 实际命中的专家；量化权重默认以压缩形态传到目标设备后再反量化。非当前 shard 的 attention/router/shared expert 保持 meta，不会先全量加载到 CPU/NPU 再卸载。若目标运行时缺少反量化所需算子，可临时设置 `ACC_STREAM_DEQUANT_DEVICE=cpu` 回退到 CPU 反量化。MoE 层 L2 暂不物化全部专家，会明确拒绝并提示使用流式 replay/内部 packed 模型。
   > Streaming expert 默认复用 NPU allocator 缓存，避免每个 expert chunk 强制 `empty_cache`；若特定 torch_npu/CANN 组合出现持续显存增长，可临时设置 `ACC_STREAM_EMPTY_CACHE=1` 恢复保守回收。运行日志会按 shard 输出 load / forward / cleanup 耗时，便于区分读盘、计算和回收瓶颈。
@@ -238,7 +239,7 @@ run_accuracy_check.py (7 modes: screening/boundary/l1/l2/full/report/inference)
 ## 不足 / 路标
 
 - **L0 完整性校验**: 未合入 (路标)
-- **Custom 模型** (DeepSeek V3.2/V4): 未合入 (路标)
+- **DeepSeek V3.2 专用 remote-code 路径**: 未合入；DeepSeek-V4 官方 Transformers 路径已支持
 - **多轮 generate N tokens 对齐**: 未支持 (路标)
 
 > 详见 `docs/roadmap.md` 和 `docs/capability_gap.md`

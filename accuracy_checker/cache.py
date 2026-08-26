@@ -39,7 +39,7 @@ def get_report_dir() -> str:
     return os.path.join(get_cache_dir(), "reports")
 
 
-CACHE_FORMAT_VERSION = "3"  # v3 stores the target layer input and optional layer state
+CACHE_FORMAT_VERSION = "4"  # v4 also stores token ids needed by hash-routed MoE replay
 INT4_UNPACK_VERSION = "2"  # bump when _decode_int4_packed changes
 
 
@@ -58,17 +58,18 @@ def _cache_key(model_path, prompt, seqlen, target_layer, side, quant_mode):
 
 
 def save_cache(model_path, prompt, seqlen, target_layer, side, quant_mode,
-               tensor, layer_state=None):
+               tensor, layer_state=None, input_ids=None):
     cache_dir = get_cache_dir()
     os.makedirs(cache_dir, exist_ok=True)
     key = _cache_key(model_path, prompt, seqlen, target_layer, side, quant_mode)
     path = os.path.join(cache_dir, key)
-    if layer_state is None:
+    if layer_state is None and input_ids is None:
         payload = tensor.cpu()
     else:
         payload = {
             "hidden_states": tensor.cpu(),
-            "layer_state": layer_state.cpu(),
+            "layer_state": layer_state.cpu() if layer_state is not None else None,
+            "input_ids": input_ids.cpu() if input_ids is not None else None,
         }
     torch.save(payload, path)
     return path
