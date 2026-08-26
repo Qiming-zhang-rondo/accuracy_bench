@@ -127,6 +127,11 @@ def parse_args():
                         help="量化模型加载方式 (dequantize=反量化到BF16比对, fake_quant=保留伪量化算子)")
     parser.add_argument("--layers_per_shard", type=int, default=8,
                         help="L1: 每个 shard 的层数")
+    parser.add_argument(
+        "--prefill_parallel", type=str, default="pp", choices=["pp", "tp"],
+        help=("GLM 长 prefill 并行方式: pp=保留按层分片（默认）, "
+              "tp=在每个 DSA indexer 的 key 维度跨 ref/quant 设备组并行"),
+    )
     parser.add_argument("--cache_top_k", type=int, default=0,
                         help="L1: 缓存 cos_sim 最低的 N 层到 L2 cache (0=不缓存)")
     parser.add_argument("--l1_target_layers", type=int, nargs="+", default=None,
@@ -452,7 +457,12 @@ def run_hf_l1(args, ref_device, target_device, dtype):
     from transformers import AutoTokenizer
     from accuracy_checker.glm_dsa_blockwise import install_glm_dsa_blockwise_indexer
     from accuracy_checker.deepseek_v4_blockwise import install_deepseek_v4_blockwise_runtime
-    install_glm_dsa_blockwise_indexer()
+    ref_tp_devices = _parse_dev_list(getattr(args, "ref_devices", None)) or [ref_device]
+    quant_tp_devices = _parse_dev_list(getattr(args, "quant_devices", None)) or [target_device]
+    install_glm_dsa_blockwise_indexer(
+        parallel_mode=getattr(args, "prefill_parallel", "pp"),
+        device_groups=[ref_tp_devices, quant_tp_devices],
+    )
     install_deepseek_v4_blockwise_runtime()
     from accuracy_checker import ShardedBlockComparator
 
@@ -677,6 +687,7 @@ def _mode_boundary(args):
         concurrency=args.concurrency,
         stop_on_first_badcase=args.stop_on_first_badcase,
         expert_chunk_size=args.expert_chunk_size,
+        prefill_parallel=getattr(args, "prefill_parallel", "pp"),
     )
     d = boundary_result_to_dict(result)
     logger.info("\n  定界结果: " + d["boundary_result"])

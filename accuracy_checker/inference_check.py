@@ -1762,6 +1762,7 @@ def hf_inference_check(
     conversations: Optional[List[List[Dict[str, Any]]]] = None,
     request_tools: Optional[List[Dict[str, Any]]] = None,
     expert_chunk_size: Optional[int] = None,
+    prefill_parallel: str = "pp",
 ) -> List[Dict[str, Any]]:
     """
     通用 HF 推理检查入口。
@@ -1790,6 +1791,18 @@ def hf_inference_check(
     if num_runs < 1 or concurrency < 1:
         raise ValueError("num_runs 和 concurrency 必须为正整数")
     device_list = parse_devices(devices)
+
+    # Install the GLM DSA long-prefill runtime before model construction.  In
+    # TP mode the same PP-sharded model keeps its layers on their owning cards,
+    # while each indexer splits the expensive key-axis score matmul over all
+    # cards in this device group.
+    from .glm_dsa_blockwise import install_glm_dsa_blockwise_indexer
+    install_glm_dsa_blockwise_indexer(
+        parallel_mode=prefill_parallel,
+        device_groups=[device_list],
+    )
+    if verbose and str(prefill_parallel).lower() == "tp":
+        logger.info("  GLM 长 prefill: TP indexer 已启用（PP 层分片保留）")
 
     _hf_log_header(model_path, device_list, dtype, use_cpu_dequant, verbose)
 

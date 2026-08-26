@@ -66,6 +66,10 @@ def main():
                         help="[boundary] 首批检测到 bad case 后提前停止")
     parser.add_argument("--expert_chunk_size", type=int, default=None,
                         help="[boundary] resident expert 临时反量化分块，默认 8")
+    parser.add_argument(
+        "--prefill_parallel", choices=["pp", "tp"], default="pp",
+        help="GLM 长 prefill: pp=按层分片（默认）, tp=DSA indexer key 维度跨卡",
+    )
     args = parser.parse_args()
 
     if args.boundary and args.mode == "inference":
@@ -88,6 +92,7 @@ def main():
         thinking=args.thinking,
         use_cpu_dequant=args.use_cpu_dequant,
         noquit=args.noquit,
+        prefill_parallel=args.prefill_parallel,
     )
 
 
