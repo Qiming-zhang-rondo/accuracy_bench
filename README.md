@@ -94,18 +94,37 @@ python3 run_accuracy_check.py --mode boundary \
   --devices npu:0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
   --prompt_file request.json --no_ref \
   --framework_name vllm-ascend --framework_bad_reproduced true \
-  --num_runs 100 --concurrency 10 --output_dir reports
+  --num_runs 100 --concurrency 10 --expert_chunk_size 8 --output_dir reports
 ```
 
 `--num_runs` 是总结果数，`--concurrency` 是每个纯 Transformers generate batch 的样本数；上例会生成 100 条结果（约 10 批），不是 1000 条。完整逐次输出写入 `boundary_runs.jsonl`，汇总写入 `boundary_result.json`。`--stop_on_first_badcase` 可在首批命中后停止后续批次。请求 JSON 的 `max_tokens` 会在未显式指定 `--max_new_tokens` 时自动采用；`model` 只记录为证据，实际 checkpoint 始终由 `--quant_model` 指定。
 
-不想创建请求文件时，可把同一个对象直接传给 `--request_json`（参数指南页面也提供直接粘贴文本框）：
+GLM-5.x 量化 MoE 的 boundary 路径会把 routed expert 以 W4/W8 压缩形态按 layer 常驻所属 NPU，并把同一 chunk 命中的 experts 合并反量化，不再逐 token 从 CPU 搬运 BF16 expert。decode 默认还为每层保留 16 个 BF16 热 expert，prefill 不写入该缓存。`--expert_chunk_size` 控制临时 BF16 峰值，默认 8；显存紧张可降到 4，显存充足可尝试 16。`ACC_BOUNDARY_EXPERT_CACHE_PER_LAYER=0/8/16/...` 可调整热缓存；设置 `ACC_BOUNDARY_RESIDENT_EXPERTS=0` 可回退到 CPU compact streaming 以排查运行时兼容问题。
+
+不想创建请求文件时，可把同一个对象直接传给 `--request_json`（参数指南页面也提供直接粘贴文本框）。如果 prompt 很长，不能把完整 JSON 放进 argv；使用 stdin 方式：
 
 ```bash
 python3 run_accuracy_check.py --mode boundary --quant_model <QUANT> \
   --devices npu:0,1 --no_ref --num_runs 10 --concurrency 2 \
   --request_json '{"model":"glm-52","max_tokens":4096,"messages":[{"role":"user","content":"完整问题"}]}'
 ```
+
+```bash
+cat <<'REQUEST_JSON' | python3 run_accuracy_check.py --mode boundary \\
+  --quant_model /path/to/quant --devices npu:0,1 --request_json_stdin
+{"model":"glm-52","max_tokens":4096,"messages":[{"role":"user","content":"超长完整问题"}]}
+REQUEST_JSON
+```
+
+如果对方给的是已经包含 `[gMASK]`、`<|sop>`、`<|assistant|><think>` 等标记的完整 Jinja/ChatML 字符串，建议原样保存为 `prompt.txt`，然后使用：
+
+```bash
+python3 run_accuracy_check.py --mode boundary \\
+  --quant_model /path/to/quant --devices npu:0,1,2,3 \\
+  --prompt_file /path/to/prompt.txt --max_new_tokens 4096 --no_ref
+```
+
+`.txt`/`.prompt` 会作为已渲染 prompt 直接送 tokenizer，不会再次套模型 chat template；JSON 文件仍按原有 messages 格式处理。
 
 结果含义：`WEIGHT_OR_QUANTIZATION` = Transformers 量化基线也复现、ref 正常或未运行；`INFERENCE_FRAMEWORK` = Transformers 正常、部署框架复现；`BOTH` = ref/量化/框架均复现；`INCONCLUSIVE` = 输出过短或证据不足；`INVALID_RUN` = 某次模型运行未完成。没有部署框架坏输出时，也可用 `--framework_bad_reproduced true` 记录外部已确认的复现事实；两者都没有时不能单独证明框架有问题。
 

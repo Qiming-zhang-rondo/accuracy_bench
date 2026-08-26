@@ -96,8 +96,16 @@ def preprocess_messages(messages: List[Dict]) -> List[Dict]:
 
 
 def load_prompt_file(path: str) -> Tuple[List[List[Dict]], Optional[List]]:
-    """加载 prompt 文件，支持 vLLM 请求格式和对话列表格式"""
-    with open(path) as f:
+    """加载 JSON 请求；.txt/.prompt 文件按已渲染的原始 prompt 原样读取。"""
+    if path.lower().endswith((".txt", ".text", ".prompt")):
+        with open(path, encoding="utf-8") as f:
+            raw_prompt = f.read()
+        if not raw_prompt.strip():
+            raise ValueError(f"原始 prompt 文件为空: {path}")
+        logger.info(f"  从 {path} 加载了 1 个原始 prompt (不再套 chat template)")
+        return [[{"role": "user", "content": raw_prompt, "_raw_prompt": True}]], None
+
+    with open(path, encoding="utf-8") as f:
         data = json.load(f)
 
     if isinstance(data, dict):
@@ -555,9 +563,11 @@ def _dequant_pass1_linears(model: nn.Module, quant_weights: Dict[str, torch.Tens
     if verbose:
         logger.info(f"  NPU 反量化: {total_linears} 个 Linear 层...")
 
-    for idx, (name, module) in enumerate(named_modules_list):
+    done = 0
+    for name, module in named_modules_list:
         if not isinstance(module, nn.Linear):
             continue
+        done += 1
 
         weight_key = f"{name}.weight"
         base_name = parse_base_name(weight_key)
@@ -566,18 +576,17 @@ def _dequant_pass1_linears(model: nn.Module, quant_weights: Dict[str, torch.Tens
         if quant_type in ("FLOAT", "C8"):
             skipped = _load_float_linear(name, module, quant_weights,
                                          weight_key, dtype, skipped)
-            continue
-
-        ok = _dequant_single_weight_on_device(name, module, quant_weights, quant_type, dtype)
-        if ok:
-            dequant_log[name] = quant_type
         else:
-            failed += 1
-            if verbose:
-                logger.warning(f"{name} ({quant_type}) NPU 反量化失败")
+            ok = _dequant_single_weight_on_device(
+                name, module, quant_weights, quant_type, dtype)
+            if ok:
+                dequant_log[name] = quant_type
+            else:
+                failed += 1
+                if verbose:
+                    logger.warning(f"{name} ({quant_type}) NPU 反量化失败")
 
         # 进度打印: 每 10 层或每个 completed 百分比
-        done = idx + 1
         if verbose and (done % 10 == 0 or done == total_linears):
             logger.info(f"    Linear 进度: {done}/{total_linears} "
                   f"(反量化 {len(dequant_log)}, FLOAT {skipped}, 失败 {failed})")
@@ -1134,70 +1143,6 @@ def _dequant_expert_weight_cpu(
     return None
 
 
-def _dequant_expert_weight(
-    quant_name: str,
-    quant_weights: Dict[str, torch.Tensor],
-    quant_desc: Dict[str, str],
-    dtype: torch.dtype,
-    target_device: str,
-) -> Optional[torch.Tensor]:
-    """反量化单个 expert 权重 (gate_proj / up_proj / down_proj)。
-
-    quant_name: 如 "model.layers.3.mlp.experts.0.gate_proj"
-    """
-    weight_key = f"{quant_name}.weight"
-    base_name = parse_base_name(weight_key)
-    quant_type = quant_desc.get(weight_key, quant_desc.get(base_name, "FLOAT"))
-
-    weight_data = quant_weights.get(weight_key)
-    if weight_data is None:
-        return None
-
-    # 优化: 在 CPU 上反量化, 只把 BF16 结果搬到 NPU (减少 NPU sync 次数)
-    # quant_weights 中的 tensor 都在 CPU (safetensors load_file 返回 CPU tensor)
-
-    if quant_type == "FLOAT":
-        return weight_data.to(dtype).to(target_device)
-
-    if quant_type in ("W8A8_DYNAMIC", "W8A8_MIX"):
-        ws = quant_weights.get(f"{quant_name}.weight_scale")
-        wo = quant_weights.get(f"{quant_name}.weight_offset")
-        if ws is not None:
-            w_fp = dequantize_weight_dynamic(weight_data, ws, wo, dtype)
-            return w_fp.to(target_device)
-        return None
-
-    if quant_type in ("W4A8_DYNAMIC", "W4A8", "W4A16"):
-        ws = quant_weights.get(f"{quant_name}.weight_scale")
-        wo = quant_weights.get(f"{quant_name}.weight_offset")
-        if weight_data.dtype == torch.int8 and ws is not None:
-            unpacked = unpack_int4_to_int8(weight_data)
-            w_fp = dequantize_weight_dynamic(unpacked, ws, wo, dtype)
-            return w_fp.to(target_device)
-        return None
-
-    if quant_type in _MX_QUANT_TYPES:
-        ws = quant_weights.get(f"{quant_name}.weight_scale")
-        if ws is not None:
-            w_fp = dequantize_weight_mx(weight_data, ws, quant_type, dtype=dtype)
-            return w_fp.to(target_device)
-        return None
-
-    # 静态量化 fallback
-    deq_scale = quant_weights.get(f"{quant_name}.deq_scale")
-    input_scale = quant_weights.get(f"{quant_name}.input_scale")
-    if deq_scale is not None:
-        w_fp, _ = dequantize_weight_static(
-            weight_data, deq_scale,
-            input_scale, dtype=dtype,
-        )
-        return w_fp.to(target_device)
-
-    return None
-
-
-
-
 DEFAULT_CONVERSATIONS = [
     [
         {"role": "user", "content": "你好，请介绍一下你自己。"},
@@ -1491,7 +1436,8 @@ def _hf_create_skeleton(model_path: str, torch_dtype: torch.dtype,
 
 def _hf_load_quant_weights(model: nn.Module, model_path: str, torch_dtype: torch.dtype,
                            device_list: List[str], use_cpu_dequant: bool,
-                           use_streaming: bool, verbose: bool):
+                           use_streaming: bool, verbose: bool,
+                           expert_chunk_size: Optional[int] = None):
     """[4/6] 量化分支: 加载量化权重 + 描述 + NPU 反量化 + 流式安装"""
     if verbose:
         logger.info("  [v2] NPU 加速反量化..." if not use_cpu_dequant
@@ -1532,10 +1478,11 @@ def _hf_load_quant_weights(model: nn.Module, model_path: str, torch_dtype: torch
     R = None  # 权重已预旋转, runtime 不再旋转
 
     if use_streaming:
-        _install_streaming_moe_forward(
-            model, quant_weights, quant_desc, torch_dtype, verbose=verbose, R=R
+        from .resident_experts import install_resident_streaming_moe
+        install_resident_streaming_moe(
+            model, quant_weights, quant_desc, torch_dtype,
+            chunk_size=expert_chunk_size or 8, verbose=verbose,
         )
-        # 不删除 quant_weights — 流式 forward 需要它
     else:
         del quant_weights
 
@@ -1579,7 +1526,8 @@ def _hf_load_nonquant_weights(model: nn.Module, model_path: str,
 
 def _hf_load_weights(model: nn.Module, model_path: str, torch_dtype: torch.dtype,
                      device_list: List[str], is_quant: bool, use_cpu_dequant: bool,
-                     use_streaming: bool, verbose: bool):
+                     use_streaming: bool, verbose: bool,
+                     expert_chunk_size: Optional[int] = None):
     """[4/6] 加载权重 + 反量化, 返回耗时"""
     if verbose:
         logger.info(f"\n[4/6] 加载权重 ({'量化' if is_quant else '非量化'})...")
@@ -1587,7 +1535,8 @@ def _hf_load_weights(model: nn.Module, model_path: str, torch_dtype: torch.dtype
     t0 = time.time()
     if is_quant:
         _hf_load_quant_weights(model, model_path, torch_dtype, device_list,
-                               use_cpu_dequant, use_streaming, verbose)
+                               use_cpu_dequant, use_streaming, verbose,
+                               expert_chunk_size=expert_chunk_size)
     else:
         _hf_load_nonquant_weights(model, model_path, torch_dtype, verbose)
 
@@ -1619,11 +1568,15 @@ def _hf_verify_model_loaded(model: nn.Module, verbose: bool):
 
 def _hf_generate_conversation_batch(model, tokenizer, messages, request_tools, thinking,
                                     max_new_tokens, first_device, conv_idx, batch_size, run_offset):
-    processed = preprocess_messages(messages)
-    template_kwargs = dict(conversation=processed, tokenize=False,
-                           add_generation_prompt=True, enable_thinking=(thinking == "chat"))
-    if request_tools: template_kwargs["tools"] = request_tools
-    text = tokenizer.apply_chat_template(**template_kwargs)
+    raw_prompt = (len(messages) == 1 and messages[0].get("_raw_prompt") is True)
+    if raw_prompt:
+        text = messages[0]["content"]
+    else:
+        processed = preprocess_messages(messages)
+        template_kwargs = dict(conversation=processed, tokenize=False,
+                               add_generation_prompt=True, enable_thinking=(thinking == "chat"))
+        if request_tools: template_kwargs["tools"] = request_tools
+        text = tokenizer.apply_chat_template(**template_kwargs)
     inputs = tokenizer(text, return_tensors="pt")
     input_ids = inputs["input_ids"].to(first_device)
     batched_ids = input_ids.repeat(batch_size, 1)
@@ -1639,9 +1592,13 @@ def _hf_generate_conversation_batch(model, tokenizer, messages, request_tools, t
 
     with torch.no_grad():
         t0 = time.time()
+        from transformers import LogitsProcessorList
+        from .generation_progress import GenerationProgressProcessor
+        progress = GenerationProgressProcessor(input_ids.shape[1], logger=logger)
         output = model.generate(batched_ids, attention_mask=attention_mask,
                                 max_new_tokens=max_new_tokens, do_sample=False,
-                                use_cache=True, return_dict_in_generate=True)
+                                use_cache=True, return_dict_in_generate=True,
+                                logits_processor=LogitsProcessorList([progress]))
         gen_time = time.time() - t0
 
     results = []
@@ -1751,6 +1708,7 @@ def hf_inference_check(
     stop_predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
     conversations: Optional[List[List[Dict[str, Any]]]] = None,
     request_tools: Optional[List[Dict[str, Any]]] = None,
+    expert_chunk_size: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """
     通用 HF 推理检查入口。
@@ -1796,7 +1754,8 @@ def hf_inference_check(
 
     # ---- Step 4: 加载权重 + 反量化 ----
     _hf_load_weights(model, model_path, torch_dtype, device_list,
-                     is_quant, use_cpu_dequant, use_streaming, verbose)
+                     is_quant, use_cpu_dequant, use_streaming, verbose,
+                     expert_chunk_size=expert_chunk_size)
 
     # ---- Step 5: 验证 ----
     _hf_verify_model_loaded(model, verbose)

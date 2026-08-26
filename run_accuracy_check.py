@@ -98,6 +98,8 @@ def parse_args():
                         help="[boundary] 完整 OpenAI/vLLM 请求 JSON 或对话列表文件")
     parser.add_argument("--request_json", type=str, default=None,
                         help="[boundary] 直接粘贴完整 OpenAI/vLLM 请求 JSON")
+    parser.add_argument("--request_json_stdin", action="store_true",
+                        help="[boundary] 从 stdin 读取完整请求 JSON，适合超长 prompt")
     parser.add_argument("--target_layers", type=str, default=None,
                         help="L2 只检查指定层 (逗号或空格分隔, 如 '8,9' 或 '8 9')")
     parser.add_argument("--target-layers", dest="target_layers_alt", type=str, default=None,
@@ -164,8 +166,8 @@ def parse_args():
                         help="L1: ref 多卡设备 (如 'npu:0,npu:1')")
     parser.add_argument("--quant_devices", type=str, default=None,
                         help="L1: quant 多卡设备 (如 'npu:2,npu:3')")
-    parser.add_argument("--expert_chunk_size", type=int, default=None,
-                        help="L1: MoE expert chunk size (grouped_dual 模式)")
+    parser.add_argument("--expert_chunk_size", type=parse_positive_int, default=None,
+                        help="L1 grouped_dual / boundary: expert 分块大小 (boundary 默认 8)")
     parser.add_argument(
         "--kimi_kda_backend",
         type=str,
@@ -631,7 +633,10 @@ def _mode_boundary(args):
     logger.info(f"  量化模型: {quant}")
     logger.info(f"  设备: {devices}")
     try:
-        request_payload = parse_request_json(args.request_json) if args.request_json else None
+        request_raw = args.request_json
+        if args.request_json_stdin:
+            request_raw = sys.stdin.read()
+        request_payload = parse_request_json(request_raw) if request_raw else None
     except ValueError as exc:
         logger.error(f"  Boundary 请求 JSON 无效: {exc}")
         return None
@@ -665,6 +670,7 @@ def _mode_boundary(args):
         num_runs=args.num_runs,
         concurrency=args.concurrency,
         stop_on_first_badcase=args.stop_on_first_badcase,
+        expert_chunk_size=args.expert_chunk_size,
     )
     d = boundary_result_to_dict(result)
     logger.info("\n  定界结果: " + d["boundary_result"])

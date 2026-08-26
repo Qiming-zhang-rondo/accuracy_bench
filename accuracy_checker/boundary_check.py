@@ -247,6 +247,7 @@ def _run_transformers_on_path(
     concurrency: int = 1,
     stop_on_first_badcase: bool = False,
     bad_pattern: Optional[Dict[str, Any]] = None,
+    expert_chunk_size: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """在给定 model_path 上跑原生 Transformers generate, 复用 hf_inference_check 加载链。
 
@@ -291,6 +292,7 @@ def _run_transformers_on_path(
             num_runs=num_runs,
             concurrency=concurrency,
             stop_predicate=_is_bad if stop_on_first_badcase else None,
+            expert_chunk_size=expert_chunk_size,
         )
     finally:
         try:
@@ -451,6 +453,7 @@ def run_boundary(
     num_runs: int = 1,
     concurrency: int = 1,
     stop_on_first_badcase: bool = False,
+    expert_chunk_size: Optional[int] = None,
 ) -> BoundaryResult:
     """定界主入口 — 区分 WEIGHT / INFERENCE_FRAMEWORK / BOTH / INCONCLUSIVE / INVALID_RUN。
 
@@ -520,6 +523,10 @@ def run_boundary(
         "num_runs": num_runs,
         "concurrency": concurrency,
         "stop_on_first_badcase": stop_on_first_badcase,
+        "expert_chunk_size": expert_chunk_size or 8,
+        "resident_experts": os.getenv("ACC_BOUNDARY_RESIDENT_EXPERTS", "1") != "0",
+        "expert_cache_per_layer": int(
+            os.getenv("ACC_BOUNDARY_EXPERT_CACHE_PER_LAYER", "16")),
         "generation_config": {
             "do_sample": False,  # hf_inference_check 当前固定 greedy
             "use_cache": True,
@@ -548,7 +555,7 @@ def run_boundary(
         run_quant, quant_model_path, devices, dtype, messages, thinking,
         max_new_tokens, framework_gen_config, verbose, bad_pattern,
         evidence, limitations, framework_name, framework_bad_reproduced, fw_reproduced,
-        num_runs, concurrency, stop_on_first_badcase)
+        num_runs, concurrency, stop_on_first_badcase, expert_chunk_size)
     if invalid_result is not None:
         return invalid_result
 
@@ -556,7 +563,7 @@ def run_boundary(
     ref_reproduced = _boundary_run_ref(
         run_ref, ref_model_path, devices, dtype, messages, thinking,
         max_new_tokens, framework_gen_config, verbose, bad_pattern, evidence, limitations,
-        num_runs, concurrency, stop_on_first_badcase)
+        num_runs, concurrency, stop_on_first_badcase, expert_chunk_size)
 
     # ---- 分类 ----
     result_kind = classify_boundary(fw_reproduced, tq_reproduced, ref_reproduced)
@@ -668,7 +675,8 @@ def _boundary_run_quant(run_quant: bool, quant_model_path: str, devices: str,
                        framework_bad_reproduced: Optional[bool],
                        fw_reproduced: Optional[bool], num_runs: int,
                        concurrency: int,
-                       stop_on_first_badcase: bool) -> Tuple[Optional[BoundaryResult], Optional[bool]]:
+                       stop_on_first_badcase: bool,
+                       expert_chunk_size: Optional[int]) -> Tuple[Optional[BoundaryResult], Optional[bool]]:
     """transformers(quant) 路径运行; 成功时返回 (None, tq_reproduced),
     失败时返回 (_invalid 结果, None)"""
     if not run_quant:
@@ -678,7 +686,8 @@ def _boundary_run_quant(run_quant: bool, quant_model_path: str, devices: str,
             quant_model_path, devices, dtype, messages, thinking,
             max_new_tokens, framework_gen_config, verbose, label="quant",
             num_runs=num_runs, concurrency=concurrency,
-            stop_on_first_badcase=stop_on_first_badcase, bad_pattern=bad_pattern)
+            stop_on_first_badcase=stop_on_first_badcase, bad_pattern=bad_pattern,
+            expert_chunk_size=expert_chunk_size)
         tq_reproduced, summary = _summarize_transformers_runs(
             qt_outputs, num_runs, concurrency, bad_pattern)
         evidence["transformers_run"]["quant"] = summary
@@ -696,7 +705,8 @@ def _boundary_run_ref(run_ref: bool, ref_model_path: Optional[str],
                      framework_gen_config: Optional[Dict], verbose: bool,
                      bad_pattern: Optional[Dict], evidence: Dict[str, Any],
                      limitations: List[str], num_runs: int, concurrency: int,
-                     stop_on_first_badcase: bool) -> Optional[bool]:
+                     stop_on_first_badcase: bool,
+                     expert_chunk_size: Optional[int]) -> Optional[bool]:
     """transformers(ref) 路径运行 (可选); 失败时记录到 limitations 不中止"""
     if not (run_ref and ref_model_path):
         return None
@@ -705,7 +715,8 @@ def _boundary_run_ref(run_ref: bool, ref_model_path: Optional[str],
             ref_model_path, devices, dtype, messages, thinking,
             max_new_tokens, framework_gen_config, verbose, label="ref",
             num_runs=num_runs, concurrency=concurrency,
-            stop_on_first_badcase=stop_on_first_badcase, bad_pattern=bad_pattern)
+            stop_on_first_badcase=stop_on_first_badcase, bad_pattern=bad_pattern,
+            expert_chunk_size=expert_chunk_size)
         ref_reproduced, summary = _summarize_transformers_runs(
             ref_outputs, num_runs, concurrency, bad_pattern)
         evidence["transformers_run"]["ref"] = summary
@@ -790,6 +801,7 @@ def run_boundary_cli(args):
         num_runs=args.num_runs,
         concurrency=args.concurrency,
         stop_on_first_badcase=args.stop_on_first_badcase,
+        expert_chunk_size=getattr(args, "expert_chunk_size", None),
     )
 
     out = boundary_result_to_dict(result)

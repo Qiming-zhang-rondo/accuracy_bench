@@ -132,8 +132,9 @@ class TestCliGuide(unittest.TestCase):
 
     def test_boundary_builder_supports_quant_only_batched_runs(self):
         for marker in (
-            'line("--prompt_file"', 'line("--request_json"', 'line("--num_runs"',
+            'line("--prompt_file"', 'line("--request_json_stdin"', 'line("--num_runs"',
             'line("--concurrency"', 'line("--no_ref")',
+            'line("--expert_chunk_size"',
             'line("--framework_bad_reproduced"',
             'line("--stop_on_first_badcase")',
             '"boundary_runs.jsonl"',

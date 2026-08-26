@@ -32,6 +32,8 @@ def main():
                         help="JSON 文件，vLLM 请求格式或对话列表")
     parser.add_argument("--request_json", default=None,
                         help="直接粘贴完整 OpenAI/vLLM 请求 JSON")
+    parser.add_argument("--request_json_stdin", action="store_true",
+                        help="从 stdin 读取完整请求 JSON，适合超长 prompt")
     parser.add_argument("--use_cpu_dequant", action="store_true",
                         help="回退到旧 CPU 全量反量化流程")
     parser.add_argument("--noquit", action="store_true",
@@ -62,12 +64,17 @@ def main():
                         help="[boundary] 每个 Transformers generate batch 的并发样本数")
     parser.add_argument("--stop_on_first_badcase", action="store_true",
                         help="[boundary] 首批检测到 bad case 后提前停止")
+    parser.add_argument("--expert_chunk_size", type=int, default=None,
+                        help="[boundary] resident expert 临时反量化分块，默认 8")
     args = parser.parse_args()
 
     if args.boundary and args.mode == "inference":
         args.mode = "boundary"
 
     if args.mode == "boundary":
+        if args.request_json_stdin:
+            import sys
+            args.request_json = sys.stdin.read()
         _run_boundary_cli(args)
         return
 
