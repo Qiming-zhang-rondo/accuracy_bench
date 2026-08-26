@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import statistics as stat
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -88,7 +89,13 @@ class BlockCompareResult:
         cs = self.metrics.get("cos_sim", 0)
         snr_val = self.metrics.get("snr", 0)
         re = self.metrics.get("relative_error", 0)
-        return f"[{status}] {self.layer_name}: cos_sim={cs:.10f}, snr={snr_val:.2f}dB, rel_err={re:.8f}"
+        def fmt(v, digits):
+            try:
+                return f"{v:.{digits}f}" if math.isfinite(float(v)) else "nan"
+            except (TypeError, ValueError):
+                return "nan"
+        return (f"[{status}] {self.layer_name}: cos_sim={fmt(cs, 10)}, "
+                f"snr={fmt(snr_val, 2)}dB, rel_err={fmt(re, 8)}")
 
 
 @dataclass
@@ -290,7 +297,7 @@ class BlockCompareReport:
             return None
         metrics = first.metrics or {}
         cos = metrics.get("cos_sim")
-        rel_err = metrics.get("rel_err")
+        rel_err = metrics.get("relative_error", metrics.get("rel_err"))
         if cos is not None and rel_err is not None and cos < 0.5 and rel_err > 2.0:
             return first
         return None

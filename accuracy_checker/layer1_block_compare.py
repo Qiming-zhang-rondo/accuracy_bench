@@ -427,6 +427,7 @@ class ShardedBlockComparator:
         # Preserve the concrete reason when full-logits capture is unavailable
         # so a missing HTML panel is diagnosable instead of silent.
         self._last_logits_error = None
+        self._first_nonfinite_layer = None
         self._activation_hooks = []  # track registered hooks for cleanup
 
         # Load rotation matrix (optional, for rotated quant models like GLM5.1 QuaRot)
@@ -1454,6 +1455,7 @@ class ShardedBlockComparator:
         **forward_kwargs,
     ) -> 'BlockCompareReport':
         """双设备分片：ref在ref_device，quant在quant_device"""
+        self._first_nonfinite_layer = None
         if self.verbose:
             logger.info(f"[Sharded L1] 开始双设备分片...")
             logger.info(f"[Sharded L1] ref_device: {self.ref_device}, quant_device: {self.quant_device}")
@@ -1641,6 +1643,7 @@ class ShardedBlockComparator:
         非 MoE 层正常 forward (和 _compare_dual_sharded 一样)，
         MoE 层路由到 _moe_forward_chunked 做 expert chunk 跨卡计算。
         """
+        self._first_nonfinite_layer = None
         # grouped_dual needs an expert range per device.  Use the checkpoint's
         # real expert count (Kimi has 896, not the historical default 256).
         if self.expert_chunk_size is None:
@@ -3388,19 +3391,32 @@ class ShardedBlockComparator:
             logger.debug(f"    ref_layer.{layer_idx} first param device: {next(ref_layers[layer_idx].parameters()).device}")
             logger.debug(f"    quant_layer.{layer_idx} first param device: {next(quant_layers[layer_idx].parameters()).device}")
 
-    @staticmethod
-    def _log_dual_post_forward_nan(layer_idx, ref_hidden, quant_hidden):
-        """forward 后 NaN 检查日志。"""
-        if not logger.isEnabledFor(logging.DEBUG):
+    def _log_dual_post_forward_nan(self, layer_idx, ref_hidden, quant_hidden):
+        """Forward 后检查 NaN/Inf，并明确报告首个污染层。"""
+        ref_bad = ~torch.isfinite(ref_hidden)
+        quant_bad = ~torch.isfinite(quant_hidden)
+        ref_count = int(ref_bad.sum().item())
+        quant_count = int(quant_bad.sum().item())
+        if ref_count == 0 and quant_count == 0:
             return
-        ref_has_nan = torch.isnan(ref_hidden).any()
-        quant_has_nan = torch.isnan(quant_hidden).any()
-        if ref_has_nan or quant_has_nan:
-            logger.debug(f"layer.{layer_idx}: ref_has_nan={ref_has_nan}, quant_has_nan={quant_has_nan}")
-            if ref_has_nan:
-                logger.info(f"    ref NaN count: {torch.isnan(ref_hidden).sum()}, max: {ref_hidden.abs().max()}")
-            if quant_has_nan:
-                logger.info(f"    quant NaN count: {torch.isnan(quant_hidden).sum()}, max: {quant_hidden.abs().max()}")
+        first = getattr(self, "_first_nonfinite_layer", None)
+        if first is None:
+            self._first_nonfinite_layer = layer_idx
+            logger.warning(
+                "[L1 nonfinite] first contaminated block: layer.%d "
+                "(ref=%d, quant=%d non-finite values)",
+                layer_idx, ref_count, quant_count,
+            )
+        elif logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[L1 nonfinite] layer.%d (ref=%d, quant=%d)",
+                layer_idx, ref_count, quant_count,
+            )
+        if logger.isEnabledFor(logging.DEBUG):
+            if ref_count:
+                logger.info("    ref NaN=%d, Inf=%d", int(torch.isnan(ref_hidden).sum()), int(torch.isinf(ref_hidden).sum()))
+            if quant_count:
+                logger.info("    quant NaN=%d, Inf=%d", int(torch.isnan(quant_hidden).sum()), int(torch.isinf(quant_hidden).sum()))
 
     def _forward_dual_layers(self, ref_hidden, quant_hidden, ref_model, quant_model,
                                layer_start, layer_end, ref_pos_ids, quant_pos_ids,

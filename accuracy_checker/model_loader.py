@@ -352,6 +352,30 @@ _DEEPSEEK_FP4_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
                          0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
 
 
+def _decode_deepseek_v4_e8m0_scale(scale: Tensor, device=None) -> Tensor:
+    """Decode a V4 UE8M0 scale to float32.
+
+    ModelScope safetensors may expose ``F8_E8M0`` as a native float8 dtype,
+    while older torch/safetensors/NPU combinations expose the same bytes as
+    uint8. The latter are exponent bytes, not numeric multipliers: byte ``b``
+    means ``2 ** (b - 127)``.
+    """
+    if device is None:
+        device = scale.device
+    dtype_name = str(scale.dtype).lower()
+    if "e8m0" in dtype_name:
+        try:
+            return scale.to(device=device, dtype=torch.float32)
+        except (RuntimeError, TypeError):
+            raw = scale.view(torch.uint8)
+    elif not scale.dtype.is_floating_point:
+        raw = scale.to(device=device, dtype=torch.int32)
+    else:
+        return scale.to(device=device, dtype=torch.float32)
+    raw = raw.to(device=device, dtype=torch.float32)
+    return torch.pow(2.0, raw - 127.0)
+
+
 def dequantize_deepseek_v4_fp4(
     packed_weight: Tensor,
     scale: Tensor,
@@ -391,7 +415,7 @@ def dequantize_deepseek_v4_fp4(
     low = values[(packed & 0x0F).long()]
     high = values[((packed >> 4) & 0x0F).long()]
     unpacked = torch.stack((low, high), dim=-1).flatten(1)
-    expanded_scale = scale.to(device=packed.device, dtype=torch.float32)
+    expanded_scale = _decode_deepseek_v4_e8m0_scale(scale, device=packed.device)
     expanded_scale = expanded_scale.repeat_interleave(group_size, dim=1)
     return (unpacked * expanded_scale).to(dtype)
 
@@ -413,7 +437,7 @@ def dequantize_deepseek_v4_fp8(
             "DeepSeek-V4 FP8 scale shape is incompatible with weight: "
             f"weight={tuple(weight.shape)}, scale={tuple(scale.shape)}"
         )
-    expanded_scale = scale.to(device=weight.device, dtype=torch.float32)
+    expanded_scale = _decode_deepseek_v4_e8m0_scale(scale, device=weight.device)
     expanded_scale = expanded_scale.repeat_interleave(
         out_features // scale.shape[0], dim=0
     ).repeat_interleave(in_features // scale.shape[1], dim=1)

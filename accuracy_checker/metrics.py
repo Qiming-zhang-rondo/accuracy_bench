@@ -8,6 +8,7 @@ import torch
 from torch import Tensor
 from typing import Dict
 import logging
+import math
 from .utils import flatten_for_compare
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,8 @@ def cos_sim(a: Tensor, b: Tensor, use_cpu: bool = True) -> float:
         if norm_a == 0 or norm_b == 0:
             return 0.0
         cos = (a @ b / (norm_a * norm_b)).item()
+        if not math.isfinite(cos):
+            return float("nan")
         return max(-1.0, min(1.0, cos))
 
     # 大向量: float64 分块累积
@@ -54,6 +57,9 @@ def cos_sim(a: Tensor, b: Tensor, use_cpu: bool = True) -> float:
         return 0.0
 
     cos = (dot / (norm_x * norm_y)).item()
+
+    if not math.isfinite(cos):
+        return float("nan")
 
     # 健全性检查: cos_sim 必须在 [-1, 1] 范围内
     # 允许微小数值误差 (float64 精度内)
