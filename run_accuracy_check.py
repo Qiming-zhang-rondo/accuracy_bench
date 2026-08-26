@@ -448,6 +448,8 @@ def run_hf_l1(args, ref_device, target_device, dtype):
         )
 
     from transformers import AutoTokenizer
+    from accuracy_checker.glm_dsa_blockwise import install_glm_dsa_blockwise_indexer
+    install_glm_dsa_blockwise_indexer()
     from accuracy_checker import ShardedBlockComparator
 
     logger.info("\n" + "=" * 70)
