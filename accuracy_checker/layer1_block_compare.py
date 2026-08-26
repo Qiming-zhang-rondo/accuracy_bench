@@ -1071,7 +1071,18 @@ class ShardedBlockComparator:
                 return True
         # Common top-level CausalLM layout; keep this exact so
         # ``verifier_lm_head.weight`` is not treated as the target head.
-        return "lm_head.weight" in {str(key) for key in weight_map}
+        keys = {str(key) for key in weight_map}
+        if "lm_head.weight" in keys:
+            return True
+        # DeepSeek-V4 ModelScope exports call the CausalLM output projection
+        # ``head.weight`` (the runtime module is still ``lm_head``).  Treat it
+        # as explicit so we do not silently replace the trained head with the
+        # embedding table during the logits pass.
+        return (
+            "head.weight" in keys
+            and str(getattr(getattr(model, "config", None), "model_type", "")).lower()
+            == "deepseek_v4"
+        )
 
     def _restore_tied_lm_head(self, model, weight_map, label: str, device) -> bool:
         """Restore an omitted lm_head from this model's embedding table.
