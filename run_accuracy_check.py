@@ -485,7 +485,10 @@ def run_hf_l1(args, ref_device, target_device, dtype):
             "  GLM DSA blockwise indexer 未安装；长 prompt 将使用 Transformers "
             "eager indexer，可能产生超大 score tensor"
         )
-    install_deepseek_v4_blockwise_runtime()
+    install_deepseek_v4_blockwise_runtime(
+        parallel_mode=getattr(args, "prefill_parallel", "pp"),
+        device_groups=[ref_tp_devices, quant_tp_devices],
+    )
     from accuracy_checker import ShardedBlockComparator
 
     logger.info("\n" + "=" * 70)

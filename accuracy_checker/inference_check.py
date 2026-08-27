@@ -1440,8 +1440,6 @@ def _hf_create_skeleton(model_path: str, torch_dtype: torch.dtype,
     """[2/6] 创建模型骨架，处理 streaming expert placeholders"""
     if verbose:
         logger.info("\n[2/6] 创建模型骨架...")
-    from .deepseek_v4_blockwise import install_deepseek_v4_blockwise_runtime
-    install_deepseek_v4_blockwise_runtime()
     model = create_model_skeleton(model_path, dtype=torch_dtype, verbose=verbose)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -1795,9 +1793,8 @@ def hf_inference_check(
     device_list = parse_devices(devices)
 
     # Install the GLM DSA long-prefill runtime before model construction.  In
-    # TP mode the same PP-sharded model keeps its layers on their owning cards,
-    # while each indexer splits the expensive key-axis score matmul over all
-    # cards in this device group.
+    # TP mode keeps the PP-sharded model layers on their owning cards while
+    # dispatching bounded query blocks across the configured device group.
     from .glm_dsa_blockwise import install_glm_dsa_blockwise_indexer
     glm_blockwise_ok = install_glm_dsa_blockwise_indexer(
         parallel_mode=prefill_parallel,
@@ -1812,6 +1809,14 @@ def hf_inference_check(
         )
     if verbose and str(prefill_parallel).lower() == "tp":
         logger.info("  GLM 长 prefill: TP indexer 已启用（PP 层分片保留）")
+
+    from .deepseek_v4_blockwise import install_deepseek_v4_blockwise_runtime
+    install_deepseek_v4_blockwise_runtime(
+        parallel_mode=prefill_parallel,
+        device_groups=[device_list],
+    )
+    if verbose and str(prefill_parallel).lower() == "tp":
+        logger.info("  DeepSeek-V4 长 prefill: TP query-parallel 已启用（PP 层分片保留）")
 
     _hf_log_header(model_path, device_list, dtype, use_cpu_dequant, verbose)
 

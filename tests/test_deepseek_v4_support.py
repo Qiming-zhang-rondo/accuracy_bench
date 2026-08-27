@@ -449,6 +449,56 @@ def test_glm_query_block_assignment_preserves_block_boundaries_and_balance():
             assert (9216, 10000) in blocks
 
 
+def test_v4_query_block_assignment_preserves_block_boundaries_and_balance():
+    from accuracy_checker.deepseek_v4_blockwise import _query_block_assignments
+
+    assignments = _query_block_assignments(65536, 1024, 8)
+    blocks = [block for device_blocks in assignments for block in device_blocks]
+    assert len(blocks) == 64
+    assert all(end - start <= 1024 for start, end in blocks)
+    assert sorted(blocks) == [
+        (start, min(65536, start + 1024))
+        for start in range(0, 65536, 1024)
+    ]
+    assert {len(device_blocks) for device_blocks in assignments} == {8}
+
+    tail = _query_block_assignments(10000, 1024, 8)
+    tail_blocks = [block for device_blocks in tail for block in device_blocks]
+    assert len(tail_blocks) == 10
+    assert (9216, 10000) in tail_blocks
+
+
+def test_v4_query_parallel_indexer_blockwise_topk_is_exact_on_cpu():
+    from accuracy_checker.deepseek_v4_blockwise import (
+        _compute_indexer_query_block_topk,
+    )
+
+    torch.manual_seed(31)
+    batch, query_len, heads, dim, compressed_len = 2, 7, 3, 5, 11
+    q = torch.randn(batch, query_len, heads, dim, dtype=torch.bfloat16)
+    k = torch.randn(batch, compressed_len, dim, dtype=torch.bfloat16)
+    weights = torch.randn(batch, query_len, heads, dtype=torch.bfloat16)
+    positions = torch.tensor([[0, 1, 3, 5, 7, 9, 10], [0, 2, 4, 6, 8, 9, 10]])
+    compress_rate = 2
+    causal = (positions + 1) // compress_rate
+    scale = 0.37
+    topk = 6  # larger than one key block, forcing running-top-k merge
+    actual = _compute_indexer_query_block_topk(
+        q, k, weights, causal, key_block=4, top_k=topk, scale=scale,
+    )
+    scores = torch.matmul(q.float(), k.float().transpose(-1, -2).unsqueeze(1))
+    scores = torch.relu(scores) * scale
+    scores = torch.matmul(weights.float().unsqueeze(-2), scores).squeeze(-2)
+    key_ids = torch.arange(compressed_len)
+    scores = scores.masked_fill(key_ids.view(1, 1, -1) >= causal.unsqueeze(-1), float("-inf"))
+    expected = torch.topk(scores, topk, dim=-1, sorted=True).indices.to(torch.int32)
+    expected = torch.where(
+        expected < causal.unsqueeze(-1), expected,
+        torch.full_like(expected, -1),
+    )
+    torch.testing.assert_close(actual, expected)
+
+
 def test_glm_sparse_attention_online_softmax_matches_dense_selected_reference():
     from accuracy_checker.glm_dsa_blockwise import (
         _compute_sparse_attention_query_block,
