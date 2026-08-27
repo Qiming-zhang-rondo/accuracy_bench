@@ -131,8 +131,8 @@ def parse_args():
                         help="L1: 每个 shard 的层数")
     parser.add_argument(
         "--prefill_parallel", type=str, default="pp", choices=["pp", "tp"],
-        help=("GLM 长 prefill 并行方式: pp=保留按层分片（默认）, "
-              "tp=在每个 DSA indexer 的 key 维度跨 ref/quant 设备组并行"),
+        help=("长 prefill 并行方式: pp=保留按层分片（默认）, "
+              "tp=GLM/DeepSeek-V4 query-parallel 跨设备组并行"),
     )
     parser.add_argument(
         "--glm_attn_query_block", type=parse_positive_int, default=None,

@@ -70,7 +70,7 @@ def main():
                         help="[boundary] resident expert 临时反量化分块，默认 8")
     parser.add_argument(
         "--prefill_parallel", choices=["pp", "tp"], default="pp",
-        help="GLM 长 prefill: pp=按层分片（默认）, tp=DSA indexer key 维度跨卡",
+        help="长 prefill: pp=按层分片（默认）, tp=GLM/DeepSeek-V4 query-parallel",
     )
     parser.add_argument(
         "--glm_attn_query_block", type=int, default=None,
