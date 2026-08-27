@@ -248,6 +248,11 @@ def parse_args():
                         help="[full] L1 后自动选取 cos_sim 最低的 Top-K 层进入 L2")
     parser.add_argument("--logits", action="store_true",
                         help="[full] 额外采集 ref/quant logits 对比")
+    parser.add_argument(
+        "--logits_max_positions", type=int, default=None,
+        help=("[L1/full] logits 采集位置上限；默认短 prompt 采集全部、"
+              "长 prompt 仅采集最后 32 个；传 0 表示不限制"),
+    )
     parser.add_argument("--manifest", type=str, default="",
                         help="[full] bad case manifest JSON 路径, 用于 ground truth 对比")
     parser.add_argument("--quant_format", type=str, default="",
@@ -512,6 +517,7 @@ def run_hf_l1(args, ref_device, target_device, dtype):
         quant_devices=_parse_dev_list(getattr(args, 'quant_devices', None)),
         expert_chunk_size=getattr(args, 'expert_chunk_size', None),
         kimi_kda_backend=getattr(args, 'kimi_kda_backend', 'auto'),
+        logits_max_positions=getattr(args, 'logits_max_positions', None),
     )
     prompt_text, input_ids = _resolve_input(args, tokenizer)
     cache_prompt = _cache_input_identity(args)

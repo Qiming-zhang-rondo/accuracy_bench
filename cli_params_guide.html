@@ -1032,6 +1032,7 @@
             <tr><td><code>--nonprintable_max</code></td><td>0.3</td><td>乱码判定的非可打印字符比例阈值。</td></tr>
             <tr><td><code>--top_k</code></td><td>1</td><td>full 模式从 L1 选取进入 L2 的层数。</td></tr>
             <tr><td><code>--logits</code></td><td>false</td><td>full 模式额外收集 ref/quant logits。</td></tr>
+            <tr><td><code>--logits_max_positions</code></td><td>自动</td><td>L1 logits 位置上限：短 prompt（≤1024）默认显示全部位置，长 prompt 默认只取最后 32 个；传 0 表示不限制（需足够主机内存）。</td></tr>
             <tr><td><code>--manifest</code></td><td>空</td><td>bad case ground-truth manifest JSON。</td></tr>
             <tr><td><code>--quant_format</code></td><td>空</td><td>写入报告的量化格式标签。</td></tr>
             <tr><td><code>--model_name</code></td><td>空</td><td>写入 full / report overview 的模型名。</td></tr>

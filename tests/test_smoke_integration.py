@@ -598,6 +598,20 @@ class TestCollectFullLogits:
         assert next(ref_model.norm.parameters()).device.type == 'meta'
         assert next(ref_model.lm_head.parameters()).device.type == 'meta'
 
+    def test_collect_full_logits_auto_captures_short_prompt(self, monkeypatch):
+        """Default auto policy keeps every position for a short prompt."""
+        import accuracy_checker.model_loader as ML
+        monkeypatch.setattr(ML, "load_layer_weights_indexed", lambda *a, **kw: None)
+        cmp = self._make_comparator(hidden=8, vocab=12, max_positions=None)
+        ref_model = _MockModel(8, 12)
+        quant_model = _MockModel(8, 12)
+        torch.manual_seed(1)
+        ref_hs = torch.randn(1, 5, 8)
+        quant_hs = torch.randn(1, 5, 8)
+        ld = cmp._collect_full_logits(ref_model, quant_model, ref_hs, quant_hs)
+        assert ld.token_positions == [0, 1, 2, 3, 4]
+        assert len(ld.token_wise_cos) == 5
+
     def test_tied_lm_head_is_restored_from_embedding(self):
         """Missing lm_head key must use this checkpoint's embedding, not an empty head."""
         cmp = self._make_comparator(hidden=8, vocab=12)

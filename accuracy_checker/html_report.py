@@ -952,6 +952,11 @@ function renderLogits(){
   let modeNote="采集位置语义未记录；请结合生成方式人工确认 position 含义。";
   if(L.position_mode==="prompt_prefill")modeNote="这里展示 Prompt prefill 各位置的 next-token 预测；只有最后一行对应首个 Decode Token，页面已默认选中最后一行。前面的 position 不是生成序列。";
   else if(L.position_mode==="generation")modeNote="这里展示自回归生成的 Decode step；Position 0 对应首个 Decode Token。";
+  if(L.token_positions.length>1 && Number(L.token_positions[0])>0){
+    modeNote += " 当前报告为长序列安全采样，仅采集最后 "+L.token_positions.length+
+      " 个 position（"+L.token_positions[0]+"–"+
+      L.token_positions[L.token_positions.length-1]+"）；可用 --logits_max_positions 0 采集全部。";
+  }
   root.innerHTML='<div class="context-note"><b>Position 口径：</b>'+modeNote+' 散点与直方图为已采集位置的聚合视图。</div>'+
     '<div class="grid" style="grid-template-columns:1fr"><div id="logits_scatter"></div>'
     +'<div id="logits_topk"></div><div id="logits_lines"></div><div id="logits_hist"></div></div>';

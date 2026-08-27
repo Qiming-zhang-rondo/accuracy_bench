@@ -59,7 +59,7 @@ W4A4_DYNAMIC 在 NPU 上默认通过 `torch_npu.npu_dynamic_quant(..., dst_type=
 
 报告顶部会明确标记本次 L1 是“仅权重误差”还是“权重 + 激活 QDQ 联合仿真”，并记录 `quant_method`、activation type/backend。联合仿真的逐层 block output 是权重误差与 Quant 侧激活 QDQ 误差的累计结果，单次运行不能把两者的贡献拆开；若要判断激活 QDQ 的增量影响，请用同一输入分别跑一份关闭/开启 `--activation_quant` 的报告。L2 的子图反事实诊断口径独立，不重放 L1 的 activation hooks。
 
-Chat/Instruct 模型建议使用 `--messages '[{"role":"user","content":"你好"}]'`，工具会调用 tokenizer 的 `apply_chat_template(..., add_generation_prompt=True)`；裸 `--prompt` 不会自动补 chat template。报告会记录输入方式，Prompt prefill 的最后一个 position 才是首个 Decode Token。
+Chat/Instruct 模型建议使用 `--messages '[{"role":"user","content":"你好"}]'`，工具会调用 tokenizer 的 `apply_chat_template(..., add_generation_prompt=True)`；裸 `--prompt` 不会自动补 chat template。报告会记录输入方式，Prompt prefill 的最后一个 position 才是首个 Decode Token。L1 logits 对短 prompt（≤1024）默认显示全部 position；长 prompt 为避免全词表投影占满内存默认只采集最后 32 个，可用 `--logits_max_positions 0` 取消上限。
 
 ## 定界使用实例
 

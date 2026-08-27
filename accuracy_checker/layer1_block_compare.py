@@ -367,9 +367,12 @@ class ShardedBlockComparator:
         # Full logits capture on the L1 forward pass (no extra model reload).
         # Default on; compare_logits 4-panel data feeds ReportData.logits.
         collect_full_logits: bool = True,
-        # OOM guard for large vocabs (GLM-5.1 vocab=154880): keep only last N
-        # positions of full-vocab logits. 32 positions × 154880 × 4B (fp32) ≈ 20MB.
-        logits_max_positions: int = 32,
+        # OOM guard for large vocabs (GLM-5.1 vocab=154880). ``None`` uses an
+        # automatic policy: capture every position for short prompts, and
+        # keep only the last 32 positions for genuinely long prompts.  An
+        # explicit 0 disables the cap (use only when enough host memory is
+        # available).
+        logits_max_positions: Optional[int] = None,
     ):
         self.ref_model_path = ref_model_path
         self.quant_model_path = quant_model_path
@@ -1352,14 +1355,28 @@ class ShardedBlockComparator:
     def _compute_logits_np(self, ref_hidden_states, quant_hidden_states,
                            ref_norm_mod, quant_norm_mod,
                            ref_head_w, quant_head_w, max_positions):
-        """norm → slice last-N → lm_head → [N, vocab] fp32 CPU。"""
+        """norm → slice selected positions → lm_head → [N, vocab] fp32 CPU.
+
+        ``max_positions=None`` captures all positions up to the short-prompt
+        safety threshold; long prompts retain the historical last-32 guard.
+        ``max_positions=0`` explicitly requests all positions.
+        """
         with torch.no_grad():
             ref_h = self._apply_real_final_norm(
                 ref_hidden_states, ref_norm_mod, self.dtype)
             quant_h = self._apply_real_final_norm(
                 quant_hidden_states, quant_norm_mod, self.dtype)
             seq_len = ref_h.shape[1]
-            N = min(max_positions, seq_len)
+            if max_positions is None:
+                # A full vocab projection is roughly 2 × N × vocab × 4 bytes
+                # on host (ref + quant). Keep ordinary prompts complete while
+                # retaining a bounded default for long-prefill runs.
+                effective_max = seq_len if seq_len <= 1024 else 32
+            elif int(max_positions) <= 0:
+                effective_max = seq_len
+            else:
+                effective_max = int(max_positions)
+            N = min(effective_max, seq_len)
             ref_h_last = ref_h[:, -N:, :].contiguous()
             quant_h_last = quant_h[:, -N:, :].contiguous()
             del ref_h, quant_h
