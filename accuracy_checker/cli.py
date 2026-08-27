@@ -35,7 +35,7 @@ def main():
     parser.add_argument("--request_json_stdin", action="store_true",
                         help="从 stdin 读取完整请求 JSON，适合超长 prompt")
     parser.add_argument("--prompt_stdin", action="store_true",
-                        help="从 stdin 读取原始 prompt，适合超长文本")
+                        help="从 stdin 读取原始 prompt，适合 boundary/L1/full 超长文本")
     parser.add_argument("--use_cpu_dequant", action="store_true",
                         help="回退到旧 CPU 全量反量化流程")
     parser.add_argument("--noquit", action="store_true",

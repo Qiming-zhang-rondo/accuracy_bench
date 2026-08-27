@@ -975,7 +975,7 @@
             <tr><td><code>--prompt_file</code></td><td>空</td><td>boundary 支持完整请求 JSON，也支持 .txt/.prompt 原始 Jinja/ChatML prompt；原始文本会直接 tokenizer，不再套 chat template。</td></tr>
             <tr><td><code>--request_json</code></td><td>空</td><td>直接粘贴完整请求 JSON；短请求适用，内容格式与 prompt_file 相同。</td></tr>
             <tr><td><code>--request_json_stdin</code></td><td>false</td><td>从 stdin 读取完整请求 JSON；适合超长 prompt，避免 shell 的 Argument list too long。</td></tr>
-            <tr><td><code>--prompt_stdin</code></td><td>false</td><td>从 stdin 读取 Boundary 原始文本/Jinja prompt；直接粘贴长文本时由页面自动生成，避免 shell 的 Argument list too long。</td></tr>
+            <tr><td><code>--prompt_stdin</code></td><td>false</td><td>从 stdin 读取 Boundary/L1/full 原始文本/Jinja prompt；页面检测到直接粘贴内容时自动生成，避免 shell 的 Argument list too long。</td></tr>
             <tr><td><code>--target_layers</code> / <code>--target-layers</code></td><td>空</td><td>L2 目标层，支持逗号或空格分隔。</td></tr>
             <tr><td><code>--device</code></td><td>cuda（自动解析）</td><td>通用设备；NPU 建议显式指定 ref/quant 设备参数。</td></tr>
             <tr><td><code>--ref_device</code></td><td>继承 device</td><td>dual / DSpark 的参考模型设备。</td></tr>
@@ -1502,6 +1502,9 @@
           && !el.requestJson.value.trim()
           && !el.promptFile.value.trim()
           && el.prompt.value.trim();
+        var inlineRawPromptStdin = ["l1", "full"].indexOf(mode) !== -1
+          && el.rawPromptFile.value.trim()
+          && !isAbsoluteLinuxPath(el.rawPromptFile.value.trim());
         recommendedCardCount = recommendation.cards;
 
         el.mode.disabled = dspark;
@@ -1604,6 +1607,10 @@
           // Keep a long raw/Jinja prompt out of argv; the shell feeds it via
           // stdin and run_accuracy_check reads it with --prompt_stdin.
           args.push(line("--prompt_stdin"));
+        } else if (inlineRawPromptStdin) {
+          // The raw-prompt field is normally a server path.  If the user
+          // pastes the prompt itself, stream it instead of putting it in argv.
+          args.push(line("--prompt_stdin"));
         } else if (["l1", "full"].indexOf(mode) !== -1 && el.rawPromptFile.value.trim()) {
           args.push(line("--prompt_file", shellQuote(el.rawPromptFile.value, "<PROMPT_FILE>")));
         } else if (mode !== "screening") {
@@ -1628,10 +1635,10 @@
           commands[commands.length - 1] += " <<'" + requestDelimiter + "'";
           commands.push(el.requestJson.value.trim());
           commands.push(requestDelimiter);
-        } else if (boundaryPromptStdin) {
+        } else if (boundaryPromptStdin || inlineRawPromptStdin) {
           var promptDelimiter = "__ACC_BENCH_PROMPT__";
           commands[commands.length - 1] += " <<'" + promptDelimiter + "'";
-          commands.push(el.prompt.value);
+          commands.push(boundaryPromptStdin ? el.prompt.value : el.rawPromptFile.value);
           commands.push(promptDelimiter);
         }
 

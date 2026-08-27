@@ -101,7 +101,7 @@ def parse_args():
     parser.add_argument("--request_json_stdin", action="store_true",
                         help="[boundary] 从 stdin 读取完整请求 JSON，适合超长 prompt")
     parser.add_argument("--prompt_stdin", action="store_true",
-                        help="[boundary] 从 stdin 读取原始 prompt，适合超长文本")
+                        help="从 stdin 读取原始 prompt，适合 boundary/L1/full 超长文本")
     parser.add_argument("--target_layers", type=str, default=None,
                         help="L2 只检查指定层 (逗号或空格分隔, 如 '8,9' 或 '8 9')")
     parser.add_argument("--target-layers", dest="target_layers_alt", type=str, default=None,
@@ -1259,6 +1259,11 @@ def main():
         return
 
     mode = _resolve_mode(args)
+    # Long L1/full prompts can be streamed through stdin just like Boundary.
+    # Boundary consumes its stdin inside _mode_boundary because it may contain
+    # either a request JSON or a raw prompt; other modes only need plain text.
+    if getattr(args, "prompt_stdin", False) and mode != "boundary":
+        args.prompt = sys.stdin.read()
     if args.max_new_tokens is None and mode != "boundary":
         args.max_new_tokens = 1024
 
