@@ -83,7 +83,7 @@ acc_bench/
 | `--rotation_matrix FILE` | QuaRot 旋转矩阵（R1） |
 | `--quant_method dequantize\|fake_quant` | 量化模型加载方式 |
 | `--compare_mode dual\|grouped_dual` | dual=双卡分片, grouped_dual=MoE expert 跨卡 |
-| `--prefill_parallel pp\|tp` | GLM 长 prefill：pp 按层分片；tp 默认按 query block 跨设备组并行（`ACC_GLM_DSA_TP_STRATEGY=key` 可回退旧 K-axis 基线） |
+| `--prefill_parallel pp\|tp` | GLM 长 prefill：pp 按层分片并在 owner 上做内存有界 attention；tp 默认按 query block 跨设备组并行 indexer 和 sparse attention（K/V 每 helper 每层复制一次；`ACC_GLM_DSA_TP_STRATEGY=key` 仅切换 indexer 的旧 K-axis 基线）；可用 `ACC_GLM_DSA_ATTN_QUERY_BLOCK`、`ACC_GLM_DSA_ATTN_SELECTED_BLOCK` 调整显存/launch 开销 |
 | `--activation_quant` | 仅在 quant 侧启用 descriptor 驱动的激活伪量化 |
 | `--activation_quant_type AUTO\|...` | 默认按每个权重 descriptor 自动选择激活格式；显式类型只匹配兼容算子 |
 | `--activation_quant_backend auto\|npu\|torch` | W4A4 在 NPU 上默认调用原生 dynamic-quant 算子；Torch 公式路径仅用于诊断 |

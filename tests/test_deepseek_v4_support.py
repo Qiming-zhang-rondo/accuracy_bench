@@ -407,6 +407,9 @@ def test_glm_query_parallel_topk_is_exact_and_ordered_on_cpu():
         expected = torch.topk(
             expected_scores, topk, dim=-1, sorted=True
         ).indices.to(torch.int32)
+        expected = torch.where(
+            expected <= position_ids[:, :, None], expected, -1
+        )
         for mask in (None, causal_mask):
             actual = _tp_query_parallel_topk(
                 q, k, weights, query_block, key_block, topk,
@@ -444,6 +447,126 @@ def test_glm_query_block_assignment_preserves_block_boundaries_and_balance():
         assert blocks[-1][1] <= seq_len
         if seq_len == 10000:
             assert (9216, 10000) in blocks
+
+
+def test_glm_sparse_attention_online_softmax_matches_dense_selected_reference():
+    from accuracy_checker.glm_dsa_blockwise import (
+        _compute_sparse_attention_query_block,
+        _gather_selected_attention_states,
+    )
+
+    torch.manual_seed(19)
+    batch, heads, seq_len, key_dim, value_dim = 2, 3, 7, 4, 5
+    query = torch.randn(batch, heads, seq_len, key_dim)
+    keys = torch.randn(batch, heads, seq_len, key_dim)
+    values = torch.randn(batch, heads, seq_len, value_dim)
+    positions = torch.arange(seq_len).view(1, -1).expand(batch, -1)
+    # Deliberately include future entries.  They are -inf candidates used to
+    # fill top-k at early positions and must not affect sparse attention.
+    selected = torch.tensor(
+        [
+            [[0, 3, 1, 6, 2]] * seq_len,
+            [[0, 4, 2, 6, 1]] * seq_len,
+        ],
+        dtype=torch.long,
+    )
+    scaling = 0.63
+
+    gathered_k = _gather_selected_attention_states(keys, selected)
+    gathered_v = _gather_selected_attention_states(values, selected)
+    dense_scores = torch.matmul(
+        query.unsqueeze(-2), gathered_k.transpose(-1, -2)
+    ).squeeze(-2) * scaling
+    valid = selected[:, None] <= positions[:, None, :, None]
+    dense_scores = dense_scores.masked_fill(~valid, float("-inf"))
+    expected = torch.matmul(
+        dense_scores.softmax(dim=-1).unsqueeze(-2), gathered_v
+    ).squeeze(-2)
+
+    # selected_block=2 forces three online-softmax tiles (2 + 2 + 1).
+    actual = _compute_sparse_attention_query_block(
+        query,
+        keys.contiguous(),
+        values.contiguous(),
+        selected,
+        positions,
+        None,
+        0,
+        scaling,
+        2,
+    )
+    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
+
+
+def test_glm_sparse_attention_respects_compact_padding_mask():
+    from accuracy_checker.glm_dsa_blockwise import (
+        _compute_sparse_attention_query_block,
+        _gather_selected_attention_states,
+    )
+
+    torch.manual_seed(23)
+    batch, heads, seq_len, dim = 1, 2, 6, 3
+    query = torch.randn(batch, heads, seq_len, dim)
+    keys = torch.randn(batch, heads, seq_len, dim)
+    values = torch.randn(batch, heads, seq_len, dim)
+    positions = torch.arange(seq_len).view(1, -1)
+    selected = torch.arange(seq_len).view(1, 1, -1).expand(
+        batch, seq_len, -1
+    )
+    padding = torch.tensor([[1, 1, 1, 1, 0, 0]], dtype=torch.long)
+
+    gathered_k = _gather_selected_attention_states(keys, selected)
+    gathered_v = _gather_selected_attention_states(values, selected)
+    scores = torch.matmul(
+        query.unsqueeze(-2), gathered_k.transpose(-1, -2)
+    ).squeeze(-2)
+    valid = selected[:, None] <= positions[:, None, :, None]
+    valid = valid & padding[:, None, None, :].bool()
+    expected = torch.matmul(
+        scores.masked_fill(~valid, float("-inf"))
+        .softmax(dim=-1).unsqueeze(-2),
+        gathered_v,
+    ).squeeze(-2)
+    actual = _compute_sparse_attention_query_block(
+        query, keys.contiguous(), values.contiguous(), selected, positions,
+        padding, 0, 1.0, 4,
+    )
+    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
+
+
+def test_glm_sparse_attention_query_parallel_restores_query_order_on_cpu():
+    from accuracy_checker.glm_dsa_blockwise import (
+        _compute_sparse_attention_query_block,
+        _tp_sparse_query_parallel_attention,
+    )
+
+    torch.manual_seed(29)
+    batch, heads, seq_len, dim = 1, 2, 11, 4
+    query = torch.randn(batch, heads, seq_len, dim)
+    keys = torch.randn(batch, heads, seq_len, dim)
+    values = torch.randn(batch, heads, seq_len, dim)
+    positions = torch.arange(seq_len).view(1, -1)
+    selected = torch.arange(seq_len).view(1, 1, -1).expand(
+        batch, seq_len, -1
+    )
+    expected = _compute_sparse_attention_query_block(
+        query, keys.contiguous(), values.contiguous(), selected, positions,
+        None, 0, 0.5, 3,
+    )
+    actual = _tp_sparse_query_parallel_attention(
+        query,
+        keys.contiguous(),
+        values.contiguous(),
+        selected,
+        positions,
+        None,
+        0.5,
+        2,
+        3,
+        ["cpu", "cpu", "cpu"],
+        "cpu",
+    )
+    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
 
 
 def test_boundary_v4_native_w8_experts_dequantize_per_projection():

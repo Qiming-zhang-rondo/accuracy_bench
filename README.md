@@ -101,7 +101,9 @@ python3 run_accuracy_check.py --mode boundary \
 
 GLM-5.x 量化 MoE 的 boundary 路径会把 routed expert 以 W4/W8 压缩形态按 layer 常驻所属 NPU，并把同一 chunk 命中的 experts 合并反量化，不再逐 token 从 CPU 搬运 BF16 expert。decode 默认还为每层保留 16 个 BF16 热 expert，prefill 不写入该缓存。`--expert_chunk_size` 控制临时 BF16 峰值，默认 8；显存紧张可降到 4，显存充足可尝试 16。`ACC_BOUNDARY_EXPERT_CACHE_PER_LAYER=0/8/16/...` 可调整热缓存；设置 `ACC_BOUNDARY_RESIDENT_EXPERTS=0` 可回退到 CPU compact streaming 以排查运行时兼容问题。
 
-GLM 的超长 prefill 默认使用 PP（按层分片）并对 DSA indexer 做内存有界的 query/key 分块。若显存允许、希望把昂贵的 `QK^T` 计算分摊到同一侧的多张卡，可加 `--prefill_parallel tp`。TP 默认使用 Query Parallel：helper 按 query block round-robin 分配任务，每个实际计算的 score tensor 的 query 维不超过 `query_block`；完整 K 在一次 forward 内复制一次，本地 running top-k 即为 exact 全局结果，最后只回传 indices。模型层和 KV cache 仍按 PP 放置。Ref/Quant 两侧分别复用各自的 `--ref_devices` / `--quant_devices` 设备组，单卡组会自动回退 PP 路径。设置 `ACC_GLM_DSA_TP_STRATEGY=key` 可保留旧 K-axis TP 作为性能基线，默认值为 `query`。
+GLM 的超长 prefill 默认使用 PP（按层分片）并对 DSA indexer 做内存有界的 query/key 分块。若显存允许、希望把昂贵的 indexer `QK^T` 计算分摊到同一侧的多张卡，可加 `--prefill_parallel tp`。TP 默认使用 Query Parallel：helper 按 query block round-robin 分配任务，每个实际计算的 score tensor 的 query 维不超过 `query_block`；完整 K 在一次 forward 内复制一次，本地 running top-k 即为 exact 全局结果，最后只回传 indices。模型层和 KV cache 仍按 PP 放置。Ref/Quant 两侧分别复用各自的 `--ref_devices` / `--quant_devices` 设备组，单卡组会自动回退 PP 路径。设置 `ACC_GLM_DSA_TP_STRATEGY=key` 可保留旧 K-axis TP 作为性能基线，默认值为 `query`。
+
+Transformers 的 eager/SDPA 在 indexer 之后还会生成一次完整 attention `Q×K`。长 prefill 会自动改为仅对 DSA 选中的 top-k 做 query/selected-key 分块和 exact online softmax，不创建 dense sparse mask。`--prefill_parallel tp` 时 attention query blocks 也会 round-robin 到同一侧的全部 TP devices，完整 K/V 每 helper 每层只复制一次，最后只 gather attention output；`pp` 时保留 owner 单卡 blockwise 路径。默认 attention 分块为 query 64、selected key 512；显存更紧时可分别调小 `ACC_GLM_DSA_ATTN_QUERY_BLOCK` 和 `ACC_GLM_DSA_ATTN_SELECTED_BLOCK`，显存充足时调大可减少 launch 次数。该优化只作用于超过 `ACC_GLM_DSA_BLOCKWISE_THRESHOLD` 的 eager/SDPA prefill；短序列、训练、Flash-MLA、decode 和 KV cache 接口保持原路径。
 
 不想创建请求文件时，可把同一个对象直接传给 `--request_json`（参数指南页面也提供直接粘贴文本框）。如果 prompt 很长，不能把完整 JSON 放进 argv；使用 stdin 方式：
 

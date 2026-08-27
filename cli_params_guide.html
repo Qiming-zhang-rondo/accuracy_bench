@@ -996,7 +996,7 @@
             <tr><td><code>--activation_quant_backend</code></td><td>auto</td><td>W4A4_DYNAMIC 在 NPU 上默认使用原生 npu_dynamic_quant；torch 仅用于无 NPU 自检或算子差异诊断。</td></tr>
             <tr><td><code>--activation_quant_group_size</code></td><td>128</td><td>W4A4_INT4_PER_GROUP 的 hidden-axis 分组大小；其他激活类型忽略。</td></tr>
             <tr><td><code>--compare_mode</code></td><td>dual</td><td>dual / grouped_dual；MoE 推荐 grouped_dual，DSpark 必须 dual。</td></tr>
-            <tr><td><code>--prefill_parallel</code></td><td>pp</td><td>GLM 长 prefill：pp 保留按层分片；tp 默认按 query block 跨对应 Ref/Quant 设备组并行，每个 score block 的 query 维不超过 query_block，完整 K 每层复制一次并直接返回 exact top-k。可用 ACC_GLM_DSA_TP_STRATEGY=key 回退旧 K-axis 基线。</td></tr>
+            <tr><td><code>--prefill_parallel</code></td><td>pp</td><td>GLM 长 prefill：pp 保留按层分片及 owner 单卡 blockwise attention；tp 默认按 query block 跨对应 Ref/Quant 设备组并行 indexer 和 sparse attention。Attention 的完整 K/V 每 helper 每层只复制一次，最后只 gather output；不会回到 dense Q×K。ACC_GLM_DSA_TP_STRATEGY=key 仅用于回退 indexer 的旧 K-axis 基线。默认 attention query=64、selected-key=512，可用 ACC_GLM_DSA_ATTN_QUERY_BLOCK / ACC_GLM_DSA_ATTN_SELECTED_BLOCK 调整显存与 launch 次数。</td></tr>
             <tr><td><code>--ref_devices</code></td><td>空</td><td>grouped_dual 的 ref 多卡列表，例如 npu:0,1。</td></tr>
             <tr><td><code>--quant_devices</code></td><td>空</td><td>grouped_dual 的 quant 多卡列表，例如 npu:2,3。</td></tr>
             <tr><td><code>--expert_chunk_size</code></td><td>L1 自动；boundary 8</td><td>L1 grouped_dual 或 boundary resident expert 的临时反量化分块；越小越省峰值显存。</td></tr>

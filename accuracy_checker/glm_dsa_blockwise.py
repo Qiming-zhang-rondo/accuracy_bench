@@ -1,9 +1,15 @@
-"""Memory-bounded GLM-MoE-DSA indexer for very long prefill inputs.
+"""Memory-bounded GLM-MoE-DSA indexer and attention for long prefill.
 
 Transformers' eager indexer materializes ``[batch, query, heads, keys]``
 scores.  For a 65k-token prompt that intermediate is hundreds of GiB.  This
 patch preserves the same projections, ReLU, causal mask and global top-k, but
 processes query/key tiles and keeps only the running top-k values.
+
+The eager attention path has a second, independent quadratic allocation after
+the indexer: ``[batch, heads, query, key]`` attention scores.  For long
+prefills we also consume the exact DSA-selected indices directly, process
+small query/selected-key tiles and use online softmax.  No dense QxK sparse
+mask or score tensor is materialized.
 """
 
 from __future__ import annotations
@@ -15,6 +21,294 @@ import time
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+def _gather_selected_attention_states(states, indices):
+    """Gather ``[B,H,Q,T,D]`` from ``[B,H,K,D]`` without expanding K.
+
+    ``indices`` is shared by all attention heads.  Flattening batch and head
+    lets ``index_select`` gather only the selected vectors instead of first
+    expanding the complete K/V tensor to ``[B,H,Q,K,D]``.
+    """
+    batch_size, num_heads, key_len, head_dim = states.shape
+    safe = indices.clamp(0, max(0, key_len - 1)).long()
+    query_len, selected_len = safe.shape[1:]
+    offsets = torch.arange(
+        batch_size * num_heads, device=states.device, dtype=torch.long
+    ).view(batch_size, num_heads, 1, 1) * key_len
+    flat_ids = (
+        safe[:, None, :, :].expand(-1, num_heads, -1, -1) + offsets
+    ).reshape(-1)
+    # Callers make states contiguous once per attention forward, so this view
+    # does not copy the full K/V tensor for every query block.
+    flat_states = states.view(batch_size * num_heads * key_len, head_dim)
+    gathered = flat_states.index_select(0, flat_ids)
+    return gathered.view(
+        batch_size, num_heads, query_len, selected_len, head_dim
+    )
+
+
+def _selected_attention_mask(
+    attention_mask, indices, q_start, q_end, key_len,
+):
+    """Gather only selected entries from a compact or additive mask."""
+    if attention_mask is None:
+        return None
+    safe = indices.clamp(0, max(0, key_len - 1)).long()
+    batch_size, query_len, selected_len = safe.shape
+    if attention_mask.dim() == 2:
+        gathered = attention_mask.gather(
+            1, safe.reshape(batch_size, -1)
+        )
+        return gathered.view(batch_size, 1, query_len, selected_len)
+    if attention_mask.dim() == 3:
+        mask = attention_mask[:, q_start:q_end, :]
+        return mask.gather(-1, safe).unsqueeze(1)
+    if attention_mask.dim() == 4:
+        mask = attention_mask[:, :, q_start:q_end, :]
+        gather_ids = safe[:, None, :, :].expand(
+            -1, mask.shape[1], -1, -1
+        )
+        return mask.gather(-1, gather_ids)
+    raise ValueError(
+        "GLM DSA attention expects a [B,K], [B,Q,K], or [B,H,Q,K] mask"
+    )
+
+
+def _compute_sparse_attention_query_block(
+    query_tile, key_states, value_states, selected_indices, position_tile,
+    attention_mask, q_start, scaling, selected_block,
+):
+    """Compute exact sparse attention for one bounded query block.
+
+    Softmax is accumulated online across selected-key tiles, so the result is
+    mathematically equivalent to softmax over all DSA-selected keys while the
+    temporary gathered K/V tensors stay bounded by
+    ``[B,H,Q_block,selected_block,D]``.
+    """
+    batch_size, num_heads, query_len, _ = query_tile.shape
+    key_len = key_states.shape[2]
+    value_dim = value_states.shape[-1]
+    query_float = query_tile.float()
+    running_max = torch.full(
+        (batch_size, num_heads, query_len, 1), float("-inf"),
+        dtype=torch.float32, device=query_tile.device,
+    )
+    running_sum = torch.zeros_like(running_max)
+    running_output = torch.zeros(
+        (batch_size, num_heads, query_len, value_dim),
+        dtype=torch.float32, device=query_tile.device,
+    )
+
+    total_selected = selected_indices.shape[-1]
+    for selected_start in range(0, total_selected, selected_block):
+        selected_end = min(total_selected, selected_start + selected_block)
+        indices = selected_indices[:, :, selected_start:selected_end]
+        valid = (indices >= 0) & (indices < key_len)
+        # DSA top-k is causal, but early query positions are padded by topk
+        # with future -inf candidates.  Reapply causality after gather.
+        valid = valid & (indices <= position_tile[:, :, None])
+
+        selected_keys = _gather_selected_attention_states(key_states, indices)
+        scores = torch.matmul(
+            query_float.unsqueeze(-2),
+            selected_keys.float().transpose(-1, -2),
+        ).squeeze(-2) * scaling
+        del selected_keys
+
+        mask = _selected_attention_mask(
+            attention_mask, indices, q_start, q_start + query_len, key_len
+        )
+        if mask is not None:
+            if attention_mask.dim() == 2:
+                # Transformers' compact padding mask uses 1/True for valid
+                # keys and 0/False for padding.
+                valid = valid[:, None] & (mask > 0)
+            elif mask.dtype == torch.bool or not mask.dtype.is_floating_point:
+                valid = valid[:, None] & mask
+            else:
+                mask_float = mask.float()
+                # HF additive masks use either -inf or dtype minimum for
+                # disallowed entries.  Preserve finite additive biases while
+                # treating those sentinels as invalid.
+                mask_floor = torch.finfo(mask.dtype).min / 2
+                mask_valid = torch.isfinite(mask_float) & (mask_float > mask_floor)
+                valid = valid[:, None] & mask_valid
+                scores = scores + mask_float
+        else:
+            valid = valid[:, None]
+        scores = scores.masked_fill(~valid, float("-inf"))
+
+        tile_max = scores.max(dim=-1, keepdim=True).values
+        new_max = torch.maximum(running_max, tile_max)
+        old_scale = torch.where(
+            torch.isfinite(running_max),
+            torch.exp(running_max - new_max),
+            torch.zeros_like(running_max),
+        )
+        shifted = torch.where(
+            valid,
+            scores - new_max,
+            torch.full_like(scores, float("-inf")),
+        )
+        exp_scores = torch.where(
+            torch.isfinite(new_max),
+            torch.exp(shifted),
+            torch.zeros_like(scores),
+        )
+        new_sum = running_sum * old_scale + exp_scores.sum(
+            dim=-1, keepdim=True
+        )
+
+        # Release gathered K before gathering V.  K and V have the same
+        # selected shape, so the allocator can reuse the bounded workspace.
+        selected_values = _gather_selected_attention_states(
+            value_states, indices
+        )
+        tile_output = torch.matmul(
+            exp_scores.unsqueeze(-2), selected_values.float()
+        ).squeeze(-2)
+        del selected_values, exp_scores, scores
+        running_output = running_output * old_scale + tile_output
+        running_max = new_max
+        running_sum = new_sum
+
+    tiny = torch.finfo(running_sum.dtype).tiny
+    output = running_output / running_sum.clamp_min(tiny)
+    return output.to(query_tile.dtype)
+
+
+def _tp_sparse_query_parallel_attention(
+    query_states, key_states, value_states, topk_indices, position_ids,
+    attention_mask, scaling, query_block, selected_block, devices, base_device,
+):
+    """Run sparse attention query blocks across one side's TP device group.
+
+    Full K/V is copied exactly once to each active helper and reused for every
+    assigned query block.  Q/top-k/positions go only to the responsible helper;
+    only the completed attention output is gathered back to the layer owner.
+    """
+    batch_size, num_heads, seq_len, _ = query_states.shape
+    value_dim = value_states.shape[-1]
+    assignments = _query_block_assignments(
+        seq_len, query_block, len(devices)
+    )
+    active = [
+        (device, blocks) for device, blocks in zip(devices, assignments)
+        if blocks
+    ]
+    if not active:
+        return torch.empty(
+            batch_size, num_heads, 0, value_dim,
+            dtype=query_states.dtype, device=base_device,
+        )
+
+    started = time.perf_counter()
+    replicated = []
+    for device, blocks in active:
+        if _same_device(device, base_device):
+            key_dev = key_states
+            value_dev = value_states
+            compact_mask = attention_mask if (
+                attention_mask is not None and attention_mask.dim() == 2
+            ) else None
+        else:
+            key_dev = key_states.to(device, non_blocking=True)
+            value_dev = value_states.to(device, non_blocking=True)
+            compact_mask = (
+                attention_mask.to(device, non_blocking=True)
+                if attention_mask is not None and attention_mask.dim() == 2
+                else None
+            )
+        replicated.append((device, blocks, key_dev, value_dev, compact_mask))
+    replicate_launch = time.perf_counter() - started
+
+    launch_started = time.perf_counter()
+    states_by_device = []
+    for device, blocks, key_dev, value_dev, compact_mask in replicated:
+        local_len = sum(q_end - q_start for q_start, q_end in blocks)
+        local_output = torch.empty(
+            batch_size, num_heads, local_len, value_dim,
+            dtype=query_states.dtype, device=device,
+        )
+        offset = 0
+        for q_start, q_end in blocks:
+            q_tile = query_states[:, :, q_start:q_end, :]
+            selected_tile = topk_indices[:, q_start:q_end, :]
+            position_tile = position_ids[:, q_start:q_end]
+            local_mask = compact_mask
+            local_q_start = q_start
+            if attention_mask is not None and attention_mask.dim() > 2:
+                # Correctness fallback for an already-materialized additive
+                # mask: transfer only this query block, never full QxK.
+                if attention_mask.dim() == 3:
+                    local_mask = attention_mask[:, q_start:q_end, :]
+                else:
+                    local_mask = attention_mask[:, :, q_start:q_end, :]
+                local_q_start = 0
+            if not _same_device(device, base_device):
+                q_tile = q_tile.to(device, non_blocking=True)
+                selected_tile = selected_tile.to(device, non_blocking=True)
+                position_tile = position_tile.to(device, non_blocking=True)
+                if local_mask is not None and local_mask is not compact_mask:
+                    local_mask = local_mask.to(device, non_blocking=True)
+            block_output = _compute_sparse_attention_query_block(
+                q_tile,
+                key_dev,
+                value_dev,
+                selected_tile,
+                position_tile,
+                local_mask,
+                local_q_start,
+                scaling,
+                selected_block,
+            )
+            q_len = q_end - q_start
+            local_output[:, :, offset:offset + q_len, :] = block_output
+            offset += q_len
+        states_by_device.append((device, blocks, local_output))
+    compute_launch = time.perf_counter() - launch_started
+
+    sync_started = time.perf_counter()
+    for device, _, _ in states_by_device:
+        _synchronise(device)
+    sync_wait = time.perf_counter() - sync_started
+
+    gather_started = time.perf_counter()
+    gathered_blocks = []
+    has_remote = False
+    for device, blocks, local_output in states_by_device:
+        if not _same_device(device, base_device):
+            local_output = local_output.to(base_device, non_blocking=True)
+            has_remote = True
+        offset = 0
+        for q_start, q_end in blocks:
+            q_len = q_end - q_start
+            gathered_blocks.append((
+                q_start,
+                local_output[:, :, offset:offset + q_len, :],
+            ))
+            offset += q_len
+    if has_remote:
+        _synchronise(base_device)
+    gathered_blocks.sort(key=lambda item: item[0])
+    output = torch.cat([block for _, block in gathered_blocks], dim=2)
+    gather_time = time.perf_counter() - gather_started
+    logger.info(
+        "[GLM DSA attention TP timing] strategy=query_parallel devices=%s "
+        "query_blocks_per_device=%s KV_replicate_launch=%.4fs "
+        "query_dispatch+compute_launch=%.4fs sync_wait=%.4fs "
+        "output_gather=%.4fs total=%.4fs "
+        "[host launch timings; device work included in sync_wait]",
+        [device for device, _ in active],
+        [len(blocks) for _, blocks in active],
+        replicate_launch,
+        compute_launch,
+        sync_wait,
+        gather_time,
+        time.perf_counter() - started,
+    )
+    return output
 
 
 def _normalise_device_groups(device_groups):
@@ -152,7 +446,12 @@ def _tp_indexer_topk(
             candidates, topk, dim=-1, sorted=True)
         running_indices = candidate_indices.gather(-1, selected)
         del values, indices, candidates, candidate_indices
-    return running_indices
+    query_positions = position_ids[:, q_start:q_start + query_len]
+    valid = (
+        (running_indices >= 0)
+        & (running_indices <= query_positions[:, :, None])
+    )
+    return torch.where(valid, running_indices, -1)
 
 
 def _query_block_assignments(seq_len, query_block, num_devices):
@@ -238,7 +537,11 @@ def _compute_query_block_topk(
             candidates, topk, dim=-1, sorted=True
         )
         local_indices = candidate_indices.gather(-1, selected)
-    return local_indices
+    valid = (
+        (local_indices >= 0)
+        & (local_indices <= position_tile[:, :, None])
+    )
+    return torch.where(valid, local_indices, -1)
 
 
 def _tp_query_parallel_topk(
@@ -347,6 +650,206 @@ def _tp_query_parallel_topk(
     return result
 
 
+def _install_glm_dsa_blockwise_attention(
+    attention_cls, rope, *, threshold, query_block, selected_block,
+    parallel_mode, device_groups,
+):
+    """Install the memory-bounded eager/SDPA long-prefill attention path."""
+    original = getattr(
+        attention_cls, "_acc_blockwise_attention_original", None
+    )
+    if original is None:
+        original = getattr(attention_cls, "forward", None)
+    if original is None:
+        return False
+
+    @torch.no_grad()
+    def blockwise_attention_forward(
+        self, hidden_states, position_embeddings, attention_mask,
+        past_key_values=None, position_ids=None, prev_topk_indices=None,
+        **kwargs,
+    ):
+        batch_size, seq_len = hidden_states.shape[:-1]
+        implementation = str(
+            getattr(self.config, "_attn_implementation", "eager")
+        ).lower()
+        # Flash-MLA already consumes sparse indices without a dense QxK score
+        # matrix.  Training keeps the original dropout/autograd behavior.
+        if (
+            seq_len <= threshold
+            or implementation not in {"eager", "sdpa"}
+            or self.training
+            or position_ids is None
+        ):
+            return original(
+                self,
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                past_key_values=past_key_values,
+                position_ids=position_ids,
+                prev_topk_indices=prev_topk_indices,
+                **kwargs,
+            )
+
+        started = time.perf_counter()
+        query_shape = (batch_size, seq_len, -1, self.qk_head_dim)
+        q_resid = self.q_a_layernorm(self.q_a_proj(hidden_states))
+        q_states = self.q_b_proj(q_resid).view(query_shape).transpose(1, 2)
+        q_pass, q_rot = torch.split(
+            q_states,
+            [self.qk_nope_head_dim, self.qk_rope_head_dim],
+            dim=-1,
+        )
+
+        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+        k_pass, k_rot = torch.split(
+            compressed_kv,
+            [self.kv_lora_rank, self.qk_rope_head_dim],
+            dim=-1,
+        )
+        k_rot = k_rot.view(
+            batch_size, 1, seq_len, self.qk_rope_head_dim
+        )
+        cos, sin = position_embeddings
+        q_rot, k_rot = rope(q_rot, k_rot, cos, sin)
+        query_states = torch.cat((q_pass, q_rot), dim=-1)
+        expand_kv = getattr(self, "expand_kv", None)
+        if expand_kv is not None:
+            # Newer generated Transformers layouts inherit this helper from
+            # DeepseekV3Attention.
+            k_pass = self.kv_a_layernorm(k_pass)
+            key_states, value_states = expand_kv(k_pass, k_rot)
+        else:
+            # Transformers 5.12.0 keeps kv_b_proj + split inline in GLM's
+            # forward and has no expand_kv method.
+            key_shape = (
+                batch_size,
+                seq_len,
+                -1,
+                self.qk_nope_head_dim + self.v_head_dim,
+            )
+            k_pass = self.kv_b_proj(
+                self.kv_a_layernorm(k_pass)
+            ).view(key_shape).transpose(1, 2)
+            k_pass, value_states = torch.split(
+                k_pass,
+                [self.qk_nope_head_dim, self.v_head_dim],
+                dim=-1,
+            )
+            k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
+            key_states = torch.cat((k_pass, k_rot), dim=-1)
+        if past_key_values is not None:
+            key_states, value_states = past_key_values.update(
+                key_states, value_states, self.layer_idx
+            )
+
+        if self.indexer is not None:
+            indexer_mask = (
+                attention_mask[:, 0, :, :]
+                if attention_mask is not None and attention_mask.dim() == 4
+                else attention_mask
+            )
+            topk_indices = self.indexer(
+                hidden_states,
+                q_resid,
+                position_embeddings,
+                indexer_mask,
+                position_ids,
+                past_key_values=past_key_values,
+            )
+        else:
+            if prev_topk_indices is None:
+                raise ValueError(
+                    "Shared DSA layers require top-k indices from a previous "
+                    "full indexer layer."
+                )
+            topk_indices = prev_topk_indices
+
+        del q_states, q_pass, q_rot
+        del compressed_kv, k_rot, k_pass, cos, sin, q_resid
+
+        # Make the source layout stable once.  The selected-state helper then
+        # uses a view for every query block rather than copying full K/V.
+        key_states = key_states.contiguous()
+        value_states = value_states.contiguous()
+        num_attention_heads = query_states.shape[1]
+        tp_devices = []
+        if parallel_mode == "tp":
+            tp_devices = _select_tp_devices(
+                query_states.device, device_groups
+            )
+            if len(tp_devices) < 2:
+                tp_devices = []
+        if tp_devices:
+            attention_strategy = "query_parallel"
+            sparse_output = _tp_sparse_query_parallel_attention(
+                query_states,
+                key_states,
+                value_states,
+                topk_indices,
+                position_ids,
+                attention_mask,
+                self.scaling,
+                query_block,
+                selected_block,
+                tp_devices,
+                query_states.device,
+            )
+        else:
+            attention_strategy = "owner_blockwise"
+            sparse_output = torch.empty(
+                batch_size,
+                num_attention_heads,
+                seq_len,
+                value_states.shape[-1],
+                dtype=query_states.dtype,
+                device=query_states.device,
+            )
+            for q_start in range(0, seq_len, query_block):
+                q_end = min(seq_len, q_start + query_block)
+                sparse_output[:, :, q_start:q_end, :] = (
+                    _compute_sparse_attention_query_block(
+                        query_states[:, :, q_start:q_end, :],
+                        key_states,
+                        value_states,
+                        topk_indices[:, q_start:q_end, :],
+                        position_ids[:, q_start:q_end],
+                        attention_mask,
+                        q_start,
+                        self.scaling,
+                        selected_block,
+                    )
+                )
+
+        attn_output = sparse_output.transpose(1, 2).contiguous()
+        del sparse_output, query_states, key_states, value_states
+        attn_output = attn_output.reshape(batch_size, seq_len, -1)
+        attn_output = self.o_proj(attn_output)
+        logger.info(
+            "[GLM DSA attention timing] strategy=%s "
+            "layer=%s q=%d selected=%d query_block=%d selected_block=%d "
+            "peak_score_shape=[%d,%d,%d,%d] total=%.4fs",
+            attention_strategy,
+            self.layer_idx,
+            seq_len,
+            topk_indices.shape[-1],
+            query_block,
+            selected_block,
+            batch_size,
+            num_attention_heads,
+            min(query_block, seq_len),
+            min(selected_block, topk_indices.shape[-1]),
+            time.perf_counter() - started,
+        )
+        return attn_output, None, topk_indices
+
+    attention_cls._acc_blockwise_attention_original = original
+    attention_cls.forward = blockwise_attention_forward
+    attention_cls._acc_blockwise_attention_installed = True
+    return True
+
+
 def install_glm_dsa_blockwise_indexer(
     *, query_block: int | None = None, key_block: int | None = None,
     threshold: int | None = None, parallel_mode: str = "pp",
@@ -354,7 +857,10 @@ def install_glm_dsa_blockwise_indexer(
 ) -> bool:
     """Patch the HF GLM indexer; return whether the class was found."""
     try:
-        from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaIndexer
+        from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
+            GlmMoeDsaAttention,
+            GlmMoeDsaIndexer,
+        )
     except ImportError:
         return False
 
@@ -384,9 +890,17 @@ def install_glm_dsa_blockwise_indexer(
     query_block = query_block or int(os.getenv("ACC_GLM_DSA_QUERY_BLOCK", "1024"))
     key_block = key_block or int(os.getenv("ACC_GLM_DSA_KEY_BLOCK", "4096"))
     threshold = threshold or int(os.getenv("ACC_GLM_DSA_BLOCKWISE_THRESHOLD", "16384"))
+    attention_query_block = int(os.getenv(
+        "ACC_GLM_DSA_ATTN_QUERY_BLOCK", "64"
+    ))
+    attention_selected_block = int(os.getenv(
+        "ACC_GLM_DSA_ATTN_SELECTED_BLOCK", "512"
+    ))
     query_block = max(1, query_block)
     key_block = max(1, key_block)
     threshold = max(1, threshold)
+    attention_query_block = max(1, attention_query_block)
+    attention_selected_block = max(1, attention_selected_block)
     globals_ = getattr(original, "__globals__", {})
     rope = globals_.get("apply_rotary_pos_emb_interleave")
     if rope is None:
@@ -500,17 +1014,42 @@ def install_glm_dsa_blockwise_indexer(
                     candidates, topk, dim=-1, sorted=True)
                 running_indices = candidate_indices.gather(-1, selected)
                 del scores, index_scores, candidates, candidate_indices
-            outputs.append(running_indices.to(torch.int32))
+            query_positions = position_ids[:, q_start:q_end]
+            valid = (
+                (running_indices >= 0)
+                & (running_indices <= query_positions[:, :, None])
+            )
+            outputs.append(torch.where(
+                valid, running_indices, -1
+            ).to(torch.int32))
             del running_values, running_indices, q_tile, w_tile
         return torch.cat(outputs, dim=1)
 
     GlmMoeDsaIndexer._acc_blockwise_original = original
     GlmMoeDsaIndexer.forward = blockwise_forward
     GlmMoeDsaIndexer._acc_blockwise_installed = True
+    attention_ok = _install_glm_dsa_blockwise_attention(
+        GlmMoeDsaAttention,
+        rope,
+        threshold=threshold,
+        query_block=attention_query_block,
+        selected_block=attention_selected_block,
+        parallel_mode=parallel_mode,
+        device_groups=device_groups,
+    )
+    if not attention_ok:
+        logger.warning(
+            "GLM DSA blockwise indexer installed, but attention patch failed; "
+            "long eager attention may still allocate a dense QxK tensor"
+        )
+        return False
     logger.info(
-        "  GLM DSA blockwise indexer 已安装: mode=%s, threshold=%d, "
-        "query_block=%d, key_block=%d, strategy=%s, "
+        "  GLM DSA blockwise runtime 已安装: mode=%s, threshold=%d, "
+        "index_query_block=%d, index_key_block=%d, strategy=%s, "
+        "attn_strategy=%s, attn_query_block=%d, attn_selected_block=%d, "
         "tp_groups=%s",
         parallel_mode, threshold, query_block, key_block, tp_strategy_label,
+        "query_parallel" if parallel_mode == "tp" else "owner_blockwise",
+        attention_query_block, attention_selected_block,
         device_groups if parallel_mode == "tp" else "disabled")
     return True
