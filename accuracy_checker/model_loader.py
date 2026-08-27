@@ -1158,7 +1158,7 @@ class ShardWeightReader:
             for source, target in (
                 ("q_a_proj.", "wq_a."), ("q_b_proj.", "wq_b."),
                 ("q_a_norm.", "q_norm."), ("kv_proj.", "wkv."),
-                ("kv_norm.", "norm."), ("o_a_proj.", "wo_a."),
+                ("o_a_proj.", "wo_a."),
                 ("o_b_proj.", "wo_b."), ("sinks", "attn_sink"),
             ):
                 candidate = candidate.replace(source, target)
