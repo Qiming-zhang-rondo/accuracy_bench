@@ -101,7 +101,7 @@ python3 run_accuracy_check.py --mode boundary \
 
 GLM-5.x 量化 MoE 的 boundary 路径会把 routed expert 以 W4/W8 压缩形态按 layer 常驻所属 NPU，并把同一 chunk 命中的 experts 合并反量化，不再逐 token 从 CPU 搬运 BF16 expert。decode 默认还为每层保留 16 个 BF16 热 expert，prefill 不写入该缓存。`--expert_chunk_size` 控制临时 BF16 峰值，默认 8；显存紧张可降到 4，显存充足可尝试 16。`ACC_BOUNDARY_EXPERT_CACHE_PER_LAYER=0/8/16/...` 可调整热缓存；设置 `ACC_BOUNDARY_RESIDENT_EXPERTS=0` 可回退到 CPU compact streaming 以排查运行时兼容问题。
 
-GLM 的超长 prefill 默认使用 PP（按层分片）并对 DSA indexer 做内存有界的 query/key 分块。若显存允许、希望把昂贵的 `QK^T` 计算分摊到同一侧的多张卡，可加 `--prefill_parallel tp`。TP 默认使用 Query Parallel：每个 helper 只接收自己的 query shard，完整 K 在一次 forward 内复制一次，本地 running top-k 即为 exact 全局结果，最后只回传 indices；模型层和 KV cache 仍按 PP 放置。Ref/Quant 两侧分别复用各自的 `--ref_devices` / `--quant_devices` 设备组，单卡组会自动回退 PP 路径。设置 `ACC_GLM_DSA_TP_STRATEGY=key` 可保留旧 K-axis TP 作为性能基线，默认值为 `query`。
+GLM 的超长 prefill 默认使用 PP（按层分片）并对 DSA indexer 做内存有界的 query/key 分块。若显存允许、希望把昂贵的 `QK^T` 计算分摊到同一侧的多张卡，可加 `--prefill_parallel tp`。TP 默认使用 Query Parallel：helper 按 query block round-robin 分配任务，每个实际计算的 score tensor 的 query 维不超过 `query_block`；完整 K 在一次 forward 内复制一次，本地 running top-k 即为 exact 全局结果，最后只回传 indices。模型层和 KV cache 仍按 PP 放置。Ref/Quant 两侧分别复用各自的 `--ref_devices` / `--quant_devices` 设备组，单卡组会自动回退 PP 路径。设置 `ACC_GLM_DSA_TP_STRATEGY=key` 可保留旧 K-axis TP 作为性能基线，默认值为 `query`。
 
 不想创建请求文件时，可把同一个对象直接传给 `--request_json`（参数指南页面也提供直接粘贴文本框）。如果 prompt 很长，不能把完整 JSON 放进 argv；使用 stdin 方式：
 

@@ -155,23 +155,90 @@ def _tp_indexer_topk(
     return running_indices
 
 
-def _query_shard_ranges(seq_len, query_block, num_devices):
-    """Partition complete query blocks into contiguous, balanced shards."""
+def _query_block_assignments(seq_len, query_block, num_devices):
+    """Assign individual query blocks round-robin to helper devices.
+
+    The assignment deliberately keeps block boundaries intact.  A device may
+    own many blocks, but it must never receive a concatenated mega-shard: the
+    score tensor's query dimension is bounded by ``query_block`` for every
+    invocation below.
+    """
+    if seq_len <= 0 or query_block <= 0 or num_devices <= 0:
+        return [[] for _ in range(max(0, num_devices))]
     blocks = [(start, min(seq_len, start + query_block))
               for start in range(0, seq_len, query_block)]
-    if not blocks:
-        return []
-    num_shards = min(len(blocks), max(1, num_devices))
-    base, remainder = divmod(len(blocks), num_shards)
-    ranges = []
-    cursor = 0
-    for shard in range(num_shards):
-        count = base + (1 if shard < remainder else 0)
-        start = blocks[cursor][0]
-        end = blocks[cursor + count - 1][1]
-        ranges.append((start, end))
-        cursor += count
-    return ranges
+    assignments = [[] for _ in range(num_devices)]
+    for block_index, block in enumerate(blocks):
+        assignments[block_index % len(assignments)].append(block)
+    return assignments
+
+
+def _attention_mask_tile(attention_mask, q_start, q_end, k_start, k_end):
+    """Take only one bounded mask tile; never materialize a Q×full-K slice."""
+    if attention_mask is None:
+        return None
+    if attention_mask.dim() == 3:
+        return attention_mask[:, q_start:q_end, k_start:k_end]
+    if attention_mask.dim() == 4 and attention_mask.shape[1] == 1:
+        return attention_mask[:, 0, q_start:q_end, k_start:k_end]
+    raise ValueError(
+        "GLM DSA indexer expects a [B,Q,K] or singleton-head "
+        "[B,1,Q,K] attention mask"
+    )
+
+
+def _compute_query_block_topk(
+    q_tile, k_full, w_tile, q_start, key_block, topk, position_tile,
+    attention_mask, scale,
+):
+    """Compute one query block's exact running top-k on one device."""
+    batch_size, query_len = q_tile.shape[:2]
+    device = q_tile.device
+    q_float = q_tile.float()
+    w_float = w_tile.float()
+    pos_tile = position_tile
+    local_values = torch.full(
+        (batch_size, query_len, topk), float("-inf"),
+        dtype=torch.float32, device=device,
+    )
+    local_indices = torch.full(
+        (batch_size, query_len, topk), -1,
+        dtype=torch.int64, device=device,
+    )
+    total_keys = k_full.shape[1]
+    for k_start in range(0, total_keys, key_block):
+        k_end = min(total_keys, k_start + key_block)
+        k_tile = k_full[:, k_start:k_end].float()
+        scores = torch.matmul(
+            q_float, k_tile.transpose(-1, -2).unsqueeze(1)
+        ) * scale
+        scores = torch.relu(scores)
+        index_scores = torch.matmul(
+            w_float.unsqueeze(-2), scores
+        ).squeeze(-2)
+        mask_tile = _attention_mask_tile(
+            attention_mask, q_start, q_start + query_len, k_start, k_end
+        )
+        if mask_tile is not None:
+            # The mask transfer, when needed, is bounded by q_block×k_block.
+            if not _same_device(mask_tile.device, device):
+                mask_tile = mask_tile.to(device, non_blocking=True)
+            index_scores = index_scores + mask_tile
+        else:
+            key_positions = torch.arange(k_start, k_end, device=device)
+            causal = key_positions[None, None, :] > pos_tile[:, :, None]
+            index_scores = index_scores.masked_fill(causal, float("-inf"))
+        candidates = torch.cat((local_values, index_scores), dim=-1)
+        candidate_indices = torch.cat((
+            local_indices,
+            torch.arange(k_start, k_end, device=device)
+            .view(1, 1, -1).expand(batch_size, query_len, -1),
+        ), dim=-1)
+        local_values, selected = torch.topk(
+            candidates, topk, dim=-1, sorted=True
+        )
+        local_indices = candidate_indices.gather(-1, selected)
+    return local_indices
 
 
 def _tp_query_parallel_topk(
@@ -181,15 +248,21 @@ def _tp_query_parallel_topk(
     """Exact query-parallel indexer with one K replication per forward.
 
     Query tokens are independent for the indexer top-k.  Each helper therefore
-    receives one contiguous query shard and the full K tensor exactly once;
+    receives individual query blocks and the full K tensor exactly once;
     local running top-k is already the global result for those queries.  Q, K,
     weights and masks are transferred in their source dtype and promoted to
     FP32 only on the destination immediately before matmul.
     """
     seq_len = q.shape[1]
     batch_size = q.shape[0]
-    ranges = _query_shard_ranges(seq_len, query_block, len(devices))
-    if not ranges:
+    assignments = _query_block_assignments(
+        seq_len, query_block, len(devices)
+    )
+    active = [
+        (device, blocks) for device, blocks in zip(devices, assignments)
+        if blocks
+    ]
+    if not active:
         return torch.empty(
             batch_size, 0, topk, dtype=torch.int32, device=base_device
         )
@@ -198,106 +271,77 @@ def _tp_query_parallel_topk(
     # original dtype during the transfer and reuse each copy for all Q blocks.
     t0 = time.perf_counter()
     k_by_device = []
-    for device in devices[:len(ranges)]:
+    for device, _ in active:
         if _same_device(device, base_device):
-            k_by_device.append(k)
+            k_by_device.append((device, k))
         else:
-            k_by_device.append(k.to(device, non_blocking=True))
+            k_by_device.append((device, k.to(device, non_blocking=True)))
     k_replicate_host = time.perf_counter() - t0
 
-    states = []
+    states_by_device = []
     t_dispatch = time.perf_counter()
-    for (q_start, q_end), device, k_dev in zip(ranges, devices, k_by_device):
-        q_shard = q[:, q_start:q_end]
-        w_shard = weights[:, q_start:q_end]
-        pos_shard = position_ids[:, q_start:q_end]
-        mask_shard = None
-        if attention_mask is not None:
-            # The indexer mask is normally [B,Q,K].  Accept a 4-D mask too so
-            # this helper remains usable with newer Transformers releases.
-            if attention_mask.dim() == 3:
-                mask_shard = attention_mask[:, q_start:q_end, :]
-            else:
-                # Indexer scores have no head axis; current HF masks use a
-                # singleton axis here.  Drop it before adding to [B,Q,K].
-                mask_shard = attention_mask[:, 0, q_start:q_end, :]
-        if not _same_device(device, base_device):
-            q_shard = q_shard.to(device, non_blocking=True)
-            w_shard = w_shard.to(device, non_blocking=True)
-            pos_shard = pos_shard.to(device, non_blocking=True)
-            if mask_shard is not None:
-                mask_shard = mask_shard.to(device, non_blocking=True)
-
-        # Preserve the same key-block running-topk order as PP.  The local
-        # result is exact because this helper owns every key for its queries.
-        q_float = q_shard.float()
-        w_float = w_shard.float()
-        local_q_len = q_end - q_start
-        local_values = torch.full(
-            (batch_size, local_q_len, topk), float("-inf"),
-            dtype=torch.float32, device=device,
-        )
-        local_indices = torch.full(
-            (batch_size, local_q_len, topk), -1,
-            dtype=torch.int64, device=device,
-        )
-        for k_start in range(0, k.shape[1], key_block):
-            k_end = min(k.shape[1], k_start + key_block)
-            k_tile = k_dev[:, k_start:k_end].float()
-            scores = torch.matmul(
-                q_float, k_tile.transpose(-1, -2).unsqueeze(1)
-            ) * scale
-            scores = torch.relu(scores)
-            index_scores = torch.matmul(
-                w_float.unsqueeze(-2), scores
-            ).squeeze(-2)
-            if mask_shard is not None:
-                index_scores = index_scores + mask_shard[..., k_start:k_end]
-            else:
-                key_positions = torch.arange(k_start, k_end, device=device)
-                causal = key_positions[None, None, :] > pos_shard[:, :, None]
-                index_scores = index_scores.masked_fill(causal, float("-inf"))
-            candidates = torch.cat((local_values, index_scores), dim=-1)
-            candidate_indices = torch.cat((
-                local_indices,
-                torch.arange(k_start, k_end, device=device)
-                .view(1, 1, -1).expand(batch_size, local_q_len, -1),
-            ), dim=-1)
-            local_values, selected = torch.topk(
-                candidates, topk, dim=-1, sorted=True
+    for (device, blocks), (_, k_dev) in zip(active, k_by_device):
+        block_states = []
+        for q_start, q_end in blocks:
+            # Only this query block is dispatched.  Multiple blocks on one
+            # device remain separate launches and never form a mega-shard.
+            q_tile = q[:, q_start:q_end]
+            w_tile = weights[:, q_start:q_end]
+            pos_tile = position_ids[:, q_start:q_end]
+            if not _same_device(device, base_device):
+                q_tile = q_tile.to(device, non_blocking=True)
+                w_tile = w_tile.to(device, non_blocking=True)
+                pos_tile = pos_tile.to(device, non_blocking=True)
+            local_indices = _compute_query_block_topk(
+                q_tile, k_dev, w_tile, q_start, key_block, topk,
+                pos_tile, attention_mask, scale,
             )
-            local_indices = candidate_indices.gather(-1, selected)
-
-        states.append((q_start, q_end, device, local_indices))
+            block_states.append((q_start, q_end, local_indices))
+        states_by_device.append((device, block_states))
     dispatch_compute_launch_host = time.perf_counter() - t_dispatch
 
     # All helper streams have now been launched.  One barrier per device is
     # sufficient; unlike K-parallel there is no per-query-block synchronize or
     # global candidate merge.
     t_sync = time.perf_counter()
-    for _, _, device, _ in states:
+    for device, _ in states_by_device:
         _synchronise(device)
     sync_host = time.perf_counter() - t_sync
 
     t_gather = time.perf_counter()
-    ordered = []
-    for q_start, q_end, device, indices in states:
+    # Concatenate each device's indices once, then perform one device→owner
+    # copy per helper.  Reconstruct original query order from block offsets.
+    gathered_blocks = []
+    has_remote = False
+    for device, block_states in states_by_device:
+        local_indices = torch.cat(
+            [indices for _, _, indices in block_states], dim=1
+        ).to(torch.int32)
         if not _same_device(device, base_device):
-            indices = indices.to(base_device, non_blocking=True)
-        ordered.append(indices.to(torch.int32))
-    result = torch.cat(ordered, dim=1)
-    # Copies above are queued after the synchronization, so synchronize the
-    # owner only when a remote gather was used before returning to the model.
-    if any(not _same_device(device, base_device) for _, _, device, _ in states):
+            local_indices = local_indices.to(base_device, non_blocking=True)
+            has_remote = True
+        offset = 0
+        for q_start, q_end, _ in block_states:
+            q_len = q_end - q_start
+            gathered_blocks.append((q_start, local_indices[:, offset:offset + q_len]))
+            offset += q_len
+    gathered_blocks.sort(key=lambda item: item[0])
+    result = torch.cat([indices for _, indices in gathered_blocks], dim=1)
+    # Copies above are queued after helper synchronization.  Wait once on the
+    # owner before returning to the model, never once per query block.
+    if has_remote:
         _synchronise(base_device)
     gather_host = time.perf_counter() - t_gather
+    sync_waits = len(states_by_device) + (1 if has_remote else 0)
     logger.info(
         "[GLM DSA TP timing] strategy=query_parallel q=%d k=%d devices=%d "
-        "query_ranges=%s "
+        "query_blocks=%s "
         "K_replicate_launch=%.4fs Q_dispatch+compute_launch=%.4fs "
-        "sync=%.4fs indices_gather=%.4fs total=%.4fs",
-        seq_len, k.shape[1], len(states), ranges, k_replicate_host,
-        dispatch_compute_launch_host, sync_host, gather_host,
+        "sync_wait=%.4fs (waits=%d) indices_gather=%.4fs total=%.4fs "
+        "[host launch timings; device work included in sync_wait]",
+        seq_len, k.shape[1], len(states_by_device),
+        [blocks for _, blocks in active], k_replicate_host,
+        dispatch_compute_launch_host, sync_host, sync_waits, gather_host,
         time.perf_counter() - t0,
     )
     return result

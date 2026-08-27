@@ -375,7 +375,7 @@ def test_boundary_v4_split_expert_store_preserves_forward():
 def test_glm_query_parallel_topk_is_exact_and_ordered_on_cpu():
     """Query shards must match one-device causal running-topk exactly."""
     from accuracy_checker.glm_dsa_blockwise import (
-        _query_shard_ranges,
+        _query_block_assignments,
         _tp_query_parallel_topk,
     )
 
@@ -385,13 +385,7 @@ def test_glm_query_parallel_topk_is_exact_and_ordered_on_cpu():
     k = torch.randn(batch, seq_len, dim, dtype=torch.bfloat16)
     weights = torch.randn(batch, seq_len, heads, dtype=torch.bfloat16)
     position_ids = torch.arange(seq_len, dtype=torch.long).view(1, -1)
-    topk, key_block, scale = 4, 3, 0.7
-
-    assert _query_shard_ranges(seq_len, 2, 3) == [(0, 4), (4, 8), (8, 11)]
-    actual = _tp_query_parallel_topk(
-        q, k, weights, 2, key_block, topk, position_ids, None, scale,
-        ["cpu", "cpu", "cpu"], "cpu",
-    )
+    scale = 0.7
 
     scores = torch.matmul(
         q.float(), k.float().transpose(-1, -2).unsqueeze(1)
@@ -404,10 +398,52 @@ def test_glm_query_parallel_topk_is_exact_and_ordered_on_cpu():
         torch.ones(seq_len, seq_len, dtype=torch.bool), diagonal=1
     )
     expected_scores = expected_scores.masked_fill(causal, float("-inf"))
-    expected = torch.topk(
-        expected_scores, topk, dim=-1, sorted=True
-    ).indices.to(torch.int32)
-    torch.testing.assert_close(actual, expected)
+    causal_mask = torch.zeros(seq_len, seq_len, dtype=torch.float32)
+    causal_mask = causal_mask.masked_fill(
+        torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool), diagonal=1),
+        float("-inf"),
+    ).unsqueeze(0)
+    for topk, key_block, query_block in ((2, 5, 3), (4, 3, 2)):
+        expected = torch.topk(
+            expected_scores, topk, dim=-1, sorted=True
+        ).indices.to(torch.int32)
+        for mask in (None, causal_mask):
+            actual = _tp_query_parallel_topk(
+                q, k, weights, query_block, key_block, topk,
+                position_ids, mask, scale,
+                ["cpu", "cpu", "cpu"], "cpu",
+            )
+            torch.testing.assert_close(actual, expected)
+
+
+def test_glm_query_block_assignment_preserves_block_boundaries_and_balance():
+    from accuracy_checker.glm_dsa_blockwise import _query_block_assignments
+
+    for seq_len, query_block, num_devices, expected_blocks in (
+        (65536, 1024, 8, 64),
+        (10000, 1024, 8, 10),
+    ):
+        assignments = _query_block_assignments(
+            seq_len, query_block, num_devices
+        )
+        assert len(assignments) == num_devices
+        blocks = [block for device_blocks in assignments for block in device_blocks]
+        assert len(blocks) == expected_blocks
+        assert all(q_end - q_start <= query_block for q_start, q_end in blocks)
+        assert sorted(blocks) == [
+            (start, min(seq_len, start + query_block))
+            for start in range(0, seq_len, query_block)
+        ]
+        assert all(
+            len(device_blocks) in {
+                expected_blocks // num_devices,
+                (expected_blocks + num_devices - 1) // num_devices,
+            }
+            for device_blocks in assignments
+        )
+        assert blocks[-1][1] <= seq_len
+        if seq_len == 10000:
+            assert (9216, 10000) in blocks
 
 
 def test_boundary_v4_native_w8_experts_dequantize_per_projection():
