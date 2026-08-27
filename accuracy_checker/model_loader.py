@@ -282,6 +282,84 @@ _MX_QUANT_TYPES = frozenset({"W8A8_MXFP8", "W4A8_MXFP", "W4A4_MXFP4"})
 _MXFP4_QUANT_TYPES = frozenset({"W4A8_MXFP", "W4A4_MXFP4"})
 
 
+def _build_fp8_e4m3fn_lut():
+    """Return the 256-value E4M3FN decode table.
+
+    The table is intentionally built with Python arithmetic rather than by
+    casting a native float8 tensor.  Several torch_npu releases reject that
+    cast on NPU (aclnnInplaceCopy/561103), while integer indexing into a small
+    float32 table is supported.
+    """
+    import math
+
+    values = []
+    for raw in range(256):
+        sign = -1.0 if raw & 0x80 else 1.0
+        exponent = (raw >> 3) & 0x0F
+        mantissa = raw & 0x07
+        if exponent == 0:
+            value = (mantissa / 8.0) * math.ldexp(1.0, -6)
+        elif exponent == 0x0F:
+            # E4M3FN has no infinities.  The top mantissa code is NaN;
+            # mantissas 0..6 are finite (up to 448).
+            value = float("nan") if mantissa == 0x07 else (1.0 + mantissa / 8.0) * 256.0
+        else:
+            value = (1.0 + mantissa / 8.0) * math.ldexp(1.0, exponent - 7)
+        values.append(sign * value)
+    return tuple(values)
+
+
+_FP8_E4M3FN_LUT = _build_fp8_e4m3fn_lut()
+_FP8_E4M3FN_LUT_BY_DEVICE = {}
+
+
+def dequantize_weight_mxfp8_npu(
+    weight_e4m3: Tensor,
+    weight_scale_u8: Tensor,
+    block_size: int = 32,
+    dtype: torch.dtype = torch.bfloat16,
+) -> Tensor:
+    """Decode native E4M3 FP8 bytes on NPU without a float8 cast.
+
+    ``view(torch.uint8)`` is a byte reinterpretation (not a numeric cast),
+    so it avoids the unsupported native-float8 ``.float()`` path.  The actual
+    E4M3FN conversion is a 256-entry lookup on the destination NPU.  If the
+    runtime cannot reinterpret/index the native dtype, the caller can catch
+    the RuntimeError and use the CPU compatibility path.
+    """
+    if weight_e4m3.dim() != 2 or weight_scale_u8.dim() != 2:
+        raise ValueError(
+            "MXFP8 requires 2-D weight and scale; got "
+            f"{tuple(weight_e4m3.shape)} and {tuple(weight_scale_u8.shape)}"
+        )
+    if weight_e4m3.device != weight_scale_u8.device:
+        raise ValueError("MXFP8 weight and scale must be on the same device")
+
+    # This must remain a view: ``to(uint8)`` would be a numeric conversion and
+    # loses the FP8 payload.  The caller may already have performed this view
+    # on CPU before transferring to an NPU that has no native FP8 support.
+    raw = weight_e4m3 if weight_e4m3.dtype == torch.uint8 else weight_e4m3.view(torch.uint8)
+    key = str(weight_e4m3.device)
+    lut = _FP8_E4M3FN_LUT_BY_DEVICE.get(key)
+    if lut is None:
+        lut = torch.tensor(
+            _FP8_E4M3FN_LUT, dtype=torch.float32, device=weight_e4m3.device
+        )
+        _FP8_E4M3FN_LUT_BY_DEVICE[key] = lut
+    w_fp = lut[raw.to(torch.long)]
+
+    shared_exp = weight_scale_u8.to(torch.float32) - 127.0
+    scale_value = torch.pow(2.0, shared_exp)
+    scale_broad = scale_value.repeat_interleave(block_size, dim=1)
+    if scale_broad.shape != w_fp.shape:
+        raise ValueError(
+            "MXFP8 scale shape is incompatible with weight: "
+            f"weight={tuple(weight_e4m3.shape)}, scale={tuple(weight_scale_u8.shape)}, "
+            f"expanded={tuple(scale_broad.shape)}"
+        )
+    return (w_fp * scale_broad).to(dtype)
+
+
 def dequantize_weight_mxfp8(
     weight_e4m3: Tensor,
     weight_scale_u8: Tensor,

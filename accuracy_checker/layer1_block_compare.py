@@ -2304,7 +2304,7 @@ class ShardedBlockComparator:
         """
         from .model_loader import (
             dequantize_weight_mx, _dequant_msslim_weight,
-            dequantize_deepseek_v4_fp4,
+            dequantize_deepseek_v4_fp4, dequantize_weight_mxfp8_npu,
         )
         reader = (
             _ExpertSliceReader(sf_reader, expert_id, num_experts)
@@ -2338,6 +2338,62 @@ class ShardedBlockComparator:
                 return fp
         if w is None:
             raise KeyError(f"streaming expert weight not found: {weight_key}")
+        # Some Ascend torch_npu releases cannot cast a native float8 E4M3
+        # tensor on NPU (aclnnInplaceCopy/561103).  First try the NPU-safe
+        # byte-LUT decoder, which reinterprets the FP8 payload as uint8 and
+        # performs the exact E4M3FN conversion on the target.  If this runtime
+        # does not support that byte view/index operation, fall back to CPU and
+        # transfer only the resulting BF16 matrix.
+        from .utils import normalize_quant_type
+        normalized_w_type = normalize_quant_type(w_type)
+        if (
+            dequant_on_target
+            and normalized_w_type == "W8A8_MXFP8"
+            and str(w.dtype).startswith("torch.float8")
+        ):
+            scale = reader.get_tensor(f"{quant_name}.weight_scale")
+            if scale is None:
+                raise ValueError(
+                    f"MXFP8 scale is missing for float8 expert weight: {weight_key}"
+            )
+            try:
+                w_target = None
+                scale_target = None
+                # Do the byte reinterpretation while the tensor is still on
+                # CPU.  This avoids transferring a native float8 tensor to an
+                # NPU runtime that does not support the dtype at all; uint8 is
+                # only the original FP8 payload, not a numeric conversion.
+                w_cpu_bytes = w if w.dtype == torch.uint8 else w.view(torch.uint8)
+                w_target = w_cpu_bytes.to(device, non_blocking=True)
+                scale_target = scale.to(device, non_blocking=True)
+                fp = dequantize_weight_mxfp8_npu(
+                    w_target, scale_target, dtype=self.dtype,
+                )
+                if not getattr(self, "_streaming_mxfp8_npu_logged", False):
+                    logger.info(
+                        "  [STREAM DEQUANT] FP8 payload transported as uint8; "
+                        "decoded on NPU with byte-LUT (weight=%s)", weight_key,
+                    )
+                    self._streaming_mxfp8_npu_logged = True
+                del w, scale, w_cpu_bytes, w_target, scale_target
+                return fp
+            except (RuntimeError, TypeError, NotImplementedError, ValueError) as exc:
+                if w_target is not None:
+                    del w_target
+                if scale_target is not None:
+                    del scale_target
+                if not getattr(self, "_streaming_mxfp8_cpu_fallback_logged", False):
+                    logger.warning(
+                        "  [STREAM DEQUANT] NPU FP8 byte-LUT unavailable (%s); "
+                        "using CPU MXFP8 decode for routed experts (weight=%s)",
+                        exc, weight_key,
+                    )
+                    self._streaming_mxfp8_cpu_fallback_logged = True
+                fp = dequantize_weight_mx(
+                    w, scale, normalized_w_type, dtype=self.dtype,
+                )
+                del w, scale
+                return fp.to(device, non_blocking=True)
         if w_type == "DEEPSEEK_FP4":
             # The official V4 reference scale uses float8 E8M0, a dtype that
             # some Ascend builds cannot materialize directly.  Decode one
