@@ -11,6 +11,7 @@ L1: 逐block对比
 
 import os
 import time
+import inspect
 from concurrent.futures import ThreadPoolExecutor, wait
 import torch
 import torch.nn as nn
@@ -178,55 +179,13 @@ def _lookup_quant_descriptor(quant_desc: Optional[dict], weight_key: str,
     from .utils import parse_base_name, normalize_quant_type
 
     candidates = [weight_key, parse_base_name(weight_key)]
-    # DeepSeek-V4 ModelScope descriptors omit the Transformers container
-    # prefix (``layers.*`` instead of ``model.layers.*``).
-    for prefix in ("model.model.", "model."):
-        if weight_key.startswith(prefix):
-            candidates.append(weight_key[len(prefix):])
     if weight_key.endswith(".weight"):
         candidates.append(weight_key[:-len(".weight")])
-        for prefix in ("model.model.", "model."):
-            base_key = weight_key[:-len(".weight")]
-            if base_key.startswith(prefix):
-                candidates.append(base_key[len(prefix):])
     else:
         candidates.extend((
             f"{weight_key}.weight",
             parse_base_name(f"{weight_key}.weight"),
         ))
-
-    # DeepSeek-V4 has two independent naming conversions in the wild:
-    # ModelScope's native ``layers.*.ffn.experts.*.w{1,2,3}`` and the
-    # Transformers runtime's ``model.layers.*.mlp.experts.*.{gate,down,up}_proj``.
-    # Quant descriptions are not always exported in the same namespace as the
-    # safetensors keys, so probe both directions here as well.
-    v4_candidates = []
-    for candidate in tuple(candidates):
-        suffix = ""
-        base = candidate
-        for marker in (".weight_scale", ".weight_offset", ".weight"):
-            if base.endswith(marker):
-                base, suffix = base[:-len(marker)], marker
-                break
-        if ".ffn.experts." in base:
-            runtime_base = base.replace(".ffn.experts.", ".mlp.experts.")
-            runtime_base = runtime_base.replace(".w1", ".gate_proj")
-            runtime_base = runtime_base.replace(".w2", ".down_proj")
-            runtime_base = runtime_base.replace(".w3", ".up_proj")
-            bare_runtime = runtime_base.removeprefix("model.")
-            v4_candidates.extend((runtime_base + suffix,
-                                  "model." + bare_runtime + suffix,
-                                  "model.model." + bare_runtime + suffix))
-        if ".mlp.experts." in base:
-            native_base = base.replace(".mlp.experts.", ".ffn.experts.")
-            native_base = native_base.replace(".gate_proj", ".w1")
-            native_base = native_base.replace(".down_proj", ".w2")
-            native_base = native_base.replace(".up_proj", ".w3")
-            bare_native = native_base.removeprefix("model.")
-            v4_candidates.extend((native_base + suffix,
-                                  bare_native + suffix,
-                                  "model." + bare_native + suffix))
-    candidates.extend(v4_candidates)
     for candidate in candidates:
         quant_type = quant_desc.get(candidate)
         if isinstance(quant_type, str):
@@ -424,10 +383,6 @@ class ShardedBlockComparator:
         self._streaming_activation_logged = False
         self.collect_full_logits = collect_full_logits
         self.logits_max_positions = logits_max_positions
-        # Preserve the concrete reason when full-logits capture is unavailable
-        # so a missing HTML panel is diagnosable instead of silent.
-        self._last_logits_error = None
-        self._first_nonfinite_layer = None
         self._activation_hooks = []  # track registered hooks for cleanup
 
         # Load rotation matrix (optional, for rotated quant models like GLM5.1 QuaRot)
@@ -463,11 +418,10 @@ class ShardedBlockComparator:
         if self.num_layers is None:
             text_config = config.get('text_config', {})
             self.num_layers = text_config.get('num_hidden_layers', 64)
-        # V4 ModelScope files also contain three optional ``mtp.N``/DSpark
-        # predictor blocks.  L1 deliberately compares only the main
-        # ``model.layers`` stack; the loader filters MTP names from each
-        # sharded pass unless a complete boundary model explicitly requests
-        # ``include_auxiliary=True``.
+        # NOTE: num_nextn_predict_layers (MTP) 在 config 里有, 但模型权重里
+        # 没有对应的 MTP 层 (safetensors 里无 mtp/nextn 相关 key).
+        # L1 只对比 model.layers ModuleList 中的层 (0..num_hidden_layers-1).
+        # MTP 层是推理框架在 decode 阶段动态加的, 不在静态模型权重里.
 
     def _plan_shards(self, layers_per_shard: int = None) -> List[Tuple[int, int]]:
         """规划分片：返回 [(layer_start, layer_end), ...]"""
@@ -516,8 +470,7 @@ class ShardedBlockComparator:
     def _build_weight_index_and_reader(self):
         """Build weight index and reader for ref/quant models."""
         from .model_loader import (build_weight_index, ShardWeightReader,
-                                   is_quantized_model, is_compressed_tensors_model,
-                                   native_quant_description)
+                                   is_quantized_model, is_compressed_tensors_model)
         from .utils import normalize_quant_desc_values
         import json as _json
 
@@ -530,39 +483,6 @@ class ShardedBlockComparator:
         self._ref_reader = ShardWeightReader(self.ref_model_path, self._ref_weight_map)
         self._quant_reader = ShardWeightReader(self.quant_model_path, self._quant_weight_map)
 
-        if str(self._model_config.get("model_type", "")).lower() == "deepseek_v4":
-            for label, weight_map in (("ref", self._ref_weight_map),
-                                      ("quant", self._quant_weight_map)):
-                native = sum(
-                    key.startswith("layers.") or key.startswith("embed.")
-                    or key.startswith("head.") or key.startswith("norm.")
-                    for key in weight_map
-                )
-                mtp = sum(key.startswith("mtp.") for key in weight_map)
-                if self.verbose:
-                    logger.info(
-                        "  [DeepSeek-V4 keys] %s: %d native bare keys, %d optional "
-                        "MTP/DSpark keys (mtp.0/1/2)", label, native, mtp,
-                    )
-                    model_path = self.ref_model_path if label == "ref" else self.quant_model_path
-                    try:
-                        with open(os.path.join(model_path, "config.json"), encoding="utf-8") as _cf:
-                            model_cfg = _json.load(_cf)
-                    except (OSError, ValueError):
-                        model_cfg = {}
-                    desc_name = (
-                        "quant_model_description.json"
-                        if os.path.exists(os.path.join(model_path, "quant_model_description.json"))
-                        else ("config.json expert_dtype=fp4" if
-                              str(model_cfg.get("expert_dtype", "")).lower() == "fp4"
-                              else "native/other")
-                    )
-                    logger.info(
-                        "  [DeepSeek-V4 source] %s: quantized=%s, compressed_tensors=%s, source=%s",
-                        label, (self._ref_is_quant if label == "ref" else self._quant_is_quant),
-                        (self._ref_is_ct if label == "ref" else self._quant_is_ct), desc_name,
-                    )
-
         # quant_desc
         self._ref_quant_desc = None
         self._quant_quant_desc = None
@@ -573,13 +493,6 @@ class ShardedBlockComparator:
                     self._ref_quant_desc = normalize_quant_desc_values(
                         _json.load(_f)
                     )
-            if self._ref_quant_desc is None:
-                self._ref_quant_desc = native_quant_description(self.ref_model_path)
-                if self._ref_quant_desc is not None and self.verbose:
-                    logger.info(
-                        "  [DeepSeek-V4 ref] detected official packed FP4 experts "
-                        "(.scale, 32-column groups)"
-                    )
         if self._quant_is_quant and not self._quant_is_ct:
             _desc_path = os.path.join(self.quant_model_path, "quant_model_description.json")
             if os.path.exists(_desc_path):
@@ -587,54 +500,62 @@ class ShardedBlockComparator:
                     self._quant_quant_desc = normalize_quant_desc_values(
                         _json.load(_f)
                     )
-            if self._quant_quant_desc is None:
-                self._quant_quant_desc = native_quant_description(self.quant_model_path)
-                if self._quant_quant_desc is not None and self.verbose:
-                    logger.info(
-                        "  [DeepSeek-V4 quant] detected official packed FP4 experts "
-                        "(.scale, 32-column groups)"
-                    )
+
+        # Auto-detect QuaRot rotation matrix from quant_desc
+        if self.R is None and self._quant_quant_desc:
+            _optional = self._quant_quant_desc.get("optional", {})
+            _quarot = _optional.get("quarot", {}) if isinstance(_optional, dict) else {}
+            _rot_map = _quarot.get("rotation_map", {}) if isinstance(_quarot, dict) else {}
+            _rot_file = _rot_map.get("global_rotation")
+            if _rot_file:
+                _rot_path = os.path.join(self.quant_model_path, _rot_file)
+                if os.path.exists(_rot_path):
+                    from .utils import load_rotation_matrix
+                    self.R = load_rotation_matrix(_rot_path)
+                    if self.R is not None and self.verbose:
+                        logger.info(f"  自动检测到 QuaRot 旋转矩阵: {_rot_file}")
 
     def _init_rotary_emb(self, model, device: str):
-        """Initialize global and compressor-owned rotary embeddings."""
-        rotary_modules = [
-            module for module in model.modules()
-            if "rotaryembedding" in type(module).__name__.lower()
-            and hasattr(module, "config")
-            and hasattr(module, "compute_default_rope_parameters")
-        ]
-        if not rotary_modules:
+        """Initialize rotary embedding for a model."""
+        from .utils import get_rotary_emb_module
+        rotary = get_rotary_emb_module(model)
+        if rotary is None:
             return
         single_dev = device.split(',')[0] if ',' in device else device
-        for rotary in rotary_modules:
-            rotary_tensors = tuple(rotary.parameters()) + tuple(rotary.buffers())
-            if any(tensor.is_meta for tensor in rotary_tensors):
-                rotary.to_empty(device=single_dev)
-            else:
-                rotary.to(single_dev)
-            layer_types = getattr(rotary, "layer_types", None)
+        rotary_tensors = tuple(rotary.parameters()) + tuple(rotary.buffers())
+        if any(tensor.is_meta for tensor in rotary_tensors):
+            rotary.to_empty(device=single_dev)
+        else:
+            rotary.to(single_dev)
+        if hasattr(rotary, 'config') and hasattr(rotary, 'compute_default_rope_parameters'):
+            # DeepSeek V4 has multiple layer types (main/compress), each with its own
+            # inv_freq buffer ({layer_type}_inv_freq). Initialize all of them.
+            layer_types = getattr(rotary, 'layer_types', None)
             if layer_types:
-                for layer_type in layer_types:
-                    rope_type = getattr(rotary, "rope_type", {}).get(layer_type, "default")
-                    if rope_type == "default":
-                        init_fn = type(rotary).compute_default_rope_parameters
+                rope_types = getattr(rotary, 'rope_type', {})
+                from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+                for lt in layer_types:
+                    rt = rope_types.get(lt, "default")
+                    if rt != "default" and rt in ROPE_INIT_FUNCTIONS:
+                        rope_init_fn = ROPE_INIT_FUNCTIONS[rt]
                     else:
-                        from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-                        init_fn = ROPE_INIT_FUNCTIONS[rope_type]
-                    inv_freq, scaling = init_fn(
-                        rotary.config, device=single_dev, layer_type=layer_type
+                        rope_init_fn = type(rotary).compute_default_rope_parameters
+                    inv_freq, attn_scaling = rope_init_fn(
+                        rotary.config, layer_type=lt, device=single_dev
                     )
-                    setattr(rotary, f"{layer_type}_inv_freq", inv_freq)
-                    setattr(rotary, f"{layer_type}_original_inv_freq", inv_freq.clone())
-                    setattr(rotary, f"{layer_type}_attention_scaling", scaling)
-                continue
-            inv_freq, attn_scaling = type(rotary).compute_default_rope_parameters(
-                rotary.config, device=single_dev)
-            rotary.inv_freq = inv_freq
-            if hasattr(rotary, 'attention_scaling'):
-                rotary.attention_scaling = attn_scaling
-            if hasattr(rotary, 'original_inv_freq'):
-                rotary.original_inv_freq = inv_freq.clone()
+                    setattr(rotary, f"{lt}_inv_freq", inv_freq)
+                    setattr(rotary, f"{lt}_attention_scaling", attn_scaling)
+                    if hasattr(rotary, f"{lt}_original_inv_freq"):
+                        setattr(rotary, f"{lt}_original_inv_freq", inv_freq.clone())
+            else:
+                inv_freq, attn_scaling = type(rotary).compute_default_rope_parameters(
+                    rotary.config, device=single_dev
+                )
+                rotary.inv_freq = inv_freq
+                if hasattr(rotary, 'attention_scaling'):
+                    rotary.attention_scaling = attn_scaling
+                if hasattr(rotary, 'original_inv_freq'):
+                    rotary.original_inv_freq = inv_freq.clone()
 
     def _init_dual_skeleton_and_embed(self, ref_device: str, quant_device: str):
         """创建 ref/quant 模型骨架 + 加载 embed_tokens + 初始化 rotary_emb。
@@ -762,12 +683,13 @@ class ShardedBlockComparator:
 
             ref_hidden = ref_emb_out.to(ref_device)
             quant_hidden = quant_emb_out.to(quant_device)
-            if str(self._model_config.get("model_type", "")).lower() == "deepseek_v4":
-                hc_mult = int(self._model_config.get("hc_mult", 4))
-                ref_hidden = ref_hidden.unsqueeze(2).expand(
-                    -1, -1, hc_mult, -1).contiguous()
-                quant_hidden = quant_hidden.unsqueeze(2).expand(
-                    -1, -1, hc_mult, -1).contiguous()
+
+            # DeepSeek V4 uses hc_mult parallel residual streams: [B, S, hc_mult, D]
+            hc_mult = getattr(ref_model.config, 'hc_mult', None)
+            if hc_mult and hc_mult > 1 and ref_hidden.dim() == 3:
+                ref_hidden = ref_hidden.unsqueeze(2).expand(-1, -1, hc_mult, -1).contiguous()
+                quant_hidden = quant_hidden.unsqueeze(2).expand(-1, -1, hc_mult, -1).contiguous()
+
             return ref_hidden, quant_hidden, False
         else:
             ref_hidden = ref_hidden_states.to(ref_device) if ref_hidden_states is not None else None
@@ -809,12 +731,10 @@ class ShardedBlockComparator:
         seqlen = ref_input.shape[1]
         p1 = l2_save_cache(self.ref_model_path, self._prompt_text,
                            seqlen, layer_idx, "ref", self.quant_method, ref_input,
-                           layer_state=ref_layer_state,
-                           input_ids=getattr(self, "_input_ids", None))
+                           layer_state=ref_layer_state)
         p2 = l2_save_cache(self.quant_model_path, self._prompt_text,
                            seqlen, layer_idx, "quant", self.quant_method, quant_input,
-                           layer_state=quant_layer_state,
-                           input_ids=getattr(self, "_input_ids", None))
+                           layer_state=quant_layer_state)
         del ref_input, quant_input
 
         if self.l1_target_layers is not None:
@@ -931,13 +851,10 @@ class ShardedBlockComparator:
         for model, device in [(ref_model, ref_device), (quant_model, quant_device)]:
             norm_mod = get_norm_module(model)
             head_mod = get_lm_head_module(model)
-            hc_head = self._get_hc_head(model)
             if norm_mod is not None:
                 norm_mod.to(device)
             if head_mod is not None:
                 head_mod.to(device)
-            if hc_head is not None:
-                hc_head.to(device)
         self._restore_tied_lm_head(
             ref_model, self._ref_weight_map, "ref", ref_device)
         self._restore_tied_lm_head(
@@ -947,8 +864,6 @@ class ShardedBlockComparator:
         quant_hidden = quant_hidden_states.to(quant_device)
 
         with torch.no_grad():
-            ref_hidden = self._collapse_hc_streams(ref_model, ref_hidden)
-            quant_hidden = self._collapse_hc_streams(quant_model, quant_hidden)
             # final_norm
             ref_norm_mod = get_norm_module(ref_model)
             quant_norm_mod = get_norm_module(quant_model)
@@ -992,13 +907,10 @@ class ShardedBlockComparator:
         for model in [ref_model, quant_model]:
             norm_mod = get_norm_module(model)
             head_mod = get_lm_head_module(model)
-            hc_head = self._get_hc_head(model)
             if norm_mod is not None:
                 norm_mod.to('cpu')
             if head_mod is not None:
                 head_mod.to('cpu')
-            if hc_head is not None:
-                hc_head.to('cpu')
 
         import gc
         gc.collect()
@@ -1031,23 +943,6 @@ class ShardedBlockComparator:
         )
 
     @staticmethod
-    def _get_hc_head(model):
-        """Return DeepSeek-V4's final hyper-connection collapse module."""
-        from .utils import get_model_components
-        return getattr(get_model_components(model).text_model, "hc_head", None)
-
-    @classmethod
-    def _collapse_hc_streams(cls, model, hidden_states):
-        if hidden_states.dim() != 4:
-            return hidden_states
-        hc_head = cls._get_hc_head(model)
-        if hc_head is None:
-            raise RuntimeError(
-                "4D hidden streams require DeepSeek-V4 model.hc_head before logits"
-            )
-        return hc_head(hidden_states.to(next(hc_head.parameters()).device))
-
-    @staticmethod
     def _has_explicit_lm_head(model, head_mod, weight_map) -> bool:
         """Whether the checkpoint stores the resolved output module's weight.
 
@@ -1071,18 +966,7 @@ class ShardedBlockComparator:
                 return True
         # Common top-level CausalLM layout; keep this exact so
         # ``verifier_lm_head.weight`` is not treated as the target head.
-        keys = {str(key) for key in weight_map}
-        if "lm_head.weight" in keys:
-            return True
-        # DeepSeek-V4 ModelScope exports call the CausalLM output projection
-        # ``head.weight`` (the runtime module is still ``lm_head``).  Treat it
-        # as explicit so we do not silently replace the trained head with the
-        # embedding table during the logits pass.
-        return (
-            "head.weight" in keys
-            and str(getattr(getattr(model, "config", None), "model_type", "")).lower()
-            == "deepseek_v4"
-        )
+        return "lm_head.weight" in {str(key) for key in weight_map}
 
     def _restore_tied_lm_head(self, model, weight_map, label: str, device) -> bool:
         """Restore an omitted lm_head from this model's embedding table.
@@ -1173,10 +1057,7 @@ class ShardedBlockComparator:
         from .utils import get_norm_module, get_lm_head_module
 
         for model in (ref_model, quant_model):
-            for module in (
-                get_norm_module(model), get_lm_head_module(model),
-                ShardedBlockComparator._get_hc_head(model),
-            ):
+            for module in (get_norm_module(model), get_lm_head_module(model)):
                 if module is None:
                     continue
                 tensors = tuple(module.parameters()) + tuple(module.buffers())
@@ -1206,13 +1087,10 @@ class ShardedBlockComparator:
         for model in [ref_model, quant_model]:
             norm_mod = get_norm_module(model)
             head_mod = get_lm_head_module(model)
-            hc_head = self._get_hc_head(model)
             if norm_mod is not None:
                 norm_mod.to('cpu')
             if head_mod is not None:
                 head_mod.to('cpu')
-            if hc_head is not None:
-                hc_head.to('cpu')
         self._restore_tied_lm_head(ref_model, self._ref_weight_map, "ref", 'cpu')
         self._restore_tied_lm_head(quant_model, self._quant_weight_map, "quant", 'cpu')
 
@@ -1222,13 +1100,10 @@ class ShardedBlockComparator:
         for model in [ref_model, quant_model]:
             norm_mod = get_norm_module(model)
             head_mod = get_lm_head_module(model)
-            hc_head = self._get_hc_head(model)
             if norm_mod is not None:
                 norm_mod.to_empty(device='meta')
             if head_mod is not None:
                 head_mod.to_empty(device='meta')
-            if hc_head is not None:
-                hc_head.to_empty(device='meta')
 
     def _compute_logits_topk_cpu(
         self,
@@ -1249,10 +1124,6 @@ class ShardedBlockComparator:
         quant_head_w = self._validated_lm_head_weight(quant_model, "quant")
 
         with torch.no_grad():
-            ref_hidden_states = self._collapse_hc_streams(
-                ref_model, ref_hidden_states.detach().cpu())
-            quant_hidden_states = self._collapse_hc_streams(
-                quant_model, quant_hidden_states.detach().cpu())
             ref_h = self._apply_real_final_norm(
                 ref_hidden_states, ref_norm_mod, self.dtype)
             quant_h = self._apply_real_final_norm(
@@ -1330,13 +1201,10 @@ class ShardedBlockComparator:
         for model in [ref_model, quant_model]:
             norm_mod = get_norm_module(model)
             head_mod = get_lm_head_module(model)
-            hc_head = self._get_hc_head(model)
             if norm_mod is not None:
                 norm_mod.to('cpu')
             if head_mod is not None:
                 head_mod.to('cpu')
-            if hc_head is not None:
-                hc_head.to('cpu')
         self._restore_tied_lm_head(ref_model, self._ref_weight_map, "ref", 'cpu')
         self._restore_tied_lm_head(quant_model, self._quant_weight_map, "quant", 'cpu')
 
@@ -1377,20 +1245,17 @@ class ShardedBlockComparator:
             N = n
         return ref_logits_np, quant_logits_np, N
 
-    @classmethod
-    def _unload_norm_lm_head(cls, ref_model, quant_model):
+    @staticmethod
+    def _unload_norm_lm_head(ref_model, quant_model):
         """卸载 norm+lm_head 回 meta, 释放 CPU 内存。"""
         from .utils import get_norm_module, get_lm_head_module
         for model in [ref_model, quant_model]:
             norm_mod = get_norm_module(model)
             head_mod = get_lm_head_module(model)
-            hc_head = cls._get_hc_head(model)
             if norm_mod is not None:
                 norm_mod.to_empty(device='meta')
             if head_mod is not None:
                 head_mod.to_empty(device='meta')
-            if hc_head is not None:
-                hc_head.to_empty(device='meta')
         import gc; gc.collect()
         from .utils import clear_device_cache
         clear_device_cache()
@@ -1416,16 +1281,12 @@ class ShardedBlockComparator:
 
         from .logits_compare import LogitsCollection, compare_logits
 
-        self._last_logits_error = None
+        self._materialize_norm_lm_head(ref_model, quant_model)
+        ref_norm_mod, quant_norm_mod, ref_head_w, quant_head_w = (
+            self._get_norm_modules_and_lm_head_weights(ref_model, quant_model)
+        )
+
         try:
-            self._materialize_norm_lm_head(ref_model, quant_model)
-            ref_norm_mod, quant_norm_mod, ref_head_w, quant_head_w = (
-                self._get_norm_modules_and_lm_head_weights(ref_model, quant_model)
-            )
-            ref_hidden_states = self._collapse_hc_streams(
-                ref_model, ref_hidden_states.detach().cpu())
-            quant_hidden_states = self._collapse_hc_streams(
-                quant_model, quant_hidden_states.detach().cpu())
             ref_logits_np, quant_logits_np, N = self._compute_logits_np(
                 ref_hidden_states, quant_hidden_states,
                 ref_norm_mod, quant_norm_mod,
@@ -1453,7 +1314,6 @@ class ShardedBlockComparator:
             comparison = compare_logits(ref_c, quant_c, self.tokenizer, top_k=top_k)
             return comparison.to_logits_data()
         except Exception as e:
-            self._last_logits_error = f"{type(e).__name__}: {e}"
             logger.warning(f"[L1 logits] full logits 采集失败: {e}")
             return None
         finally:
@@ -1466,7 +1326,6 @@ class ShardedBlockComparator:
         **forward_kwargs,
     ) -> 'BlockCompareReport':
         """双设备分片：ref在ref_device，quant在quant_device"""
-        self._first_nonfinite_layer = None
         if self.verbose:
             logger.info(f"[Sharded L1] 开始双设备分片...")
             logger.info(f"[Sharded L1] ref_device: {self.ref_device}, quant_device: {self.quant_device}")
@@ -1654,7 +1513,8 @@ class ShardedBlockComparator:
         非 MoE 层正常 forward (和 _compare_dual_sharded 一样)，
         MoE 层路由到 _moe_forward_chunked 做 expert chunk 跨卡计算。
         """
-        self._first_nonfinite_layer = None
+        # DeepSeek V4 hash router needs input_ids; store for layer forward kwargs
+        self._current_input_ids = input_ids
         # grouped_dual needs an expert range per device.  Use the checkpoint's
         # real expert count (Kimi has 896, not the historical default 256).
         if self.expert_chunk_size is None:
@@ -1879,8 +1739,7 @@ class ShardedBlockComparator:
                 layer, hidden_states, devices, chunk_size,
                 layer_idx=lidx, sf_reader=sf_rdr,
                 quant_desc_str=q_desc, is_quant=is_q, is_ct=is_ct,
-                apply_activation_quant=apply_activation_quant,
-                input_ids=kwargs.get("input_ids"))
+                apply_activation_quant=apply_activation_quant)
         return _chunked_mlp_forward
 
     def _patch_moe_forward_for_layer(self, ref_layer, quant_layer, layer_idx,
@@ -2001,6 +1860,7 @@ class ShardedBlockComparator:
                         quant_moe.forward = quant_orig_mlp_fwd
 
                 self._log_norm_debug(layer_idx, ref_hidden, quant_hidden, "OUT")
+                self._log_dual_post_forward_nan(layer_idx, ref_hidden, quant_hidden)
 
                 is_target = (self.l1_target_layers is not None and layer_idx in self.l1_target_layers)
                 if not is_target and self.l1_target_layers is not None:
@@ -2146,7 +2006,6 @@ class ShardedBlockComparator:
         is_quant: bool = False,
         is_ct: bool = False,
         apply_activation_quant: bool = False,
-        input_ids: Optional[Tensor] = None,
     ) -> Tensor:
         """手动拆解 MoE forward，expert chunk 轮询分发到 devices。
 
@@ -2178,8 +2037,7 @@ class ShardedBlockComparator:
             out = mlp(hidden_states)
             return out[0] if isinstance(out, tuple) else out
 
-        router_logits, precomputed_scores, precomputed_indices = self._resolve_gate_output(
-            gate, hidden_states, input_ids=input_ids)
+        router_logits, precomputed_scores, precomputed_indices = self._resolve_gate_output(gate, hidden_states)
         num_experts_per_tok = self._resolve_num_experts_per_tok(mlp, gate)
 
         # ---- MoE router scoring ----
@@ -2282,12 +2140,6 @@ class ShardedBlockComparator:
     def _streaming_quant_type(quant_desc_str, weight_key, default="FLOAT"):
         """Look up quant type for both Parameter and Linear-style keys."""
         from .utils import normalize_quant_type
-        if (
-            quant_desc_str
-            and quant_desc_str.get("__acc_deepseek_v4_fp4__") == "DEEPSEEK_FP4"
-            and ".experts." in weight_key
-        ):
-            return "DEEPSEEK_FP4"
         return _lookup_quant_descriptor(
             quant_desc_str, weight_key, normalize_quant_type(default)
         )
@@ -2302,10 +2154,7 @@ class ShardedBlockComparator:
         ``ACC_STREAM_DEQUANT_DEVICE=cpu`` only as a compatibility escape hatch
         for an accelerator runtime that lacks one of the required torch ops.
         """
-        from .model_loader import (
-            dequantize_weight_mx, _dequant_msslim_weight,
-            dequantize_deepseek_v4_fp4,
-        )
+        from .model_loader import dequantize_weight_mx, _dequant_msslim_weight
         reader = (
             _ExpertSliceReader(sf_reader, expert_id, num_experts)
             if expert_id is not None and num_experts is not None
@@ -2338,57 +2187,103 @@ class ShardedBlockComparator:
                 return fp
         if w is None:
             raise KeyError(f"streaming expert weight not found: {weight_key}")
-        if w_type == "DEEPSEEK_FP4":
-            # The official V4 reference scale uses float8 E8M0, a dtype that
-            # some Ascend builds cannot materialize directly.  Decode one
-            # selected expert on CPU, then transfer only its BF16 matrix.
-            scale = reader.get_tensor(f"{quant_name}.scale")
-            if scale is None:
-                raise ValueError(
-                    f"DeepSeek-V4 FP4 scale is missing for {weight_key}"
-                )
-            fp = dequantize_deepseek_v4_fp4(w, scale, dtype=self.dtype)
-            del w, scale
-            return fp.to(device, non_blocking=True)
         if w_type == "FLOAT":
-            if is_ct and not w.dtype.is_floating_point:
-                scale = reader.get_tensor(f"{quant_name}.weight_scale")
-                if scale is not None:
-                    if dequant_on_target:
-                        w = w.to(device, non_blocking=True)
-                        scale = scale.to(device, non_blocking=True)
-                        fp = w.to(self.dtype) * scale.to(self.dtype)
-                    else:
-                        fp = (w.to(self.dtype) * scale.to(self.dtype)).to(device)
-                    del w, scale
-                    return fp
             if not w.dtype.is_floating_point:
-                # A few DeepSeek-V4 reference exports contain integer expert
-                # tensors but omit/rename the corresponding descriptor keys.
-                # Infer the safe dynamic format from the scale row count
-                # rather than treating an integer matrix as FLOAT.
-                scale = reader.get_tensor(f"{quant_name}.weight_scale")
-                inferred_type = None
-                if scale is not None and w.dim() == 2:
-                    scale_rows = scale.shape[0] if scale.dim() > 0 else 1
-                    if scale_rows == w.shape[0]:
-                        inferred_type = "W8A8_DYNAMIC"
-                    elif scale_rows == 2 * w.shape[0]:
-                        inferred_type = "W4A8_DYNAMIC"
-                if inferred_type is not None:
-                    dequant_reader = reader
-                    if dequant_on_target:
-                        w = w.to(device, non_blocking=True)
-                        dequant_reader = _DeviceTensorReader(reader, device)
-                    fp, status = _dequant_msslim_weight(
-                        w, inferred_type, quant_name, dequant_reader, self.dtype
-                    )
-                    if fp is not None and status == "loaded":
-                        return fp if dequant_on_target else fp.to(device)
+                # Try .weight_scale (msmodelslim/compressed-tensors) or .scale
+                # (DeepSeek native INT8/FP4 expert checkpoints) to dequantize.
+                # Always dequantize integer weights on CPU — NPU may not
+                # support direct INT8→float copy or multiplication.
+                for scale_key in (
+                    f"{quant_name}.weight_scale",
+                    f"{quant_name}.scale",
+                ):
+                    scale = reader.get_tensor(scale_key)
+                    if scale is not None:
+                        # E8M0 scale + integer weight: could be MXFP8
+                        # (float8_e4m3fn stored as int8, 1 byte/element)
+                        # or MXFP4 (packed 4-bit, 2 values/byte).
+                        # Distinguish by checking whether the MXFP8
+                        # interpretation (1 byte/element) produces a
+                        # weight whose in_features matches the hidden
+                        # size.  If the hidden size is known and
+                        # w.shape[1] (MXFP8) != hidden but
+                        # w.shape[1]*2 (MXFP4) == hidden, use MXFP4.
+                        # Otherwise, fall back to MXFP4 (the original
+                        # behavior) since MXFP8 weights stored as int8
+                        # would have been loaded with float8 dtype.
+                        if (
+                            scale.dtype in (
+                                torch.float8_e8m0fnu,
+                                torch.uint8,
+                            )
+                            and w.dtype in (torch.int8, torch.uint8)
+                            and scale.dim() == 2
+                            and w.dim() == 2
+                            and scale.shape[1] != w.shape[1]
+                        ):
+                            # MXFP4: packed FP4 (int8 storage) with E8M0
+                            # scale.  Use the MXFP4 dequantization path.
+                            from .model_loader import dequantize_weight_mxfp4
+                            block_size = w.shape[1] * 2 // scale.shape[1]
+                            fp = dequantize_weight_mxfp4(
+                                w.view(torch.uint8),
+                                scale.view(torch.uint8)
+                                if scale.dtype == torch.float8_e8m0fnu
+                                else scale,
+                                block_size=block_size,
+                                dtype=self.dtype,
+                            )
+                            fp = fp.to(device)
+                            del w, scale
+                            return fp
+                        # Regular INT8 with float scale: per-group or
+                        # per-channel dequantization.
+                        w_f = w.to(torch.float32)
+                        s_f = scale.to(torch.float32)
+                        if (
+                            w_f.dim() == 2 and s_f.dim() == 2
+                            and s_f.shape[1] != 1
+                            and s_f.shape[1] != w_f.shape[1]
+                        ):
+                            # Per-group quantization: weight [out, in],
+                            # scale [out, groups] → reshape and broadcast.
+                            group_size = w_f.shape[1] // s_f.shape[1]
+                            w_f = w_f.reshape(
+                                s_f.shape[0], s_f.shape[1], group_size
+                            )
+                            s_f = s_f.unsqueeze(-1)
+                            fp = (w_f * s_f).reshape(w.shape[0], w.shape[1])
+                        else:
+                            # Per-channel or per-tensor: direct broadcast.
+                            fp = w_f * s_f
+                        fp = fp.to(self.dtype).to(device)
+                        del w, scale
+                        return fp
                 raise ValueError(
                     "integer streaming expert was classified as FLOAT; "
-                    f"quantization metadata is missing or incompatible for {weight_key}"
+                    f"quantization metadata is missing for {weight_key}"
                 )
+            # float8_e4m3fn weights (DeepSeek V4 native MXFP8): apply
+            # E8M0 per-block scale before casting to target dtype.
+            if str(w.dtype).startswith("torch.float8"):
+                for scale_key in (
+                    f"{quant_name}.weight_scale",
+                    f"{quant_name}.scale",
+                ):
+                    scale = reader.get_tensor(scale_key)
+                    if scale is not None:
+                        from .model_loader import dequantize_weight_mxfp8
+                        s_u8 = (
+                            scale.view(torch.uint8)
+                            if str(scale.dtype).startswith("torch.float8")
+                            else scale
+                        )
+                        fp = dequantize_weight_mxfp8(
+                            w, s_u8, block_size=32, dtype=self.dtype,
+                        )
+                        fp = fp.to(device)
+                        del w, scale
+                        return fp
             fp = w.to(device=device, dtype=self.dtype)
             del w
             return fp
@@ -2475,7 +2370,7 @@ class ShardedBlockComparator:
         if (
             self.activation_quant
             and apply_activation_quant
-            and getattr(self, "verbose", False)
+            and self.verbose
             and not getattr(self, "_streaming_activation_logged", False)
         ):
             logger.info(
@@ -2605,12 +2500,6 @@ class ShardedBlockComparator:
                 or f"{gate}.weight_packed" in weight_map
             ):
                 return names
-            # ShardWeightReader can resolve an internal runtime name to the
-            # official DeepSeek-V4 native name even when the map was assembled
-            # from an unindexed multi-shard export.
-            resolver = getattr(sf_reader, "_resolve_key", None)
-            if callable(resolver) and resolver(f"{gate}.weight")[0] is not None:
-                return names
         return "gate_proj", "up_proj", "down_proj"
 
     @staticmethod
@@ -2627,29 +2516,20 @@ class ShardedBlockComparator:
             if linear_beta is not None:
                 up = float(linear_beta) * torch.tanh(up / float(linear_beta))
             return (gate * up).to(gate_out.dtype)
-        experts = getattr(mlp, "experts", None)
-        limit = getattr(experts, "limit", getattr(mlp, "limit", None))
-        if limit is not None:
-            gate_out = gate_out.clamp(max=float(limit))
-            up_out = up_out.clamp(min=-float(limit), max=float(limit))
-        act_fn = getattr(experts, "act_fn", None)
-        if callable(act_fn):
-            return act_fn(gate_out) * up_out
         return torch.nn.functional.silu(gate_out) * up_out
 
     # ---- MoE chunked forward 辅助方法 (Extract Method 降圈复杂度) ----
 
-    def _resolve_gate_output(self, gate, hidden_states, input_ids=None):
+    def _resolve_gate_output(self, gate, hidden_states):
         """解析 GLM/Qwen3.6/Kimi K3 router 的不同返回约定。"""
         precomputed_scores = None
         precomputed_indices = None
-        if hasattr(gate, "tid2eid"):
-            if input_ids is None:
-                input_ids = getattr(self, "_input_ids", None)
-            if input_ids is None:
-                raise RuntimeError("DeepSeek-V4 hash router requires input_ids")
-            input_ids = input_ids.to(hidden_states.device)
-            gate_out = gate(hidden_states, input_ids)
+        # DeepSeek V4 hash router needs input_ids
+        input_ids = getattr(self, '_current_input_ids', None)
+        import inspect as _inspect
+        gate_sig = _inspect.signature(gate.forward)
+        if "input_ids" in gate_sig.parameters and input_ids is not None:
+            gate_out = gate(hidden_states, input_ids=input_ids)
         else:
             gate_out = gate(hidden_states)
         if isinstance(gate_out, tuple):
@@ -2791,10 +2671,6 @@ class ShardedBlockComparator:
                                    num_experts_per_tok):
         """MoE router scoring 总入口: sigmoid 或 softmax(fallback)。"""
         routed_scaling_factor = getattr(mlp, 'routed_scaling_factor', None)
-        if precomputed_scores is not None and precomputed_indices is not None:
-            # Modern HF routers (including DeepSeek-V4 hash/top-k) already
-            # return normalized, scaled weights and the exact selected ids.
-            return precomputed_scores, precomputed_indices, routed_scaling_factor
         if router_logits is None:
             if precomputed_scores is None or precomputed_indices is None:
                 raise RuntimeError("Router returned no logits and no precomputed top-k")
@@ -2896,12 +2772,7 @@ class ShardedBlockComparator:
         gate_up_out = torch.nn.functional.linear(x_for_gate_up, gate_up_e)
         gate_out = gate_up_out[..., :intermediate_dim]
         up_out = gate_up_out[..., intermediate_dim:]
-        limit = getattr(experts_mod, "limit", None)
-        if limit is not None:
-            gate_out = gate_out.clamp(max=float(limit))
-            up_out = up_out.clamp(min=-float(limit), max=float(limit))
-        act_fn = getattr(experts_mod, "act_fn", torch.nn.functional.silu)
-        act_out = act_fn(gate_out) * up_out
+        act_out = torch.nn.functional.silu(gate_out) * up_out
         if self.activation_quant and apply_activation_quant:
             down_activation_type = _activation_quant_for_weight(
                 down_quant_type, self.activation_quant_type
@@ -2945,23 +2816,30 @@ class ShardedBlockComparator:
             return cached
 
         index = {}
-        # Runtime names normally contain ``model.layers.N``.  The official
-        # ModelScope V4 export drops the container prefix and uses
-        # ``layers.N.ffn.experts`` instead, so parse both forms.
-        import re
-        layer_pattern = re.compile(r"(?:^|\.)layers\.(\d+)\.(.+)$")
+        layer_marker = ".layers."
+        bare_prefix = "layers."
         candidate_attrs = ("block_sparse_moe", "mlp", "moe", "ffn")
         for key in getattr(sf_reader, "weight_map", {}):
-            match = layer_pattern.search(key)
-            if match is None:
+            if layer_marker in key:
+                root, tail = key.split(layer_marker, 1)
+            elif key.startswith(bare_prefix):
+                root = ""
+                tail = key[len(bare_prefix):]
+            else:
                 continue
-            layer_text, remainder = match.groups()
+            layer_text, separator, remainder = tail.partition(".")
+            if not separator or not layer_text.isdigit():
+                continue
             for attr in candidate_attrs:
                 marker = f"{attr}.experts."
                 if remainder.startswith(marker):
+                    if root:
+                        prefix = f"{root}{layer_marker}{layer_text}.{attr}.experts"
+                    else:
+                        prefix = f"{bare_prefix}{layer_text}.{attr}.experts"
                     index.setdefault(
                         (int(layer_text), attr),
-                        key[:match.start(2)] + f"{attr}.experts",
+                        prefix,
                     )
                     break
         try:
@@ -3164,20 +3042,23 @@ class ShardedBlockComparator:
         ref_rotary = get_rotary_emb_module(ref_model)
         quant_rotary = get_rotary_emb_module(quant_model)
         if ref_rotary is not None and quant_rotary is not None:
-            is_v4 = str(self._model_config.get("model_type", "")).lower() == "deepseek_v4"
-            if is_v4:
-                ref_base = ref_hidden[:, :, 0, :] if ref_hidden.dim() == 4 else ref_hidden
-                quant_base = quant_hidden[:, :, 0, :] if quant_hidden.dim() == 4 else quant_hidden
+            # DeepSeek V4 has multiple layer types (main/compress); the attention
+            # layer expects position_embeddings to be a dict keyed by rope_layer_type.
+            ref_layer_types = getattr(ref_rotary, 'layer_types', None)
+            quant_layer_types = getattr(quant_rotary, 'layer_types', None)
+            if ref_layer_types:
                 ref_pe = {
-                    "main": ref_rotary(ref_base, position_ids=ref_position_ids, layer_type="main"),
-                    "compress": ref_rotary(ref_base, position_ids=ref_position_ids, layer_type="compress"),
-                }
-                quant_pe = {
-                    "main": quant_rotary(quant_base, position_ids=quant_position_ids, layer_type="main"),
-                    "compress": quant_rotary(quant_base, position_ids=quant_position_ids, layer_type="compress"),
+                    lt: ref_rotary(ref_hidden, ref_position_ids, layer_type=lt)
+                    for lt in ref_layer_types
                 }
             else:
                 ref_pe = ref_rotary(ref_hidden, ref_position_ids)
+            if quant_layer_types:
+                quant_pe = {
+                    lt: quant_rotary(quant_hidden, quant_position_ids, layer_type=lt)
+                    for lt in quant_layer_types
+                }
+            else:
                 quant_pe = quant_rotary(quant_hidden, quant_position_ids)
         else:
             ref_pe = None
@@ -3297,34 +3178,16 @@ class ShardedBlockComparator:
         quant_group = self._normalized_device_group(getattr(self, "quant_devices", ()))
         return bool(ref_group and quant_group and ref_group.isdisjoint(quant_group))
 
+    @staticmethod
     def _build_single_layer_forward_kwargs(
-        self, layer, hidden_states, position_ids, position_embeddings, previous_state
+        layer, hidden_states, position_ids, position_embeddings, previous_state
     ):
         kwargs = {"position_ids": position_ids}
         if position_embeddings is not None:
             kwargs["position_embeddings"] = position_embeddings
-        is_v4 = "deepseekv4" in type(layer).__name__.lower()
-        attention_mask = None
-        if is_v4:
-            seq_len = hidden_states.shape[1]
-            threshold = int(os.getenv("ACC_DEEPSEEK_V4_BLOCKWISE_THRESHOLD", "8192"))
-            if seq_len <= threshold:
-                window = int(getattr(getattr(layer, "self_attn", None), "sliding_window", seq_len))
-                query = position_ids[:, :, None]
-                key = torch.arange(seq_len, device=hidden_states.device).view(1, 1, -1)
-                valid = (key <= query) & (key > query - window)
-                attention_mask = torch.zeros(
-                    hidden_states.shape[0], 1, seq_len, seq_len,
-                    device=hidden_states.device, dtype=hidden_states.dtype,
-                ).masked_fill(~valid[:, None], float("-inf"))
-            input_ids = getattr(self, "_input_ids", None)
-            if input_ids is not None:
-                kwargs["input_ids"] = input_ids.to(hidden_states.device)
-        else:
-            attention_mask = build_replay_attention_mask(layer, hidden_states)
-        if attention_mask is not None:
-            kwargs["attention_mask"] = attention_mask
-        kwargs.update(self._build_cross_layer_state_kwargs(
+        attention_mask = build_replay_attention_mask(layer, hidden_states)
+        kwargs["attention_mask"] = attention_mask
+        kwargs.update(ShardedBlockComparator._build_cross_layer_state_kwargs(
             layer, previous_state, hidden_states
         ))
         return kwargs
@@ -3362,6 +3225,11 @@ class ShardedBlockComparator:
         quant_fwd_kwargs = self._build_single_layer_forward_kwargs(
             quant_layer, quant_hidden, quant_pos_ids, quant_pe, quant_prev_topk
         )
+        # DeepSeek V4 hash router needs input_ids in the layer forward kwargs
+        input_ids = getattr(self, '_current_input_ids', None)
+        if input_ids is not None:
+            ref_fwd_kwargs["input_ids"] = input_ids
+            quant_fwd_kwargs["input_ids"] = input_ids
 
         if executor is None:
             ref_hidden, ref_prev_topk = self._forward_one_layer_side(
@@ -3402,32 +3270,26 @@ class ShardedBlockComparator:
             logger.debug(f"    ref_layer.{layer_idx} first param device: {next(ref_layers[layer_idx].parameters()).device}")
             logger.debug(f"    quant_layer.{layer_idx} first param device: {next(quant_layers[layer_idx].parameters()).device}")
 
-    def _log_dual_post_forward_nan(self, layer_idx, ref_hidden, quant_hidden):
-        """Forward 后检查 NaN/Inf，并明确报告首个污染层。"""
-        ref_bad = ~torch.isfinite(ref_hidden)
-        quant_bad = ~torch.isfinite(quant_hidden)
-        ref_count = int(ref_bad.sum().item())
-        quant_count = int(quant_bad.sum().item())
-        if ref_count == 0 and quant_count == 0:
-            return
-        first = getattr(self, "_first_nonfinite_layer", None)
-        if first is None:
-            self._first_nonfinite_layer = layer_idx
-            logger.warning(
-                "[L1 nonfinite] first contaminated block: layer.%d "
-                "(ref=%d, quant=%d non-finite values)",
-                layer_idx, ref_count, quant_count,
-            )
+    @staticmethod
+    def _log_dual_post_forward_nan(layer_idx, ref_hidden, quant_hidden):
+        """forward 后 NaN/Inf 检查日志。"""
+        ref_has_nan = torch.isnan(ref_hidden).any() if ref_hidden is not None else False
+        quant_has_nan = torch.isnan(quant_hidden).any() if quant_hidden is not None else False
+        ref_has_inf = torch.isinf(ref_hidden).any() if ref_hidden is not None else False
+        quant_has_inf = torch.isinf(quant_hidden).any() if quant_hidden is not None else False
+        if ref_has_nan or quant_has_nan or ref_has_inf or quant_has_inf:
+            logger.info(f"  [NaN/Inf] layer.{layer_idx}: ref_nan={ref_has_nan}, quant_nan={quant_has_nan}, "
+                        f"ref_inf={ref_has_inf}, quant_inf={quant_has_inf}")
+            if ref_has_nan or ref_has_inf:
+                finite = ref_hidden[torch.isfinite(ref_hidden)]
+                rmax = finite.abs().max().item() if finite.numel() > 0 else float('nan')
+                logger.info(f"    ref bad count: {(torch.isnan(ref_hidden)|torch.isinf(ref_hidden)).sum()}, finite max: {rmax}")
+            if quant_has_nan or quant_has_inf:
+                finite = quant_hidden[torch.isfinite(quant_hidden)]
+                qmax = finite.abs().max().item() if finite.numel() > 0 else float('nan')
+                logger.info(f"    quant bad count: {(torch.isnan(quant_hidden)|torch.isinf(quant_hidden)).sum()}, finite max: {qmax}")
         elif logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "[L1 nonfinite] layer.%d (ref=%d, quant=%d)",
-                layer_idx, ref_count, quant_count,
-            )
-        if logger.isEnabledFor(logging.DEBUG):
-            if ref_count:
-                logger.info("    ref NaN=%d, Inf=%d", int(torch.isnan(ref_hidden).sum()), int(torch.isinf(ref_hidden).sum()))
-            if quant_count:
-                logger.info("    quant NaN=%d, Inf=%d", int(torch.isnan(quant_hidden).sum()), int(torch.isinf(quant_hidden).sum()))
+            logger.debug(f"layer.{layer_idx}: ref_has_nan=False, quant_has_nan=False")
 
     def _forward_dual_layers(self, ref_hidden, quant_hidden, ref_model, quant_model,
                                layer_start, layer_end, ref_pos_ids, quant_pos_ids,
@@ -3502,10 +3364,6 @@ class ShardedBlockComparator:
         if self.l1_target_layers is not None:
             logger.info(f"\n[Sharded L1] 目标层 {sorted(self.l1_target_layers)} 已全部缓存完毕。")
             logger.info(f"  现在可以运行 L2: --l2 --target_layers {' '.join(str(l) for l in sorted(self.l1_target_layers))}")
-            report.logits_error = (
-                "skipped: --l1_target_layers only forwards to the last target layer; "
-                "final hidden states are unavailable for logits capture"
-            )
             return report
         if self.verbose:
             logger.info(f"\n[Sharded L1] 计算 top-k token 对齐{' (CPU)' if use_cpu_topk else ''}...")
@@ -3526,10 +3384,7 @@ class ShardedBlockComparator:
         try:
             report.logits_data = self._collect_full_logits(
                 ref_model, quant_model, ref_hidden_states, quant_hidden_states)
-            if report.logits_data is None:
-                report.logits_error = self._last_logits_error or "not collected"
         except Exception as e:
-            report.logits_error = f"{type(e).__name__}: {e}"
             if self.verbose:
                 logger.warning(f"full logits 采集失败: {e}")
         return report
@@ -3568,7 +3423,6 @@ class ShardedBlockComparator:
             if cache_prompt is not None
             else f"{input_ids.shape[1]}_tokens"
         )
-        self._input_ids = input_ids.detach().cpu()
         if self.compare_mode == "grouped_dual":
             return self._compare_grouped_dual(input_ids, layers_per_shard=layers_per_shard, **kwargs)
         return self._compare_dual_sharded(input_ids, layers_per_shard=layers_per_shard, **kwargs)
