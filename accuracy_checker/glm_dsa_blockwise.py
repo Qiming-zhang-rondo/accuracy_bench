@@ -853,7 +853,8 @@ def _install_glm_dsa_blockwise_attention(
 def install_glm_dsa_blockwise_indexer(
     *, query_block: int | None = None, key_block: int | None = None,
     threshold: int | None = None, parallel_mode: str = "pp",
-    device_groups=None,
+    device_groups=None, attention_query_block: int | None = None,
+    attention_selected_block: int | None = None,
 ) -> bool:
     """Patch the HF GLM indexer; return whether the class was found."""
     try:
@@ -890,12 +891,16 @@ def install_glm_dsa_blockwise_indexer(
     query_block = query_block or int(os.getenv("ACC_GLM_DSA_QUERY_BLOCK", "1024"))
     key_block = key_block or int(os.getenv("ACC_GLM_DSA_KEY_BLOCK", "4096"))
     threshold = threshold or int(os.getenv("ACC_GLM_DSA_BLOCKWISE_THRESHOLD", "16384"))
-    attention_query_block = int(os.getenv(
-        "ACC_GLM_DSA_ATTN_QUERY_BLOCK", "64"
-    ))
-    attention_selected_block = int(os.getenv(
-        "ACC_GLM_DSA_ATTN_SELECTED_BLOCK", "512"
-    ))
+    attention_query_block = int(
+        attention_query_block
+        if attention_query_block is not None
+        else os.getenv("ACC_GLM_DSA_ATTN_QUERY_BLOCK", "64")
+    )
+    attention_selected_block = int(
+        attention_selected_block
+        if attention_selected_block is not None
+        else os.getenv("ACC_GLM_DSA_ATTN_SELECTED_BLOCK", "512")
+    )
     query_block = max(1, query_block)
     key_block = max(1, key_block)
     threshold = max(1, threshold)

@@ -134,6 +134,14 @@ def parse_args():
         help=("GLM 长 prefill 并行方式: pp=保留按层分片（默认）, "
               "tp=在每个 DSA indexer 的 key 维度跨 ref/quant 设备组并行"),
     )
+    parser.add_argument(
+        "--glm_attn_query_block", type=parse_positive_int, default=None,
+        help="GLM 长 prefill attention query block（默认 64；也可用 ACC_GLM_DSA_ATTN_QUERY_BLOCK）",
+    )
+    parser.add_argument(
+        "--glm_attn_selected_block", type=parse_positive_int, default=None,
+        help="GLM 长 prefill selected-key block（默认 512；也可用 ACC_GLM_DSA_ATTN_SELECTED_BLOCK）",
+    )
     parser.add_argument("--cache_top_k", type=int, default=0,
                         help="L1: 缓存 cos_sim 最低的 N 层到 L2 cache (0=不缓存)")
     parser.add_argument("--l1_target_layers", type=int, nargs="+", default=None,
@@ -464,6 +472,8 @@ def run_hf_l1(args, ref_device, target_device, dtype):
     glm_blockwise_ok = install_glm_dsa_blockwise_indexer(
         parallel_mode=getattr(args, "prefill_parallel", "pp"),
         device_groups=[ref_tp_devices, quant_tp_devices],
+        attention_query_block=getattr(args, "glm_attn_query_block", None),
+        attention_selected_block=getattr(args, "glm_attn_selected_block", None),
     )
     if not glm_blockwise_ok and getattr(args, "prefill_parallel", "pp") in {"pp", "tp"}:
         logger.warning(
@@ -697,6 +707,8 @@ def _mode_boundary(args):
         stop_on_first_badcase=args.stop_on_first_badcase,
         expert_chunk_size=args.expert_chunk_size,
         prefill_parallel=getattr(args, "prefill_parallel", "pp"),
+        glm_attn_query_block=getattr(args, "glm_attn_query_block", None),
+        glm_attn_selected_block=getattr(args, "glm_attn_selected_block", None),
     )
     d = boundary_result_to_dict(result)
     logger.info("\n  定界结果: " + d["boundary_result"])

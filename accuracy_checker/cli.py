@@ -72,6 +72,14 @@ def main():
         "--prefill_parallel", choices=["pp", "tp"], default="pp",
         help="GLM 长 prefill: pp=按层分片（默认）, tp=DSA indexer key 维度跨卡",
     )
+    parser.add_argument(
+        "--glm_attn_query_block", type=int, default=None,
+        help="GLM 长 prefill attention query block（默认 64）",
+    )
+    parser.add_argument(
+        "--glm_attn_selected_block", type=int, default=None,
+        help="GLM 长 prefill selected-key block（默认 512）",
+    )
     args = parser.parse_args()
 
     if args.boundary and args.mode == "inference":
@@ -98,6 +106,8 @@ def main():
         use_cpu_dequant=args.use_cpu_dequant,
         noquit=args.noquit,
         prefill_parallel=args.prefill_parallel,
+        glm_attn_query_block=args.glm_attn_query_block,
+        glm_attn_selected_block=args.glm_attn_selected_block,
     )
 
 

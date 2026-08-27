@@ -249,6 +249,8 @@ def _run_transformers_on_path(
     bad_pattern: Optional[Dict[str, Any]] = None,
     expert_chunk_size: Optional[int] = None,
     prefill_parallel: str = "pp",
+    glm_attn_query_block: Optional[int] = None,
+    glm_attn_selected_block: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """在给定 model_path 上跑原生 Transformers generate, 复用 hf_inference_check 加载链。
 
@@ -295,6 +297,8 @@ def _run_transformers_on_path(
             stop_predicate=_is_bad if stop_on_first_badcase else None,
             expert_chunk_size=expert_chunk_size,
             prefill_parallel=prefill_parallel,
+            glm_attn_query_block=glm_attn_query_block,
+            glm_attn_selected_block=glm_attn_selected_block,
         )
     finally:
         try:
@@ -457,6 +461,8 @@ def run_boundary(
     stop_on_first_badcase: bool = False,
     expert_chunk_size: Optional[int] = None,
     prefill_parallel: str = "pp",
+    glm_attn_query_block: Optional[int] = None,
+    glm_attn_selected_block: Optional[int] = None,
 ) -> BoundaryResult:
     """定界主入口 — 区分 WEIGHT / INFERENCE_FRAMEWORK / BOTH / INCONCLUSIVE / INVALID_RUN。
 
@@ -560,7 +566,7 @@ def run_boundary(
         max_new_tokens, framework_gen_config, verbose, bad_pattern,
         evidence, limitations, framework_name, framework_bad_reproduced, fw_reproduced,
         num_runs, concurrency, stop_on_first_badcase, expert_chunk_size,
-        prefill_parallel)
+        prefill_parallel, glm_attn_query_block, glm_attn_selected_block)
     if invalid_result is not None:
         return invalid_result
 
@@ -569,7 +575,7 @@ def run_boundary(
         run_ref, ref_model_path, devices, dtype, messages, thinking,
         max_new_tokens, framework_gen_config, verbose, bad_pattern, evidence, limitations,
         num_runs, concurrency, stop_on_first_badcase, expert_chunk_size,
-        prefill_parallel)
+        prefill_parallel, glm_attn_query_block, glm_attn_selected_block)
 
     # ---- 分类 ----
     result_kind = classify_boundary(fw_reproduced, tq_reproduced, ref_reproduced)
@@ -683,7 +689,9 @@ def _boundary_run_quant(run_quant: bool, quant_model_path: str, devices: str,
                        concurrency: int,
                        stop_on_first_badcase: bool,
                        expert_chunk_size: Optional[int],
-                       prefill_parallel: str = "pp") -> Tuple[Optional[BoundaryResult], Optional[bool]]:
+                       prefill_parallel: str = "pp",
+                       glm_attn_query_block: Optional[int] = None,
+                       glm_attn_selected_block: Optional[int] = None) -> Tuple[Optional[BoundaryResult], Optional[bool]]:
     """transformers(quant) 路径运行; 成功时返回 (None, tq_reproduced),
     失败时返回 (_invalid 结果, None)"""
     if not run_quant:
@@ -694,7 +702,9 @@ def _boundary_run_quant(run_quant: bool, quant_model_path: str, devices: str,
             max_new_tokens, framework_gen_config, verbose, label="quant",
             num_runs=num_runs, concurrency=concurrency,
             stop_on_first_badcase=stop_on_first_badcase, bad_pattern=bad_pattern,
-            expert_chunk_size=expert_chunk_size, prefill_parallel=prefill_parallel)
+            expert_chunk_size=expert_chunk_size, prefill_parallel=prefill_parallel,
+            glm_attn_query_block=glm_attn_query_block,
+            glm_attn_selected_block=glm_attn_selected_block)
         tq_reproduced, summary = _summarize_transformers_runs(
             qt_outputs, num_runs, concurrency, bad_pattern)
         evidence["transformers_run"]["quant"] = summary
@@ -714,7 +724,9 @@ def _boundary_run_ref(run_ref: bool, ref_model_path: Optional[str],
                      limitations: List[str], num_runs: int, concurrency: int,
                      stop_on_first_badcase: bool,
                      expert_chunk_size: Optional[int],
-                     prefill_parallel: str = "pp") -> Optional[bool]:
+                     prefill_parallel: str = "pp",
+                     glm_attn_query_block: Optional[int] = None,
+                     glm_attn_selected_block: Optional[int] = None) -> Optional[bool]:
     """transformers(ref) 路径运行 (可选); 失败时记录到 limitations 不中止"""
     if not (run_ref and ref_model_path):
         return None
@@ -724,7 +736,9 @@ def _boundary_run_ref(run_ref: bool, ref_model_path: Optional[str],
             max_new_tokens, framework_gen_config, verbose, label="ref",
             num_runs=num_runs, concurrency=concurrency,
             stop_on_first_badcase=stop_on_first_badcase, bad_pattern=bad_pattern,
-            expert_chunk_size=expert_chunk_size, prefill_parallel=prefill_parallel)
+            expert_chunk_size=expert_chunk_size, prefill_parallel=prefill_parallel,
+            glm_attn_query_block=glm_attn_query_block,
+            glm_attn_selected_block=glm_attn_selected_block)
         ref_reproduced, summary = _summarize_transformers_runs(
             ref_outputs, num_runs, concurrency, bad_pattern)
         evidence["transformers_run"]["ref"] = summary
@@ -811,6 +825,8 @@ def run_boundary_cli(args):
         stop_on_first_badcase=args.stop_on_first_badcase,
         expert_chunk_size=getattr(args, "expert_chunk_size", None),
         prefill_parallel=getattr(args, "prefill_parallel", "pp"),
+        glm_attn_query_block=getattr(args, "glm_attn_query_block", None),
+        glm_attn_selected_block=getattr(args, "glm_attn_selected_block", None),
     )
 
     out = boundary_result_to_dict(result)

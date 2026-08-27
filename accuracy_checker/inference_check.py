@@ -1763,6 +1763,8 @@ def hf_inference_check(
     request_tools: Optional[List[Dict[str, Any]]] = None,
     expert_chunk_size: Optional[int] = None,
     prefill_parallel: str = "pp",
+    glm_attn_query_block: Optional[int] = None,
+    glm_attn_selected_block: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """
     通用 HF 推理检查入口。
@@ -1800,6 +1802,8 @@ def hf_inference_check(
     glm_blockwise_ok = install_glm_dsa_blockwise_indexer(
         parallel_mode=prefill_parallel,
         device_groups=[device_list],
+        attention_query_block=glm_attn_query_block,
+        attention_selected_block=glm_attn_selected_block,
     )
     if not glm_blockwise_ok:
         logger.warning(

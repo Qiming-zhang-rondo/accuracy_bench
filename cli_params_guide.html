@@ -734,6 +734,16 @@
               </select>
               <span class="hint">GLM 长 prompt 使用 TP 时，按 query block 分配到 Ref/Quant 设备组；每个 score block 受 query_block 限制，完整 K 每层只复制一次，模型层仍按 PP 放置。</span>
             </div>
+            <div id="glmAttnQueryBlockField">
+              <label for="glmAttnQueryBlock">GLM attention query block</label>
+              <input id="glmAttnQueryBlock" type="number" min="1" step="1" value="64">
+              <span class="hint">长 prefill 每次 attention 处理的 query 数；默认 64。增大可减少 launch，但会增加显存。</span>
+            </div>
+            <div id="glmAttnSelectedBlockField">
+              <label for="glmAttnSelectedBlock">GLM attention selected-key block</label>
+              <input id="glmAttnSelectedBlock" type="number" min="1" step="1" value="512">
+              <span class="hint">selected top-k 的分块大小；默认 512。增大可减少循环，但 workspace 按 query×selected 增长。</span>
+            </div>
             <div id="kimiKdaField" class="hidden" aria-hidden="true">
               <label for="kimiKdaBackend">Kimi K3 KDA 后端</label>
               <select id="kimiKdaBackend">
@@ -997,6 +1007,8 @@
             <tr><td><code>--activation_quant_group_size</code></td><td>128</td><td>W4A4_INT4_PER_GROUP 的 hidden-axis 分组大小；其他激活类型忽略。</td></tr>
             <tr><td><code>--compare_mode</code></td><td>dual</td><td>dual / grouped_dual；MoE 推荐 grouped_dual，DSpark 必须 dual。</td></tr>
             <tr><td><code>--prefill_parallel</code></td><td>pp</td><td>GLM 长 prefill：pp 保留按层分片及 owner 单卡 blockwise attention；tp 默认按 query block 跨对应 Ref/Quant 设备组并行 indexer 和 sparse attention。Attention 的完整 K/V 每 helper 每层只复制一次，最后只 gather output；不会回到 dense Q×K。ACC_GLM_DSA_TP_STRATEGY=key 仅用于回退 indexer 的旧 K-axis 基线。默认 attention query=64、selected-key=512，可用 ACC_GLM_DSA_ATTN_QUERY_BLOCK / ACC_GLM_DSA_ATTN_SELECTED_BLOCK 调整显存与 launch 次数。</td></tr>
+            <tr><td><code>--glm_attn_query_block</code></td><td>64</td><td>GLM 长 prefill attention 的 query block 大小。增大可减少 launch 次数，但会增加临时显存；未指定时也可用 ACC_GLM_DSA_ATTN_QUERY_BLOCK。</td></tr>
+            <tr><td><code>--glm_attn_selected_block</code></td><td>512</td><td>GLM attention selected top-k 的分块大小。workspace 近似按 query block×selected block 增长；未指定时也可用 ACC_GLM_DSA_ATTN_SELECTED_BLOCK。</td></tr>
             <tr><td><code>--ref_devices</code></td><td>空</td><td>grouped_dual 的 ref 多卡列表，例如 npu:0,1。</td></tr>
             <tr><td><code>--quant_devices</code></td><td>空</td><td>grouped_dual 的 quant 多卡列表，例如 npu:2,3。</td></tr>
             <tr><td><code>--expert_chunk_size</code></td><td>L1 自动；boundary 8</td><td>L1 grouped_dual 或 boundary resident expert 的临时反量化分块；越小越省峰值显存。</td></tr>
@@ -1038,7 +1050,7 @@
       var ids = [
         "refModel", "quantModel", "mode", "modelType", "visibleDevices",
         "modelSizeB", "perDeviceMemory", "refDevices", "quantDevices",
-        "compareMode", "prefillParallel", "kimiKdaBackend", "layersPerShard",
+        "compareMode", "prefillParallel", "glmAttnQueryBlock", "glmAttnSelectedBlock", "kimiKdaBackend", "layersPerShard",
         "quantMethod", "dtype", "activationQuantType", "activationQuantBackend", "activationQuantGroupSize", "cacheTopK", "cacheDir", "mlaFine",
         "outputDir", "prompt", "rawPromptFile", "promptFile", "requestJson", "numRuns", "concurrency",
         "maxNewTokens", "noRef", "frameworkReproduced", "stopOnFirstBadcase",
@@ -1202,6 +1214,8 @@
         var grouped = compare === "grouped_dual";
         setFieldVisibility("compareModeField", l1Flow && !dspark);
         setFieldVisibility("prefillParallelField", l1Flow && !dspark);
+        setFieldVisibility("glmAttnQueryBlockField", l1Flow && !dspark);
+        setFieldVisibility("glmAttnSelectedBlockField", l1Flow && !dspark);
         setFieldVisibility("layersPerShardField", l1Flow && !dspark);
         setFieldVisibility("perDeviceMemoryField", l1Flow && !dspark);
         setFieldVisibility("quantMethodField", l1Flow || l2Flow);
@@ -1338,6 +1352,12 @@
         }
         if (!dspark && ["l1", "full"].indexOf(mode) !== -1 && (!/^\d+$/.test(el.layersPerShard.value) || Number(el.layersPerShard.value) < 1)) {
           addIssue(errors, "layersPerShard", "layers_per_shard 必须是大于 0 的整数");
+        }
+        if (!dspark && ["l1", "full"].indexOf(mode) !== -1 && (!/^\d+$/.test(el.glmAttnQueryBlock.value) || Number(el.glmAttnQueryBlock.value) < 1)) {
+          addIssue(errors, "glmAttnQueryBlock", "GLM attention query block 必须是大于 0 的整数");
+        }
+        if (!dspark && ["l1", "full"].indexOf(mode) !== -1 && (!/^\d+$/.test(el.glmAttnSelectedBlock.value) || Number(el.glmAttnSelectedBlock.value) < 1)) {
+          addIssue(errors, "glmAttnSelectedBlock", "GLM attention selected-key block 必须是大于 0 的整数");
         }
         if (!dspark && ["l1", "full"].indexOf(mode) !== -1 && (!/^\d+$/.test(el.cacheTopK.value) || Number(el.cacheTopK.value) < 0)) {
           addIssue(errors, "cacheTopK", "cache_top_k 必须是非负整数");
@@ -1547,6 +1567,8 @@
             args.push(line("--compare_mode", compare));
             if (el.prefillParallel.value === "tp") args.push(line("--prefill_parallel", "tp"));
             args.push(line("--layers_per_shard", el.layersPerShard.value || "2"));
+            args.push(line("--glm_attn_query_block", el.glmAttnQueryBlock.value || "64"));
+            args.push(line("--glm_attn_selected_block", el.glmAttnSelectedBlock.value || "512"));
             args.push(line("--cache_top_k", el.cacheTopK.value || "0"));
             args.push(line("--quant_method", quantMethod));
             args.push(line("--dtype", el.dtype.value));
