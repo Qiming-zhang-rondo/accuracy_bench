@@ -34,6 +34,8 @@ def main():
                         help="直接粘贴完整 OpenAI/vLLM 请求 JSON")
     parser.add_argument("--request_json_stdin", action="store_true",
                         help="从 stdin 读取完整请求 JSON，适合超长 prompt")
+    parser.add_argument("--prompt_stdin", action="store_true",
+                        help="从 stdin 读取原始 prompt，适合超长文本")
     parser.add_argument("--use_cpu_dequant", action="store_true",
                         help="回退到旧 CPU 全量反量化流程")
     parser.add_argument("--noquit", action="store_true",
@@ -79,6 +81,9 @@ def main():
         if args.request_json_stdin:
             import sys
             args.request_json = sys.stdin.read()
+        elif args.prompt_stdin:
+            import sys
+            args.prompt = sys.stdin.read()
         _run_boundary_cli(args)
         return
 

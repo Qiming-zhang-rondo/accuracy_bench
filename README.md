@@ -118,6 +118,8 @@ cat <<'REQUEST_JSON' | python3 run_accuracy_check.py --mode boundary \\
 REQUEST_JSON
 ```
 
+Boundary 也可以直接在参数页的 Prompt 文本框粘贴已渲染的超长 Jinja/ChatML 文本；页面会生成 `--prompt_stdin` heredoc，避免把全文放进命令行参数。
+
 如果对方给的是已经包含 `[gMASK]`、`<|sop>`、`<|assistant|><think>` 等标记的完整 Jinja/ChatML 字符串，建议原样保存为 `prompt.txt`，然后使用：
 
 ```bash

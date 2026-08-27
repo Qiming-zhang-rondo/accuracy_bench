@@ -100,6 +100,8 @@ def parse_args():
                         help="[boundary] 直接粘贴完整 OpenAI/vLLM 请求 JSON")
     parser.add_argument("--request_json_stdin", action="store_true",
                         help="[boundary] 从 stdin 读取完整请求 JSON，适合超长 prompt")
+    parser.add_argument("--prompt_stdin", action="store_true",
+                        help="[boundary] 从 stdin 读取原始 prompt，适合超长文本")
     parser.add_argument("--target_layers", type=str, default=None,
                         help="L2 只检查指定层 (逗号或空格分隔, 如 '8,9' 或 '8 9')")
     parser.add_argument("--target-layers", dest="target_layers_alt", type=str, default=None,
@@ -652,6 +654,8 @@ def _mode_boundary(args):
         request_raw = args.request_json
         if args.request_json_stdin:
             request_raw = sys.stdin.read()
+        elif args.prompt_stdin:
+            args.prompt = sys.stdin.read()
         request_payload = parse_request_json(request_raw) if request_raw else None
     except ValueError as exc:
         logger.error(f"  Boundary 请求 JSON 无效: {exc}")
