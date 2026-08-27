@@ -730,9 +730,9 @@
               <label for="prefillParallel">长 Prefill 并行</label>
               <select id="prefillParallel">
                 <option value="pp">pp · 按层分片（默认）</option>
-                <option value="tp">tp · DSA key 维度跨卡</option>
+                <option value="tp">tp · DSA query 维度跨卡</option>
               </select>
-              <span class="hint">GLM 长 prompt 使用 TP 时，复用 Ref/Quant 逻辑设备组并行计算 indexer；模型层仍按 PP 放置。</span>
+              <span class="hint">GLM 长 prompt 使用 TP 时，按 query shard 分配到 Ref/Quant 设备组；完整 K 每层只复制一次，模型层仍按 PP 放置。</span>
             </div>
             <div id="kimiKdaField" class="hidden" aria-hidden="true">
               <label for="kimiKdaBackend">Kimi K3 KDA 后端</label>
@@ -995,7 +995,7 @@
             <tr><td><code>--activation_quant_backend</code></td><td>auto</td><td>W4A4_DYNAMIC 在 NPU 上默认使用原生 npu_dynamic_quant；torch 仅用于无 NPU 自检或算子差异诊断。</td></tr>
             <tr><td><code>--activation_quant_group_size</code></td><td>128</td><td>W4A4_INT4_PER_GROUP 的 hidden-axis 分组大小；其他激活类型忽略。</td></tr>
             <tr><td><code>--compare_mode</code></td><td>dual</td><td>dual / grouped_dual；MoE 推荐 grouped_dual，DSpark 必须 dual。</td></tr>
-            <tr><td><code>--prefill_parallel</code></td><td>pp</td><td>GLM 长 prefill：pp 保留按层分片；tp 将 DSA indexer 的 key block 跨对应 Ref/Quant 设备组并行，再合并全局 top-k。</td></tr>
+            <tr><td><code>--prefill_parallel</code></td><td>pp</td><td>GLM 长 prefill：pp 保留按层分片；tp 默认按 query shard 跨对应 Ref/Quant 设备组并行，完整 K 每层复制一次并直接返回 exact top-k。可用 ACC_GLM_DSA_TP_STRATEGY=key 回退旧 K-axis 基线。</td></tr>
             <tr><td><code>--ref_devices</code></td><td>空</td><td>grouped_dual 的 ref 多卡列表，例如 npu:0,1。</td></tr>
             <tr><td><code>--quant_devices</code></td><td>空</td><td>grouped_dual 的 quant 多卡列表，例如 npu:2,3。</td></tr>
             <tr><td><code>--expert_chunk_size</code></td><td>L1 自动；boundary 8</td><td>L1 grouped_dual 或 boundary resident expert 的临时反量化分块；越小越省峰值显存。</td></tr>

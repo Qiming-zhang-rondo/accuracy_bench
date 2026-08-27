@@ -372,6 +372,44 @@ def test_boundary_v4_split_expert_store_preserves_forward():
         assert torch.equal(down, weights[f"{native}.{expert_id}.w2.weight"])
 
 
+def test_glm_query_parallel_topk_is_exact_and_ordered_on_cpu():
+    """Query shards must match one-device causal running-topk exactly."""
+    from accuracy_checker.glm_dsa_blockwise import (
+        _query_shard_ranges,
+        _tp_query_parallel_topk,
+    )
+
+    torch.manual_seed(7)
+    batch, seq_len, heads, dim = 1, 11, 3, 5
+    q = torch.randn(batch, seq_len, heads, dim, dtype=torch.bfloat16)
+    k = torch.randn(batch, seq_len, dim, dtype=torch.bfloat16)
+    weights = torch.randn(batch, seq_len, heads, dtype=torch.bfloat16)
+    position_ids = torch.arange(seq_len, dtype=torch.long).view(1, -1)
+    topk, key_block, scale = 4, 3, 0.7
+
+    assert _query_shard_ranges(seq_len, 2, 3) == [(0, 4), (4, 8), (8, 11)]
+    actual = _tp_query_parallel_topk(
+        q, k, weights, 2, key_block, topk, position_ids, None, scale,
+        ["cpu", "cpu", "cpu"], "cpu",
+    )
+
+    scores = torch.matmul(
+        q.float(), k.float().transpose(-1, -2).unsqueeze(1)
+    ) * scale
+    scores = torch.relu(scores)
+    expected_scores = torch.matmul(
+        weights.float().unsqueeze(-2), scores
+    ).squeeze(-2)
+    causal = torch.triu(
+        torch.ones(seq_len, seq_len, dtype=torch.bool), diagonal=1
+    )
+    expected_scores = expected_scores.masked_fill(causal, float("-inf"))
+    expected = torch.topk(
+        expected_scores, topk, dim=-1, sorted=True
+    ).indices.to(torch.int32)
+    torch.testing.assert_close(actual, expected)
+
+
 def test_boundary_v4_native_w8_experts_dequantize_per_projection():
     from accuracy_checker.resident_experts import (
         _build_v4_split_store,

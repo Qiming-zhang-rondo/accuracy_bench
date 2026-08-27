@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 import torch
 
@@ -154,6 +155,154 @@ def _tp_indexer_topk(
     return running_indices
 
 
+def _query_shard_ranges(seq_len, query_block, num_devices):
+    """Partition complete query blocks into contiguous, balanced shards."""
+    blocks = [(start, min(seq_len, start + query_block))
+              for start in range(0, seq_len, query_block)]
+    if not blocks:
+        return []
+    num_shards = min(len(blocks), max(1, num_devices))
+    base, remainder = divmod(len(blocks), num_shards)
+    ranges = []
+    cursor = 0
+    for shard in range(num_shards):
+        count = base + (1 if shard < remainder else 0)
+        start = blocks[cursor][0]
+        end = blocks[cursor + count - 1][1]
+        ranges.append((start, end))
+        cursor += count
+    return ranges
+
+
+def _tp_query_parallel_topk(
+    q, k, weights, query_block, key_block, topk, position_ids,
+    attention_mask, scale, devices, base_device,
+):
+    """Exact query-parallel indexer with one K replication per forward.
+
+    Query tokens are independent for the indexer top-k.  Each helper therefore
+    receives one contiguous query shard and the full K tensor exactly once;
+    local running top-k is already the global result for those queries.  Q, K,
+    weights and masks are transferred in their source dtype and promoted to
+    FP32 only on the destination immediately before matmul.
+    """
+    seq_len = q.shape[1]
+    batch_size = q.shape[0]
+    ranges = _query_shard_ranges(seq_len, query_block, len(devices))
+    if not ranges:
+        return torch.empty(
+            batch_size, 0, topk, dtype=torch.int32, device=base_device
+        )
+
+    # K is the only large tensor replicated to every helper.  Keep the
+    # original dtype during the transfer and reuse each copy for all Q blocks.
+    t0 = time.perf_counter()
+    k_by_device = []
+    for device in devices[:len(ranges)]:
+        if _same_device(device, base_device):
+            k_by_device.append(k)
+        else:
+            k_by_device.append(k.to(device, non_blocking=True))
+    k_replicate_host = time.perf_counter() - t0
+
+    states = []
+    t_dispatch = time.perf_counter()
+    for (q_start, q_end), device, k_dev in zip(ranges, devices, k_by_device):
+        q_shard = q[:, q_start:q_end]
+        w_shard = weights[:, q_start:q_end]
+        pos_shard = position_ids[:, q_start:q_end]
+        mask_shard = None
+        if attention_mask is not None:
+            # The indexer mask is normally [B,Q,K].  Accept a 4-D mask too so
+            # this helper remains usable with newer Transformers releases.
+            if attention_mask.dim() == 3:
+                mask_shard = attention_mask[:, q_start:q_end, :]
+            else:
+                # Indexer scores have no head axis; current HF masks use a
+                # singleton axis here.  Drop it before adding to [B,Q,K].
+                mask_shard = attention_mask[:, 0, q_start:q_end, :]
+        if not _same_device(device, base_device):
+            q_shard = q_shard.to(device, non_blocking=True)
+            w_shard = w_shard.to(device, non_blocking=True)
+            pos_shard = pos_shard.to(device, non_blocking=True)
+            if mask_shard is not None:
+                mask_shard = mask_shard.to(device, non_blocking=True)
+
+        # Preserve the same key-block running-topk order as PP.  The local
+        # result is exact because this helper owns every key for its queries.
+        q_float = q_shard.float()
+        w_float = w_shard.float()
+        local_q_len = q_end - q_start
+        local_values = torch.full(
+            (batch_size, local_q_len, topk), float("-inf"),
+            dtype=torch.float32, device=device,
+        )
+        local_indices = torch.full(
+            (batch_size, local_q_len, topk), -1,
+            dtype=torch.int64, device=device,
+        )
+        for k_start in range(0, k.shape[1], key_block):
+            k_end = min(k.shape[1], k_start + key_block)
+            k_tile = k_dev[:, k_start:k_end].float()
+            scores = torch.matmul(
+                q_float, k_tile.transpose(-1, -2).unsqueeze(1)
+            ) * scale
+            scores = torch.relu(scores)
+            index_scores = torch.matmul(
+                w_float.unsqueeze(-2), scores
+            ).squeeze(-2)
+            if mask_shard is not None:
+                index_scores = index_scores + mask_shard[..., k_start:k_end]
+            else:
+                key_positions = torch.arange(k_start, k_end, device=device)
+                causal = key_positions[None, None, :] > pos_shard[:, :, None]
+                index_scores = index_scores.masked_fill(causal, float("-inf"))
+            candidates = torch.cat((local_values, index_scores), dim=-1)
+            candidate_indices = torch.cat((
+                local_indices,
+                torch.arange(k_start, k_end, device=device)
+                .view(1, 1, -1).expand(batch_size, local_q_len, -1),
+            ), dim=-1)
+            local_values, selected = torch.topk(
+                candidates, topk, dim=-1, sorted=True
+            )
+            local_indices = candidate_indices.gather(-1, selected)
+
+        states.append((q_start, q_end, device, local_indices))
+    dispatch_compute_launch_host = time.perf_counter() - t_dispatch
+
+    # All helper streams have now been launched.  One barrier per device is
+    # sufficient; unlike K-parallel there is no per-query-block synchronize or
+    # global candidate merge.
+    t_sync = time.perf_counter()
+    for _, _, device, _ in states:
+        _synchronise(device)
+    sync_host = time.perf_counter() - t_sync
+
+    t_gather = time.perf_counter()
+    ordered = []
+    for q_start, q_end, device, indices in states:
+        if not _same_device(device, base_device):
+            indices = indices.to(base_device, non_blocking=True)
+        ordered.append(indices.to(torch.int32))
+    result = torch.cat(ordered, dim=1)
+    # Copies above are queued after the synchronization, so synchronize the
+    # owner only when a remote gather was used before returning to the model.
+    if any(not _same_device(device, base_device) for _, _, device, _ in states):
+        _synchronise(base_device)
+    gather_host = time.perf_counter() - t_gather
+    logger.info(
+        "[GLM DSA TP timing] strategy=query_parallel q=%d k=%d devices=%d "
+        "query_ranges=%s "
+        "K_replicate_launch=%.4fs Q_dispatch+compute_launch=%.4fs "
+        "sync=%.4fs indices_gather=%.4fs total=%.4fs",
+        seq_len, k.shape[1], len(states), ranges, k_replicate_host,
+        dispatch_compute_launch_host, sync_host, gather_host,
+        time.perf_counter() - t0,
+    )
+    return result
+
+
 def install_glm_dsa_blockwise_indexer(
     *, query_block: int | None = None, key_block: int | None = None,
     threshold: int | None = None, parallel_mode: str = "pp",
@@ -175,6 +324,18 @@ def install_glm_dsa_blockwise_indexer(
     if parallel_mode not in {"pp", "tp"}:
         raise ValueError("GLM prefill parallel_mode must be 'pp' or 'tp'")
     device_groups = _normalise_device_groups(device_groups)
+    tp_strategy = os.getenv("ACC_GLM_DSA_TP_STRATEGY", "query").strip().lower()
+    if tp_strategy in {"query_parallel", "query-parallel"}:
+        tp_strategy = "query"
+    if tp_strategy in {"key_parallel", "key-parallel"}:
+        tp_strategy = "key"
+    if tp_strategy not in {"query", "key"}:
+        raise ValueError(
+            "ACC_GLM_DSA_TP_STRATEGY must be 'query' (default) or 'key'"
+        )
+    tp_strategy_label = (
+        "query_parallel" if tp_strategy == "query" else "key_parallel"
+    )
 
     query_block = query_block or int(os.getenv("ACC_GLM_DSA_QUERY_BLOCK", "1024"))
     key_block = key_block or int(os.getenv("ACC_GLM_DSA_KEY_BLOCK", "4096"))
@@ -210,8 +371,10 @@ def install_glm_dsa_blockwise_indexer(
         if past_key_values is not None:
             k = past_key_values.update_indexer(k, self.layer_idx)
 
+        # Keep transport dtype intact.  Both TP implementations promote on
+        # the destination immediately before the score matmul.
         weights = self.weights_proj(
-            hidden_states.to(self.weights_proj.weight.dtype)).float()
+            hidden_states.to(self.weights_proj.weight.dtype))
         weights = weights * (self.n_heads ** -0.5)
         total_keys = k.shape[1]
         topk = min(self.index_topk, total_keys)
@@ -226,12 +389,19 @@ def install_glm_dsa_blockwise_indexer(
                 tp_devices = []
         if tp_devices:
             logger.debug(
-                "GLM DSA TP indexer layer=%s source=%s devices=%s",
-                self.layer_idx, q.device, tp_devices)
+                "GLM DSA TP indexer layer=%s strategy=%s source=%s devices=%s",
+                self.layer_idx,
+                "query_parallel" if tp_strategy == "query" else "key_parallel",
+                q.device, tp_devices)
+        if tp_devices and tp_strategy == "query":
+            return _tp_query_parallel_topk(
+                q, k, weights, query_block, key_block, topk, position_ids,
+                attention_mask, scale, tp_devices, q.device,
+            )
         for q_start in range(0, seq_len, query_block):
             q_end = min(seq_len, q_start + query_block)
             q_tile = q[:, q_start:q_end].float()
-            w_tile = weights[:, q_start:q_end]
+            w_tile = weights[:, q_start:q_end].float()
             if tp_devices:
                 outputs.append(_tp_indexer_topk(
                     q_tile, k, w_tile, q_start, key_block, topk,
@@ -281,7 +451,8 @@ def install_glm_dsa_blockwise_indexer(
     GlmMoeDsaIndexer._acc_blockwise_installed = True
     logger.info(
         "  GLM DSA blockwise indexer 已安装: mode=%s, threshold=%d, "
-        "query_block=%d, key_block=%d, tp_groups=%s",
-        parallel_mode, threshold, query_block, key_block,
+        "query_block=%d, key_block=%d, strategy=%s, "
+        "tp_groups=%s",
+        parallel_mode, threshold, query_block, key_block, tp_strategy_label,
         device_groups if parallel_mode == "tp" else "disabled")
     return True
