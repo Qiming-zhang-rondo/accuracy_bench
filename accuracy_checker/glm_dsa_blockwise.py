@@ -390,8 +390,22 @@ def install_glm_dsa_blockwise_indexer(
     globals_ = getattr(original, "__globals__", {})
     rope = globals_.get("apply_rotary_pos_emb_interleave")
     if rope is None:
-        logger.warning("GLM DSA interleaved RoPE helper not found; blockwise disabled")
-        return False
+        # Transformers releases generated from the modular GLM source may
+        # resolve the helper through the DeepSeek-V3 module rather than keep
+        # it in modeling_glm_moe_dsa.__globals__.  Import the canonical
+        # implementation explicitly instead of silently falling back to the
+        # eager indexer (which materializes the huge [Q,H,K] score tensor).
+        try:
+            from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
+                apply_rotary_pos_emb_interleave,
+            )
+            rope = apply_rotary_pos_emb_interleave
+        except (ImportError, AttributeError):
+            logger.warning(
+                "GLM DSA interleaved RoPE helper not found; blockwise disabled "
+                "(eager indexer may OOM on long prompts)"
+            )
+            return False
 
     @torch.no_grad()
     def blockwise_forward(self, hidden_states, q_resid, position_embeddings,

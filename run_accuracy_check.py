@@ -461,10 +461,15 @@ def run_hf_l1(args, ref_device, target_device, dtype):
     from accuracy_checker.deepseek_v4_blockwise import install_deepseek_v4_blockwise_runtime
     ref_tp_devices = _parse_dev_list(getattr(args, "ref_devices", None)) or [ref_device]
     quant_tp_devices = _parse_dev_list(getattr(args, "quant_devices", None)) or [target_device]
-    install_glm_dsa_blockwise_indexer(
+    glm_blockwise_ok = install_glm_dsa_blockwise_indexer(
         parallel_mode=getattr(args, "prefill_parallel", "pp"),
         device_groups=[ref_tp_devices, quant_tp_devices],
     )
+    if not glm_blockwise_ok and getattr(args, "prefill_parallel", "pp") in {"pp", "tp"}:
+        logger.warning(
+            "  GLM DSA blockwise indexer 未安装；长 prompt 将使用 Transformers "
+            "eager indexer，可能产生超大 score tensor"
+        )
     install_deepseek_v4_blockwise_runtime()
     from accuracy_checker import ShardedBlockComparator
 

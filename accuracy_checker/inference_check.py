@@ -1797,10 +1797,15 @@ def hf_inference_check(
     # while each indexer splits the expensive key-axis score matmul over all
     # cards in this device group.
     from .glm_dsa_blockwise import install_glm_dsa_blockwise_indexer
-    install_glm_dsa_blockwise_indexer(
+    glm_blockwise_ok = install_glm_dsa_blockwise_indexer(
         parallel_mode=prefill_parallel,
         device_groups=[device_list],
     )
+    if not glm_blockwise_ok:
+        logger.warning(
+            "  GLM DSA blockwise indexer 未安装；长 prompt 将使用 Transformers "
+            "eager indexer，可能产生超大 score tensor"
+        )
     if verbose and str(prefill_parallel).lower() == "tp":
         logger.info("  GLM 长 prefill: TP indexer 已启用（PP 层分片保留）")
 
