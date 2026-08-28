@@ -857,7 +857,7 @@ def _mode_boundary(args):
         report_json_path = os.path.join(out_dir, "report_data.json")
         with open(report_json_path, "w", encoding="utf-8") as f:
             f.write(report_data.to_json(indent=2))
-        product_path = generate_product_html(
+        product_path = generate_product_html_report(
             report_data, output_path=os.path.join(out_dir, "product_report.html")
         )
         try:
