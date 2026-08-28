@@ -210,8 +210,8 @@ def _render_boundary(results: List[Dict]) -> str:
         # logger intentionally prints only a short preview.
         parts.append(f'<pre class="gen">{_esc(gen)}</pre>')
         if thinking:
-            parts.append(f"<p style='color:#666'><b>#{i+1} 思维链 (前 300 字):</b></p>")
-            parts.append(f'<pre class="gen" style="color:#666">{_esc(thinking[:300])}</pre>')
+            parts.append(f"<p style='color:#666'><b>#{i+1} 思维链:</b></p>")
+            parts.append(f'<pre class="gen" style="color:#666">{_esc(thinking)}</pre>')
     return "\n".join(parts)
 
 
