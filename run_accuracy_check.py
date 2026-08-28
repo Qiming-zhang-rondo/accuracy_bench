@@ -254,6 +254,8 @@ def parse_args():
                         help="[boundary] 每个纯 Transformers generate batch 的样本数")
     parser.add_argument("--stop_on_first_badcase", action="store_true",
                         help="[boundary] 首批检测到 bad case 后提前停止")
+    parser.add_argument("--print_full_output", action="store_true",
+                        help="[boundary/inference] 在终端打印每次生成的完整文本")
     parser.add_argument("--repeat_4gram_max", type=float, default=None,
                         help="[boundary] 4-gram 重复比阈值，默认 0.5")
     parser.add_argument("--nonprintable_max", type=float, default=None,
@@ -791,6 +793,7 @@ def _mode_boundary(args):
         deepseek_v4_query_block=getattr(args, "deepseek_v4_query_block", None),
         deepseek_v4_key_block=getattr(args, "deepseek_v4_key_block", None),
         chat_template_mode=getattr(args, "chat_template_mode", "auto"),
+        print_full_output=getattr(args, "print_full_output", False),
     )
     d = boundary_result_to_dict(result)
     logger.info("\n  定界结果: " + d["boundary_result"])

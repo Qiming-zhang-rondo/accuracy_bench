@@ -291,6 +291,7 @@ def _run_transformers_on_path(
     deepseek_v4_query_block: Optional[int] = None,
     deepseek_v4_key_block: Optional[int] = None,
     chat_template_mode: str = "auto",
+    print_full_output: bool = False,
 ) -> List[Dict[str, Any]]:
     """在给定 model_path 上跑原生 Transformers generate, 复用 hf_inference_check 加载链。
 
@@ -341,6 +342,7 @@ def _run_transformers_on_path(
             deepseek_v4_key_block=deepseek_v4_key_block,
             chat_template_mode=chat_template_mode,
             generation_config=framework_gen_config,
+            print_full_output=print_full_output,
         )
     finally:
         try:
@@ -508,6 +510,7 @@ def run_boundary(
     deepseek_v4_query_block: Optional[int] = None,
     deepseek_v4_key_block: Optional[int] = None,
     chat_template_mode: str = "auto",
+    print_full_output: bool = False,
 ) -> BoundaryResult:
     """定界主入口 — 区分 WEIGHT / INFERENCE_FRAMEWORK / BOTH / INCONCLUSIVE / INVALID_RUN。
 
@@ -637,7 +640,7 @@ def run_boundary(
         num_runs, concurrency, stop_on_first_badcase, expert_chunk_size,
         prefill_parallel, glm_attn_query_block, glm_attn_selected_block,
         deepseek_v4_query_block, deepseek_v4_key_block,
-        chat_template_mode)
+        chat_template_mode, print_full_output)
     if invalid_result is not None:
         return invalid_result
 
@@ -648,7 +651,7 @@ def run_boundary(
         num_runs, concurrency, stop_on_first_badcase, expert_chunk_size,
         prefill_parallel, glm_attn_query_block, glm_attn_selected_block,
         deepseek_v4_query_block, deepseek_v4_key_block,
-        chat_template_mode)
+        chat_template_mode, print_full_output)
 
     # ---- 分类 ----
     result_kind = classify_boundary(fw_reproduced, tq_reproduced, ref_reproduced)
@@ -768,7 +771,8 @@ def _boundary_run_quant(run_quant: bool, quant_model_path: str, devices: str,
                        glm_attn_selected_block: Optional[int] = None,
                        deepseek_v4_query_block: Optional[int] = None,
                        deepseek_v4_key_block: Optional[int] = None,
-                       chat_template_mode: str = "auto") -> Tuple[Optional[BoundaryResult], Optional[bool]]:
+                       chat_template_mode: str = "auto",
+                       print_full_output: bool = False) -> Tuple[Optional[BoundaryResult], Optional[bool]]:
     """transformers(quant) 路径运行; 成功时返回 (None, tq_reproduced),
     失败时返回 (_invalid 结果, None)"""
     if not run_quant:
@@ -784,7 +788,8 @@ def _boundary_run_quant(run_quant: bool, quant_model_path: str, devices: str,
             glm_attn_selected_block=glm_attn_selected_block,
             deepseek_v4_query_block=deepseek_v4_query_block,
             deepseek_v4_key_block=deepseek_v4_key_block,
-            chat_template_mode=chat_template_mode)
+            chat_template_mode=chat_template_mode,
+            print_full_output=print_full_output)
         tq_reproduced, summary = _summarize_transformers_runs(
             qt_outputs, num_runs, concurrency, bad_pattern)
         evidence["transformers_run"]["quant"] = summary
@@ -809,7 +814,8 @@ def _boundary_run_ref(run_ref: bool, ref_model_path: Optional[str],
                      glm_attn_selected_block: Optional[int] = None,
                      deepseek_v4_query_block: Optional[int] = None,
                      deepseek_v4_key_block: Optional[int] = None,
-                     chat_template_mode: str = "auto") -> Optional[bool]:
+                     chat_template_mode: str = "auto",
+                     print_full_output: bool = False) -> Optional[bool]:
     """transformers(ref) 路径运行 (可选); 失败时记录到 limitations 不中止"""
     if not (run_ref and ref_model_path):
         return None
@@ -824,7 +830,8 @@ def _boundary_run_ref(run_ref: bool, ref_model_path: Optional[str],
             glm_attn_selected_block=glm_attn_selected_block,
             deepseek_v4_query_block=deepseek_v4_query_block,
             deepseek_v4_key_block=deepseek_v4_key_block,
-            chat_template_mode=chat_template_mode)
+            chat_template_mode=chat_template_mode,
+            print_full_output=print_full_output)
         ref_reproduced, summary = _summarize_transformers_runs(
             ref_outputs, num_runs, concurrency, bad_pattern)
         evidence["transformers_run"]["ref"] = summary

@@ -70,6 +70,8 @@ def main():
                         help="[boundary] 每个 Transformers generate batch 的并发样本数")
     parser.add_argument("--stop_on_first_badcase", action="store_true",
                         help="[boundary] 首批检测到 bad case 后提前停止")
+    parser.add_argument("--print_full_output", action="store_true",
+                        help="[boundary/inference] 在终端打印每次生成的完整文本")
     parser.add_argument("--expert_chunk_size", type=int, default=None,
                         help="[boundary] resident expert 临时反量化分块，默认 8")
     parser.add_argument(
@@ -123,6 +125,7 @@ def main():
         deepseek_v4_query_block=args.deepseek_v4_query_block,
         deepseek_v4_key_block=args.deepseek_v4_key_block,
         chat_template_mode=args.chat_template_mode,
+        print_full_output=args.print_full_output,
     )
 
 

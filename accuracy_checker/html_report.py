@@ -206,7 +206,9 @@ def _render_boundary(results: List[Dict]) -> str:
         gen = r.get("generated") or "(无正文 / 思维链截断)"
         thinking = r.get("thinking") or ""
         parts.append(f"<p><b>#{i+1} 生成:</b></p>")
-        parts.append(f'<pre class="gen">{_esc(gen[:1000])}</pre>')
+        # Keep the complete answer available in the report; the terminal
+        # logger intentionally prints only a short preview.
+        parts.append(f'<pre class="gen">{_esc(gen)}</pre>')
         if thinking:
             parts.append(f"<p style='color:#666'><b>#{i+1} 思维链 (前 300 字):</b></p>")
             parts.append(f'<pre class="gen" style="color:#666">{_esc(thinking[:300])}</pre>')

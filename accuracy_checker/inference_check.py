@@ -1718,7 +1718,8 @@ def _seed_hf_generation(generation_config):
 def _hf_generate_conversation_batch(model, tokenizer, messages, request_tools, thinking,
                                     max_new_tokens, first_device, conv_idx, batch_size,
                                     run_offset, chat_template_mode="auto",
-                                    generation_config=None):
+                                    generation_config=None,
+                                    print_full_output=False):
     from .input_resolver import resolve_model_input
 
     raw_prompt = (len(messages) == 1 and messages[0].get("_raw_prompt") is True)
@@ -1779,6 +1780,8 @@ def _hf_generate_conversation_batch(model, tokenizer, messages, request_tools, t
         preview = decoded["answer"] or decoded["thinking"]
         logger.info(f"  run {run_index}: {len(new_tokens)} tokens, "
                     f"{preview[:160] if preview else '(empty)'}")
+        if print_full_output:
+            logger.info(f"  [full output run {run_index}]\n{decoded['raw_text']}")
         results.append({
             "run_index": run_index, "batch_index": batch_idx, "messages": messages,
             "generated": decoded["answer"], "thinking": decoded["thinking"],
@@ -1796,7 +1799,8 @@ def _hf_run_generation(model, tokenizer, prompt_file, thinking, max_new_tokens,
                        stop_predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
                        conversations_override=None, request_tools_override=None,
                        chat_template_mode: str = "auto",
-                       generation_config=None):
+                       generation_config=None,
+                       print_full_output: bool = False):
     if verbose:
         logger.info("\n[6/6] 推理测试...")
     if conversations_override is not None:
@@ -1821,6 +1825,7 @@ def _hf_run_generation(model, tokenizer, prompt_file, thinking, max_new_tokens,
                 model, tokenizer, messages, request_tools, thinking,
                 max_new_tokens, first_device, i, batch_size, completed,
                 chat_template_mode, generation_config,
+                print_full_output,
             )
             results.extend(batch_results)
             completed += batch_size
@@ -1890,6 +1895,7 @@ def hf_inference_check(
     deepseek_v4_key_block: Optional[int] = None,
     chat_template_mode: str = "auto",
     generation_config: Optional[Dict[str, Any]] = None,
+    print_full_output: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     通用 HF 推理检查入口。
@@ -1985,6 +1991,7 @@ def hf_inference_check(
         request_tools_override=request_tools,
         chat_template_mode=chat_template_mode,
         generation_config=generation_config,
+        print_full_output=print_full_output,
     )
 
     # PPL
