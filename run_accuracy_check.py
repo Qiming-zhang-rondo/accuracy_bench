@@ -828,6 +828,46 @@ def _mode_boundary(args):
                 ) + "\n")
     logger.info(f"  Boundary 汇总: {bpath}")
     logger.info(f"  Boundary 逐次结果: {runs_path}")
+    # Boundary also feeds the shared product report's section ⑤.  Keep the
+    # raw boundary JSON/JSONL above as the source of truth, while exposing the
+    # actual Quant-only (or Ref/Quant) generation in latest.html.
+    try:
+        from accuracy_checker import assemble_report, generate_index_html, generate_product_html_report
+        quant_runs = transformers_runs.get("quant", {}).get("runs", [])
+        ref_runs = transformers_runs.get("ref", {}).get("runs", [])
+        boundary_runs = list(quant_runs) + list(ref_runs)
+        prompt_text = args.prompt or ""
+        for message in messages or []:
+            if message.get("role") == "user":
+                prompt_text = message.get("content", "") or ""
+        inference_compare = _build_inference_compare_from_boundary(
+            d, quant, prompt=prompt_text
+        )
+        report_data = assemble_report(
+            boundary_result=boundary_runs,
+            inference_compare_data=inference_compare,
+            model_name=args.model_name or os.path.basename(quant),
+            ref_model_path=args.ref_model or "",
+            quant_model_path=quant,
+            quant_format=getattr(args, "quant_format", "") or "",
+            device_mode=str(devices),
+            prompt=prompt_text,
+            input_mode="messages",
+        )
+        report_json_path = os.path.join(out_dir, "report_data.json")
+        with open(report_json_path, "w", encoding="utf-8") as f:
+            f.write(report_data.to_json(indent=2))
+        product_path = generate_product_html(
+            report_data, output_path=os.path.join(out_dir, "product_report.html")
+        )
+        try:
+            generate_index_html(os.path.dirname(os.path.abspath(out_dir)))
+        except Exception as exc:  # noqa: BLE001
+            logger.info(f"  Boundary 报告索引生成跳过: {exc}")
+        logger.info(f"  Boundary 产品报告: {product_path}")
+        logger.info("  latest.html 的⑤生成输出对比已填充")
+    except Exception as exc:  # noqa: BLE001
+        logger.info(f"  Boundary 产品报告生成跳过: {exc}")
     # 写入 AlignmentReport (供 full 模式复用)
     return d
 
@@ -1013,6 +1053,31 @@ def _build_inference_compare_from_boundary(boundary_dict, quant_model_path, prom
         quant_tokens = tok.tokenize(quant_text) if quant_text else []
     except Exception as e:
         logger.info(f"  [inference_compare] tokenizer 加载失败, 仅做文本级对比: {e}")
+
+    # Boundary is commonly Quant-only (--no_ref).  Do not manufacture a
+    # zero-percent Ref/Quant comparison in that case; report the actual
+    # Quant output as a single endpoint result and leave comparison metrics
+    # unavailable.
+    if not ref_text or not quant_text:
+        from accuracy_checker.report_schema import InferenceCompareData
+        from accuracy_checker.inference_compare import detect_garbled, detect_repeat
+        return InferenceCompareData(
+            prompt=prompt,
+            ref_output=ref_text,
+            quant_output=quant_text,
+            ref_tokens=ref_tokens,
+            quant_tokens=quant_tokens,
+            token_match_rate=None,
+            exact_match=False,
+            first_divergence_pos=None,
+            max_new_tokens=int(
+                (quant_info if quant_text else ref_info).get("output_tokens", 0)
+            ),
+            ref_garbled=detect_garbled(ref_text),
+            quant_garbled=detect_garbled(quant_text),
+            ref_repeat=detect_repeat(ref_text, ref_tokens),
+            quant_repeat=detect_repeat(quant_text, quant_tokens),
+        )
 
     from accuracy_checker.inference_compare import compare_inference
     comparison = compare_inference(

@@ -1135,15 +1135,25 @@ function renderBadcase(){
   if(I.quant_repeat)flags.push('<span class="pill warn">QUANT 复读</span>');
   if(I.logits_nan_inf)flags.push('<span class="pill bad">LOGITS NaN/Inf</span>');
   if(!flags.length)flags.push('<span class="pill ok">未发现退化信号</span>');
-  let h='<div class="grid cols-3">'+
-    '<div class="card"><h3>生成文本完全一致</h3><div class="pill '+(exact?'ok':'warn')+'">'+(exact?'YES':'NO')+'</div></div>'+
-    '<div class="card"><h3>逐 Token 匹配率</h3><div class="val">'+pct(rate,1)+'</div></div>'+
-    '<div class="card"><h3>首个分歧位置</h3><div class="val">'+(first==null?'—':esc(first))+'</div><div class="sub">max_new_tokens '+esc(I.max_new_tokens||0)+'</div></div>'+
-    '</div><div class="health-row">'+flags.join('')+'</div>';
+  const boundarySingle = (!I.ref_output || !I.quant_output);
+  let h=boundarySingle ?
+    '<div class="card"><h3>Boundary 原生 Transformers 输出</h3><div class="pill ok">已生成</div>'+
+    '<div class="sub">当前为 Quant-only 或 Ref-only 定界，暂无另一侧输出，未计算 Token 匹配率。</div></div>' :
+    '<div class="grid cols-3">'+
+      '<div class="card"><h3>生成文本完全一致</h3><div class="pill '+(exact?'ok':'warn')+'">'+(exact?'YES':'NO')+'</div></div>'+
+      '<div class="card"><h3>逐 Token 匹配率</h3><div class="val">'+pct(rate,1)+'</div></div>'+
+      '<div class="card"><h3>首个分歧位置</h3><div class="val">'+(first==null?'—':esc(first))+'</div><div class="sub">max_new_tokens '+esc(I.max_new_tokens||0)+'</div></div>'+
+      '</div>';
+  h+='<div class="health-row">'+flags.join('')+'</div>';
   h+='<div class="card" style="margin-top:12px"><h3>输入</h3><pre class="output-box">'+esc(I.prompt||R.overview?.prompt||'')+'</pre></div>';
-  h+='<div class="grid cols-2" style="margin-top:12px">'+
-    '<div class="card"><h3>REF OUTPUT</h3><pre class="output-box">'+esc(I.ref_output||'')+'</pre></div>'+
-    '<div class="card"><h3>QUANT OUTPUT</h3><pre class="output-box">'+esc(I.quant_output||'')+'</pre></div></div>';
+  if(boundarySingle){
+    h+='<div class="card" style="margin-top:12px"><h3>'+(I.quant_output?'QUANT OUTPUT':'REF OUTPUT')+'</h3>'+
+      '<pre class="output-box">'+esc(I.quant_output||I.ref_output||'')+'</pre></div>';
+  } else {
+    h+='<div class="grid cols-2" style="margin-top:12px">'+
+      '<div class="card"><h3>REF OUTPUT</h3><pre class="output-box">'+esc(I.ref_output||'')+'</pre></div>'+
+      '<div class="card"><h3>QUANT OUTPUT</h3><pre class="output-box">'+esc(I.quant_output||'')+'</pre></div></div>';
+  }
 
   const rt=I.ref_tokens||[],qt=I.quant_tokens||[];
   if(rt.length||qt.length){
