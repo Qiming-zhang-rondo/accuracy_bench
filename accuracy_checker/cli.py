@@ -84,6 +84,14 @@ def main():
         "--glm_attn_selected_block", type=int, default=None,
         help="GLM 长 prefill selected-key block（默认 512）",
     )
+    parser.add_argument(
+        "--deepseek_v4_query_block", type=int, default=None,
+        help="DeepSeek-V4 blockwise/TP query block（默认 64）",
+    )
+    parser.add_argument(
+        "--deepseek_v4_key_block", type=int, default=None,
+        help="DeepSeek-V4 blockwise/TP key block（默认 1024）",
+    )
     args = parser.parse_args()
 
     if args.boundary and args.mode == "inference":
@@ -112,6 +120,8 @@ def main():
         prefill_parallel=args.prefill_parallel,
         glm_attn_query_block=args.glm_attn_query_block,
         glm_attn_selected_block=args.glm_attn_selected_block,
+        deepseek_v4_query_block=args.deepseek_v4_query_block,
+        deepseek_v4_key_block=args.deepseek_v4_key_block,
         chat_template_mode=args.chat_template_mode,
     )
 

@@ -288,6 +288,8 @@ def _run_transformers_on_path(
     prefill_parallel: str = "pp",
     glm_attn_query_block: Optional[int] = None,
     glm_attn_selected_block: Optional[int] = None,
+    deepseek_v4_query_block: Optional[int] = None,
+    deepseek_v4_key_block: Optional[int] = None,
     chat_template_mode: str = "auto",
 ) -> List[Dict[str, Any]]:
     """在给定 model_path 上跑原生 Transformers generate, 复用 hf_inference_check 加载链。
@@ -295,7 +297,7 @@ def _run_transformers_on_path(
     通过临时 prompt_file 把单轮对话喂给 hf_inference_check, 避免重复实现
     skeleton/distribute/dequantize 逻辑。返回全部批次的逐次解码结果。
 
-    若 do_sample 启用, hf_inference_check 当前固定 greedy, 这里记录 limitation。
+    Sampling 参数由 framework_gen_config 对齐到 hf_inference_check。
     """
     # 延迟 import 避免循环
     from .inference_check import hf_inference_check
@@ -311,8 +313,6 @@ def _run_transformers_on_path(
         prompt_file = tf.name
 
     try:
-        # framework_gen_config 对齐: 当前 hf_inference_check 只暴露 max_new_tokens/
-        # thinking(do_sample=False), 其余 (temperature/top_p/top_k) 无法对齐 → 记录
         def _is_bad(run: Dict[str, Any]) -> bool:
             text = run.get("raw_text") or run.get("generated", "")
             detected = detect_badcase(
@@ -337,6 +337,8 @@ def _run_transformers_on_path(
             prefill_parallel=prefill_parallel,
             glm_attn_query_block=glm_attn_query_block,
             glm_attn_selected_block=glm_attn_selected_block,
+            deepseek_v4_query_block=deepseek_v4_query_block,
+            deepseek_v4_key_block=deepseek_v4_key_block,
             chat_template_mode=chat_template_mode,
             generation_config=framework_gen_config,
         )
@@ -503,6 +505,8 @@ def run_boundary(
     prefill_parallel: str = "pp",
     glm_attn_query_block: Optional[int] = None,
     glm_attn_selected_block: Optional[int] = None,
+    deepseek_v4_query_block: Optional[int] = None,
+    deepseek_v4_key_block: Optional[int] = None,
     chat_template_mode: str = "auto",
 ) -> BoundaryResult:
     """定界主入口 — 区分 WEIGHT / INFERENCE_FRAMEWORK / BOTH / INCONCLUSIVE / INVALID_RUN。
@@ -591,6 +595,12 @@ def run_boundary(
         "stop_on_first_badcase": stop_on_first_badcase,
         "expert_chunk_size": expert_chunk_size or 8,
         "prefill_parallel": prefill_parallel,
+        "deepseek_v4_query_block": deepseek_v4_query_block or int(
+            os.getenv("ACC_DEEPSEEK_V4_QUERY_BLOCK", "64")
+        ),
+        "deepseek_v4_key_block": deepseek_v4_key_block or int(
+            os.getenv("ACC_DEEPSEEK_V4_KEY_BLOCK", "1024")
+        ),
         "chat_template_mode": chat_template_mode,
         "resident_experts": os.getenv("ACC_BOUNDARY_RESIDENT_EXPERTS", "1") != "0",
         "expert_cache_per_layer": int(
@@ -626,6 +636,7 @@ def run_boundary(
         evidence, limitations, framework_name, framework_bad_reproduced, fw_reproduced,
         num_runs, concurrency, stop_on_first_badcase, expert_chunk_size,
         prefill_parallel, glm_attn_query_block, glm_attn_selected_block,
+        deepseek_v4_query_block, deepseek_v4_key_block,
         chat_template_mode)
     if invalid_result is not None:
         return invalid_result
@@ -636,6 +647,7 @@ def run_boundary(
         max_new_tokens, framework_gen_config, verbose, bad_pattern, evidence, limitations,
         num_runs, concurrency, stop_on_first_badcase, expert_chunk_size,
         prefill_parallel, glm_attn_query_block, glm_attn_selected_block,
+        deepseek_v4_query_block, deepseek_v4_key_block,
         chat_template_mode)
 
     # ---- 分类 ----
@@ -754,6 +766,8 @@ def _boundary_run_quant(run_quant: bool, quant_model_path: str, devices: str,
                        prefill_parallel: str = "pp",
                        glm_attn_query_block: Optional[int] = None,
                        glm_attn_selected_block: Optional[int] = None,
+                       deepseek_v4_query_block: Optional[int] = None,
+                       deepseek_v4_key_block: Optional[int] = None,
                        chat_template_mode: str = "auto") -> Tuple[Optional[BoundaryResult], Optional[bool]]:
     """transformers(quant) 路径运行; 成功时返回 (None, tq_reproduced),
     失败时返回 (_invalid 结果, None)"""
@@ -768,6 +782,8 @@ def _boundary_run_quant(run_quant: bool, quant_model_path: str, devices: str,
             expert_chunk_size=expert_chunk_size, prefill_parallel=prefill_parallel,
             glm_attn_query_block=glm_attn_query_block,
             glm_attn_selected_block=glm_attn_selected_block,
+            deepseek_v4_query_block=deepseek_v4_query_block,
+            deepseek_v4_key_block=deepseek_v4_key_block,
             chat_template_mode=chat_template_mode)
         tq_reproduced, summary = _summarize_transformers_runs(
             qt_outputs, num_runs, concurrency, bad_pattern)
@@ -791,6 +807,8 @@ def _boundary_run_ref(run_ref: bool, ref_model_path: Optional[str],
                      prefill_parallel: str = "pp",
                      glm_attn_query_block: Optional[int] = None,
                      glm_attn_selected_block: Optional[int] = None,
+                     deepseek_v4_query_block: Optional[int] = None,
+                     deepseek_v4_key_block: Optional[int] = None,
                      chat_template_mode: str = "auto") -> Optional[bool]:
     """transformers(ref) 路径运行 (可选); 失败时记录到 limitations 不中止"""
     if not (run_ref and ref_model_path):
@@ -804,6 +822,8 @@ def _boundary_run_ref(run_ref: bool, ref_model_path: Optional[str],
             expert_chunk_size=expert_chunk_size, prefill_parallel=prefill_parallel,
             glm_attn_query_block=glm_attn_query_block,
             glm_attn_selected_block=glm_attn_selected_block,
+            deepseek_v4_query_block=deepseek_v4_query_block,
+            deepseek_v4_key_block=deepseek_v4_key_block,
             chat_template_mode=chat_template_mode)
         ref_reproduced, summary = _summarize_transformers_runs(
             ref_outputs, num_runs, concurrency, bad_pattern)
@@ -896,6 +916,8 @@ def run_boundary_cli(args):
         prefill_parallel=getattr(args, "prefill_parallel", "pp"),
         glm_attn_query_block=getattr(args, "glm_attn_query_block", None),
         glm_attn_selected_block=getattr(args, "glm_attn_selected_block", None),
+        deepseek_v4_query_block=getattr(args, "deepseek_v4_query_block", None),
+        deepseek_v4_key_block=getattr(args, "deepseek_v4_key_block", None),
         chat_template_mode=getattr(args, "chat_template_mode", "auto"),
     )
 

@@ -744,6 +744,16 @@
               <input id="glmAttnSelectedBlock" type="number" min="1" step="1" value="512">
               <span class="hint">selected top-k 的分块大小；默认 512。增大可减少循环，但 workspace 按 query×selected 增长。</span>
             </div>
+            <div id="deepseekV4QueryBlockField" class="hidden" aria-hidden="true">
+              <label for="deepseekV4QueryBlock">DeepSeek-V4 query block</label>
+              <input id="deepseekV4QueryBlock" type="number" min="1" step="1" value="64">
+              <span class="hint">每个实际 query tile 的 token 数；默认 64。增大可减少 launch，但 score workspace 线性增加。</span>
+            </div>
+            <div id="deepseekV4KeyBlockField" class="hidden" aria-hidden="true">
+              <label for="deepseekV4KeyBlock">DeepSeek-V4 key block</label>
+              <input id="deepseekV4KeyBlock" type="number" min="1" step="1" value="1024">
+              <span class="hint">完整 K 的流式分块大小；默认 1024。TP 下每个 helper 复用 full K，但单次 score 仍受 query×key block 控制。</span>
+            </div>
             <div id="kimiKdaField" class="hidden" aria-hidden="true">
               <label for="kimiKdaBackend">Kimi K3 KDA 后端</label>
               <select id="kimiKdaBackend">
@@ -871,8 +881,8 @@
               <textarea id="requestJson" placeholder='{"model":"glm-52","max_tokens":102400,"messages":[{"role":"user","content":"..."}]}'></textarea>
               <span class="hint">Boundary 只接受结构化请求：填写 <code>model</code>（模型标识）和非空 <code>messages</code>；tokenizer 会按模型自带 ChatTemplate 渲染一次。长 JSON 会通过 heredoc 送入 stdin，不会触发 Argument list too long。</span>
             </div>
-            <div><label for="numRuns">总运行次数</label><input id="numRuns" type="number" min="1" value="100"></div>
-            <div><label for="concurrency">每批并发数</label><input id="concurrency" type="number" min="1" value="10"><span class="hint">batched Transformers generate；总结果仍为运行次数。</span></div>
+            <div><label for="numRuns">总运行次数</label><input id="numRuns" type="number" min="1" value="1"></div>
+            <div><label for="concurrency">每批并发数</label><input id="concurrency" type="number" min="1" value="1"><span class="hint">默认先单次跑通；排查偶现问题时再调大。总结果仍为运行次数。</span></div>
             <div><label for="maxNewTokens">最大生成 token <span class="optional">留空读 JSON</span></label><input id="maxNewTokens" type="number" min="1" placeholder="读取 max_tokens；否则 1024"></div>
             <div><label for="noRef">运行 Ref</label><select id="noRef"><option value="true">不运行 · Quant-only</option><option value="false">运行 · 需填写 Ref 路径</option></select></div>
             <div><label for="frameworkReproduced">部署框架已复现</label><select id="frameworkReproduced"><option value="true">是 · 外部已确认</option><option value="">未知</option><option value="false">否</option></select></div>
@@ -1019,6 +1029,8 @@
             <tr><td><code>--prefill_parallel</code></td><td>pp</td><td>GLM/DeepSeek-V4 长 prefill：pp 保留按层分片及 owner 单卡 blockwise attention；tp 按 query block 跨设备组并行 indexer 和 sparse attention。Boundary Quant-only 使用全部 <code>--devices</code>，L1/full 使用对应 Ref/Quant 设备组。模型层 placement 仍为 PP。</td></tr>
             <tr><td><code>--glm_attn_query_block</code></td><td>64</td><td>GLM 长 prefill attention 的 query block 大小。增大可减少 launch 次数，但会增加临时显存；未指定时也可用 ACC_GLM_DSA_ATTN_QUERY_BLOCK。</td></tr>
             <tr><td><code>--glm_attn_selected_block</code></td><td>512</td><td>GLM attention selected top-k 的分块大小。workspace 近似按 query block×selected block 增长；未指定时也可用 ACC_GLM_DSA_ATTN_SELECTED_BLOCK。</td></tr>
+            <tr><td><code>--deepseek_v4_query_block</code></td><td>64</td><td>DeepSeek-V4 blockwise/Query Parallel 每个实际 query tile 的大小；也可用 ACC_DEEPSEEK_V4_QUERY_BLOCK。</td></tr>
+            <tr><td><code>--deepseek_v4_key_block</code></td><td>1024</td><td>DeepSeek-V4 每次流式处理的 key tile 大小；也可用 ACC_DEEPSEEK_V4_KEY_BLOCK。峰值 score 近似随 query_block×key_block 增长。</td></tr>
             <tr><td><code>--ref_devices</code></td><td>空</td><td>grouped_dual 的 ref 多卡列表，例如 npu:0,1。</td></tr>
             <tr><td><code>--quant_devices</code></td><td>空</td><td>grouped_dual 的 quant 多卡列表，例如 npu:2,3。</td></tr>
             <tr><td><code>--expert_chunk_size</code></td><td>L1 自动；boundary 8</td><td>L1 grouped_dual 或 boundary resident expert 的临时反量化分块；越小越省峰值显存。</td></tr>
@@ -1061,7 +1073,7 @@
       var ids = [
         "refModel", "quantModel", "mode", "modelType", "visibleDevices",
         "modelSizeB", "perDeviceMemory", "refDevices", "quantDevices",
-        "compareMode", "prefillParallel", "glmAttnQueryBlock", "glmAttnSelectedBlock", "chatTemplateMode", "kimiKdaBackend", "layersPerShard",
+        "compareMode", "prefillParallel", "glmAttnQueryBlock", "glmAttnSelectedBlock", "deepseekV4QueryBlock", "deepseekV4KeyBlock", "chatTemplateMode", "kimiKdaBackend", "layersPerShard",
         "quantMethod", "dtype", "activationQuantType", "activationQuantBackend", "activationQuantGroupSize", "cacheTopK", "cacheDir", "mlaFine",
         "outputDir", "prompt", "rawPromptFile", "promptFile", "requestJson", "numRuns", "concurrency",
         "maxNewTokens", "noRef", "frameworkReproduced", "stopOnFirstBadcase",
@@ -1222,11 +1234,14 @@
       function updateModeFields(type, mode, compare, dspark) {
         var l1Flow = ["l1", "full"].indexOf(mode) !== -1;
         var l2Flow = mode === "l2";
+        var longPrefillFlow = l1Flow || mode === "boundary";
         var grouped = compare === "grouped_dual";
         setFieldVisibility("compareModeField", l1Flow && !dspark);
-        setFieldVisibility("prefillParallelField", (l1Flow || mode === "boundary") && !dspark);
-        setFieldVisibility("glmAttnQueryBlockField", l1Flow && !dspark);
-        setFieldVisibility("glmAttnSelectedBlockField", l1Flow && !dspark);
+        setFieldVisibility("prefillParallelField", longPrefillFlow && !dspark);
+        setFieldVisibility("glmAttnQueryBlockField", longPrefillFlow && type === "glm_moe_dsa" && !dspark);
+        setFieldVisibility("glmAttnSelectedBlockField", longPrefillFlow && type === "glm_moe_dsa" && !dspark);
+        setFieldVisibility("deepseekV4QueryBlockField", longPrefillFlow && type === "deepseek_v4" && !dspark);
+        setFieldVisibility("deepseekV4KeyBlockField", longPrefillFlow && type === "deepseek_v4" && !dspark);
         setFieldVisibility("layersPerShardField", l1Flow && !dspark);
         setFieldVisibility("perDeviceMemoryField", l1Flow && !dspark);
         setFieldVisibility("quantMethodField", l1Flow || l2Flow);
@@ -1369,11 +1384,17 @@
         if (!dspark && ["l1", "full"].indexOf(mode) !== -1 && (!/^\d+$/.test(el.layersPerShard.value) || Number(el.layersPerShard.value) < 1)) {
           addIssue(errors, "layersPerShard", "layers_per_shard 必须是大于 0 的整数");
         }
-        if (!dspark && ["l1", "full"].indexOf(mode) !== -1 && (!/^\d+$/.test(el.glmAttnQueryBlock.value) || Number(el.glmAttnQueryBlock.value) < 1)) {
+        if (!dspark && type === "glm_moe_dsa" && ["l1", "full", "boundary"].indexOf(mode) !== -1 && (!/^\d+$/.test(el.glmAttnQueryBlock.value) || Number(el.glmAttnQueryBlock.value) < 1)) {
           addIssue(errors, "glmAttnQueryBlock", "GLM attention query block 必须是大于 0 的整数");
         }
-        if (!dspark && ["l1", "full"].indexOf(mode) !== -1 && (!/^\d+$/.test(el.glmAttnSelectedBlock.value) || Number(el.glmAttnSelectedBlock.value) < 1)) {
+        if (!dspark && type === "glm_moe_dsa" && ["l1", "full", "boundary"].indexOf(mode) !== -1 && (!/^\d+$/.test(el.glmAttnSelectedBlock.value) || Number(el.glmAttnSelectedBlock.value) < 1)) {
           addIssue(errors, "glmAttnSelectedBlock", "GLM attention selected-key block 必须是大于 0 的整数");
+        }
+        if (!dspark && type === "deepseek_v4" && ["l1", "full", "boundary"].indexOf(mode) !== -1 && (!/^\d+$/.test(el.deepseekV4QueryBlock.value) || Number(el.deepseekV4QueryBlock.value) < 1)) {
+          addIssue(errors, "deepseekV4QueryBlock", "DeepSeek-V4 query block 必须是大于 0 的整数");
+        }
+        if (!dspark && type === "deepseek_v4" && ["l1", "full", "boundary"].indexOf(mode) !== -1 && (!/^\d+$/.test(el.deepseekV4KeyBlock.value) || Number(el.deepseekV4KeyBlock.value) < 1)) {
+          addIssue(errors, "deepseekV4KeyBlock", "DeepSeek-V4 key block 必须是大于 0 的整数");
         }
         if (!dspark && ["l1", "full"].indexOf(mode) !== -1 && (!/^\d+$/.test(el.cacheTopK.value) || Number(el.cacheTopK.value) < 0)) {
           addIssue(errors, "cacheTopK", "cache_top_k 必须是非负整数");
@@ -1505,6 +1526,12 @@
         if (["l1", "full"].indexOf(mode) !== -1 && isMoe(type) && type !== "dspark") {
           addStatus("MoE 使用 grouped_dual 流式 expert；ref/quant 独立卡组会并发 forward", "ok");
         }
+        if (["l1", "full", "boundary"].indexOf(mode) !== -1 && type === "deepseek_v4") {
+          addStatus(
+            "DeepSeek-V4 block=" + el.deepseekV4QueryBlock.value + "×" + el.deepseekV4KeyBlock.value,
+            "ok"
+          );
+        }
         if (["l1", "full"].indexOf(mode) !== -1 && type === "kimi_k3") addStatus("KDA backend=" + el.kimiKdaBackend.value + "；auto 在 Ascend 上使用无 Triton 依赖的 torch recurrence", "ok");
         if (el.activationQuantType.value && ["l1", "full"].indexOf(mode) !== -1 && type !== "dspark") {
           var activationGroupText = el.activationQuantType.value === "W4A4_INT4_PER_GROUP"
@@ -1599,8 +1626,14 @@
             args.push(line("--compare_mode", compare));
             if (el.prefillParallel.value === "tp") args.push(line("--prefill_parallel", "tp"));
             args.push(line("--layers_per_shard", el.layersPerShard.value || "2"));
-            args.push(line("--glm_attn_query_block", el.glmAttnQueryBlock.value || "64"));
-            args.push(line("--glm_attn_selected_block", el.glmAttnSelectedBlock.value || "512"));
+            if (type === "glm_moe_dsa") {
+              args.push(line("--glm_attn_query_block", el.glmAttnQueryBlock.value || "64"));
+              args.push(line("--glm_attn_selected_block", el.glmAttnSelectedBlock.value || "512"));
+            }
+            if (type === "deepseek_v4") {
+              args.push(line("--deepseek_v4_query_block", el.deepseekV4QueryBlock.value || "64"));
+              args.push(line("--deepseek_v4_key_block", el.deepseekV4KeyBlock.value || "1024"));
+            }
             args.push(line("--cache_top_k", el.cacheTopK.value || "0"));
             args.push(line("--quant_method", quantMethod));
             args.push(line("--dtype", el.dtype.value));
@@ -1630,6 +1663,14 @@
           args.push(line("--devices", "npu:" + logicalIds.join(",")));
           args.push(line("--dtype", el.dtype.value));
           if (el.prefillParallel.value === "tp") args.push(line("--prefill_parallel", "tp"));
+          if (type === "glm_moe_dsa") {
+            args.push(line("--glm_attn_query_block", el.glmAttnQueryBlock.value || "64"));
+            args.push(line("--glm_attn_selected_block", el.glmAttnSelectedBlock.value || "512"));
+          }
+          if (type === "deepseek_v4") {
+            args.push(line("--deepseek_v4_query_block", el.deepseekV4QueryBlock.value || "64"));
+            args.push(line("--deepseek_v4_key_block", el.deepseekV4KeyBlock.value || "1024"));
+          }
           args.push(line("--num_runs", el.numRuns.value || "1"));
           args.push(line("--concurrency", el.concurrency.value || "1"));
           if (el.expertChunkSize.value) args.push(line("--expert_chunk_size", el.expertChunkSize.value));
@@ -1758,8 +1799,8 @@
           el.modelType.value = "auto";
           el.modelSizeB.value = "";
           el.visibleDevices.value = "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15";
-          el.numRuns.value = "100";
-          el.concurrency.value = "10";
+          el.numRuns.value = "1";
+          el.concurrency.value = "1";
           el.noRef.value = "true";
           el.frameworkReproduced.value = "true";
         }

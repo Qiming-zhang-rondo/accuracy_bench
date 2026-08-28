@@ -148,6 +148,14 @@ def parse_args():
         "--glm_attn_selected_block", type=parse_positive_int, default=None,
         help="GLM 长 prefill selected-key block（默认 512；也可用 ACC_GLM_DSA_ATTN_SELECTED_BLOCK）",
     )
+    parser.add_argument(
+        "--deepseek_v4_query_block", type=parse_positive_int, default=None,
+        help="DeepSeek-V4 blockwise/TP query block（默认 64；也可用 ACC_DEEPSEEK_V4_QUERY_BLOCK）",
+    )
+    parser.add_argument(
+        "--deepseek_v4_key_block", type=parse_positive_int, default=None,
+        help="DeepSeek-V4 blockwise/TP key block（默认 1024；也可用 ACC_DEEPSEEK_V4_KEY_BLOCK）",
+    )
     parser.add_argument("--cache_top_k", type=int, default=0,
                         help="L1: 缓存 cos_sim 最低的 N 层到 L2 cache (0=不缓存)")
     parser.add_argument("--l1_target_layers", type=int, nargs="+", default=None,
@@ -541,6 +549,8 @@ def run_hf_l1(args, ref_device, target_device, dtype):
             "eager indexer，可能产生超大 score tensor"
         )
     install_deepseek_v4_blockwise_runtime(
+        query_block=getattr(args, "deepseek_v4_query_block", None),
+        key_block=getattr(args, "deepseek_v4_key_block", None),
         parallel_mode=getattr(args, "prefill_parallel", "pp"),
         device_groups=[ref_tp_devices, quant_tp_devices],
     )
@@ -778,6 +788,9 @@ def _mode_boundary(args):
         prefill_parallel=getattr(args, "prefill_parallel", "pp"),
         glm_attn_query_block=getattr(args, "glm_attn_query_block", None),
         glm_attn_selected_block=getattr(args, "glm_attn_selected_block", None),
+        deepseek_v4_query_block=getattr(args, "deepseek_v4_query_block", None),
+        deepseek_v4_key_block=getattr(args, "deepseek_v4_key_block", None),
+        chat_template_mode=getattr(args, "chat_template_mode", "auto"),
     )
     d = boundary_result_to_dict(result)
     logger.info("\n  定界结果: " + d["boundary_result"])

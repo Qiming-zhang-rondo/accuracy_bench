@@ -1848,6 +1848,8 @@ def hf_inference_check(
     prefill_parallel: str = "pp",
     glm_attn_query_block: Optional[int] = None,
     glm_attn_selected_block: Optional[int] = None,
+    deepseek_v4_query_block: Optional[int] = None,
+    deepseek_v4_key_block: Optional[int] = None,
     chat_template_mode: str = "auto",
     generation_config: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
@@ -1899,6 +1901,8 @@ def hf_inference_check(
 
     from .deepseek_v4_blockwise import install_deepseek_v4_blockwise_runtime
     install_deepseek_v4_blockwise_runtime(
+        query_block=deepseek_v4_query_block,
+        key_block=deepseek_v4_key_block,
         parallel_mode=prefill_parallel,
         device_groups=[device_list],
     )

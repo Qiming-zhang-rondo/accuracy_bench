@@ -58,7 +58,7 @@ class TestCliGuide(unittest.TestCase):
             "boundaryFields", "promptFile", "requestJson", "numRuns", "concurrency",
             "maxNewTokens", "noRef", "frameworkReproduced",
             "stopOnFirstBadcase", "repeat4gramMax", "nonprintableMax",
-            "chatTemplateMode",
+            "chatTemplateMode", "deepseekV4QueryBlock", "deepseekV4KeyBlock",
         }
         self.assertTrue(required.issubset(self.parser.ids))
 
@@ -144,11 +144,15 @@ class TestCliGuide(unittest.TestCase):
         self.assertIn("npu:\" + logicalIds.join", self.html)
         self.assertIn("总结果仍为运行次数", self.html)
         self.assertIn(
-            'setFieldVisibility("prefillParallelField", (l1Flow || mode === "boundary")',
+            'setFieldVisibility("prefillParallelField", longPrefillFlow',
             self.html,
         )
         boundary_build = self.html.split('} else if (mode === "boundary") {', 2)[2]
         self.assertIn('line("--prefill_parallel", "tp")', boundary_build)
+        self.assertIn('line("--deepseek_v4_query_block"', boundary_build)
+        self.assertIn('line("--deepseek_v4_key_block"', boundary_build)
+        self.assertIn('id="numRuns" type="number" min="1" value="1"', self.html)
+        self.assertIn('id="concurrency" type="number" min="1" value="1"', self.html)
 
     def test_report_runs_are_archived_and_latest_opens_history(self):
         run_source = RUN_SCRIPT.read_text(encoding="utf-8")
