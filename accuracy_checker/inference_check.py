@@ -221,10 +221,19 @@ def distribute_model(model, device_list: List[str]) -> List[nn.Module]:
     # norm + lm_head → 最后一张卡
     if final_norm is not None:
         final_norm.to(device_list[-1])
+        if n_devices > 1:
+            # The HF model applies the final norm inside ``model.forward``;
+            # unlike decoder layers it is not reached by the layer hooks
+            # below.  Move the last hidden state explicitly before the norm,
+            # otherwise a PP-sharded V4 run ends with npu[N-2] vs npu[N-1]
+            # matmul errors.
+            _register_module_input_hook(final_norm, device_list[-1])
     # DeepSeek-V4 collapses its hc_mult residual streams before final norm.
     hc_head = getattr(components.text_model, "hc_head", None)
     if hc_head is not None:
         hc_head.to(device_list[-1])
+        if n_devices > 1:
+            _register_module_input_hook(hc_head, device_list[-1])
     if lm_head is not None:
         lm_head.to(device_list[-1])
         if n_devices > 1:
@@ -248,6 +257,17 @@ def _register_lm_head_device_hook(lm_head, first_device: str):
         if isinstance(output, torch.Tensor) and str(output.device) != first_device:
             return output.to(first_device)
     lm_head.register_forward_hook(_logits_to_first_device)
+
+
+def _register_module_input_hook(module: nn.Module, target_device: str):
+    """Move a terminal module's tensor inputs to its owning PP device."""
+    def _hook(_module, args, kwargs):
+        new_args = tuple(_move_to_device(a, target_device) for a in args)
+        new_kwargs = {k: _move_to_device(v, target_device)
+                      for k, v in kwargs.items()}
+        return new_args, new_kwargs
+
+    module.register_forward_pre_hook(_hook, with_kwargs=True)
 
 
 def _move_to_device(obj, dev):
