@@ -94,8 +94,14 @@ def parse_args():
                         help="对比用的输入文本")
     parser.add_argument("--messages", type=str, default=None,
                         help='Chat messages JSON, 走 apply_chat_template')
+    parser.add_argument(
+        "--chat_template_mode", type=str, default="auto",
+        choices=["auto", "always", "never"],
+        help=("控制 tokenizer chat_template: auto=messages 自动套用、普通/原始文本保持原样；"
+              "always=文本也包装为 user message；never=全部原样且禁止 structured messages"),
+    )
     parser.add_argument("--prompt_file", type=str, default=None,
-                        help="[boundary] 完整 OpenAI/vLLM 请求 JSON 或对话列表文件")
+                        help="完整请求/对话列表 JSON，或 .txt/.prompt 原始文本文件")
     parser.add_argument("--request_json", type=str, default=None,
                         help="[boundary] 直接粘贴完整 OpenAI/vLLM 请求 JSON")
     parser.add_argument("--request_json_stdin", action="store_true",
@@ -312,25 +318,73 @@ def _parse_messages(args):
 
 
 def _resolve_input(args, tokenizer=None):
+    if tokenizer is None:
+        raise ValueError("resolve input 需要 tokenizer")
+    from accuracy_checker.input_resolver import resolve_model_input
+
+    messages = None
+    prompt = args.prompt
+    request_tools = None
+    source_kind = "text"
     if args.messages:
         messages = json.loads(args.messages)
-        if tokenizer is None:
-            raise ValueError("--messages 需要 tokenizer")
-        prompt_text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True)
-        input_ids = tokenizer.apply_chat_template(
-            messages, return_tensors="pt", add_generation_prompt=True)
-        if input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(0)
-        return prompt_text, input_ids
-    return args.prompt, None
+        if isinstance(messages, dict):
+            messages = messages.get("messages")
+        source_kind = "messages"
+    elif args.prompt_file:
+        path = args.prompt_file
+        if path.lower().endswith((".txt", ".text", ".prompt")):
+            with open(path, encoding="utf-8") as handle:
+                prompt = handle.read()
+        else:
+            with open(path, encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if isinstance(payload, dict) and isinstance(payload.get("messages"), list):
+                messages = payload["messages"]
+                request_tools = payload.get("tools")
+                source_kind = "messages"
+            elif isinstance(payload, list):
+                messages = payload[0] if payload and isinstance(payload[0], list) else payload
+                source_kind = "messages"
+            else:
+                raise ValueError("prompt_file JSON 必须包含 messages 数组")
+    resolved = resolve_model_input(
+        tokenizer, prompt=prompt, messages=messages, source_kind=source_kind,
+        request_tools=request_tools,
+        thinking=getattr(args, "thinking", "chat"),
+        chat_template_mode=getattr(args, "chat_template_mode", "auto"),
+    )
+    return resolved["rendered_text"], resolved["input_ids"]
 
 
 def _cache_input_identity(args) -> str:
     """Return the canonical sample identity shared by L1 cache and L2 lookup."""
+    # Keep the historical text/messages identity so L2 can locate L1 caches;
+    # the mode suffix prevents auto/always/never collisions.  A future cache
+    # format should hash the final input_ids sequence directly instead.
+    mode = getattr(args, "chat_template_mode", "auto") or "auto"
+    mode_suffix = "" if mode == "auto" else f"|chat_template:{mode}"
     raw_messages = getattr(args, "messages", None)
+    if not raw_messages and getattr(args, "prompt_file", None):
+        path = args.prompt_file
+        if path.lower().endswith((".txt", ".text", ".prompt")):
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    return f"prompt:{handle.read()}{mode_suffix}"
+            except OSError:
+                pass
+        else:
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    raw_messages = json.load(handle)
+                if isinstance(raw_messages, dict):
+                    raw_messages = raw_messages.get("messages")
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                raw_messages = None
     if raw_messages:
         try:
+            if isinstance(raw_messages, list) and raw_messages and isinstance(raw_messages[0], list):
+                raw_messages = raw_messages[0]
             messages = json.loads(raw_messages)
             payload = json.dumps(
                 messages,
@@ -341,9 +395,10 @@ def _cache_input_identity(args) -> str:
         except (TypeError, ValueError, json.JSONDecodeError):
             # Validation reports malformed JSON separately. Keep this fallback
             # deterministic so it does not mask the primary input error.
-            payload = str(raw_messages)
-        return f"messages:{payload}"
-    return f"prompt:{getattr(args, 'prompt', None) or ''}"
+            payload = json.dumps(raw_messages, ensure_ascii=False, sort_keys=True,
+                                 separators=(",", ":"))
+        return f"messages:{payload}{mode_suffix}"
+    return f"prompt:{getattr(args, 'prompt', None) or ''}{mode_suffix}"
 
 
 def _clean_l2_cache():
@@ -618,10 +673,15 @@ def _run_logits(args, ref_device, target_device, dtype):
             args.quant_model, device=target_device, dtype=dtype,
             quant_method=args.quant_method, use_fake_quant=(args.quant_method == "fake_quant"))
         ref_model.eval(); quant_model.eval()
-        ref_lc = collect_logits(ref_model, tokenizer, args.prompt,
-                                device=str(ref_device), max_new_tokens=args.max_new_tokens)
-        quant_lc = collect_logits(quant_model, tokenizer, args.prompt,
-                                  device=str(target_device), max_new_tokens=args.max_new_tokens)
+        rendered_text, input_ids = _resolve_input(args, tokenizer)
+        ref_lc = collect_logits(
+            ref_model, tokenizer, rendered_text, device=str(ref_device),
+            max_new_tokens=args.max_new_tokens, input_ids=input_ids,
+        )
+        quant_lc = collect_logits(
+            quant_model, tokenizer, rendered_text, device=str(target_device),
+            max_new_tokens=args.max_new_tokens, input_ids=input_ids,
+        )
         comp = compare_logits(ref_lc, quant_lc, tokenizer)
         n = len(comp.token_positions)
         logger.info(f"  [full] logits 采集 {n} 位置")
@@ -1223,7 +1283,16 @@ def _mode_inference(args):
                 quant_method=quant_method,
                 use_fake_quant=(quant_method == "fake_quant"))
             model.eval()
-            inputs = tok(prompt, return_tensors="pt").to(model.device if hasattr(model, "device") else device)
+            from accuracy_checker.input_resolver import resolve_model_input
+            direct_messages = _parse_messages(args)
+            resolved = resolve_model_input(
+                tok, prompt=prompt, messages=direct_messages,
+                source_kind="messages" if direct_messages is not None else "text",
+                thinking=getattr(args, "thinking", "chat"),
+                chat_template_mode=getattr(args, "chat_template_mode", "auto"),
+            )
+            target_device = model.device if hasattr(model, "device") else device
+            inputs = {"input_ids": resolved["input_ids"].to(target_device)}
             import time as _t
             t0 = _t.time()
             with torch.no_grad():

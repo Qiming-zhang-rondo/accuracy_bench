@@ -1618,22 +1618,27 @@ def _hf_verify_model_loaded(model: nn.Module, verbose: bool):
 
 
 def _hf_generate_conversation_batch(model, tokenizer, messages, request_tools, thinking,
-                                    max_new_tokens, first_device, conv_idx, batch_size, run_offset):
+                                    max_new_tokens, first_device, conv_idx, batch_size,
+                                    run_offset, chat_template_mode="auto"):
+    from .input_resolver import resolve_model_input
+
     raw_prompt = (len(messages) == 1 and messages[0].get("_raw_prompt") is True)
     if raw_prompt:
-        text = messages[0]["content"]
+        resolved = resolve_model_input(
+            tokenizer, prompt=messages[0]["content"], source_kind="text",
+            thinking=thinking, chat_template_mode=chat_template_mode,
+        )
     else:
         processed = preprocess_messages(messages)
-        template_kwargs = dict(conversation=processed, tokenize=False,
-                               add_generation_prompt=True, enable_thinking=(thinking == "chat"))
-        if request_tools: template_kwargs["tools"] = request_tools
-        text = tokenizer.apply_chat_template(**template_kwargs)
-    inputs = tokenizer(text, return_tensors="pt")
-    input_ids = inputs["input_ids"].to(first_device)
+        resolved = resolve_model_input(
+            tokenizer, messages=processed, source_kind="messages",
+            request_tools=request_tools, thinking=thinking,
+            chat_template_mode=chat_template_mode,
+        )
+    text = resolved["rendered_text"]
+    input_ids = resolved["input_ids"].to(first_device)
     batched_ids = input_ids.repeat(batch_size, 1)
-    attention_mask = inputs.get("attention_mask")
-    if attention_mask is not None:
-        attention_mask = attention_mask.to(first_device).repeat(batch_size, 1)
+    attention_mask = torch.ones_like(input_ids).repeat(batch_size, 1)
 
     last_user = [m["content"] for m in messages if m["role"] == "user"][-1] \
         if any(m["role"] == "user" for m in messages) else f"对话{conv_idx+1}"
@@ -1678,7 +1683,8 @@ def _hf_run_generation(model, tokenizer, prompt_file, thinking, max_new_tokens,
                        first_device, verbose: bool, num_runs: int = 1,
                        concurrency: int = 1,
                        stop_predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
-                       conversations_override=None, request_tools_override=None):
+                       conversations_override=None, request_tools_override=None,
+                       chat_template_mode: str = "auto"):
     if verbose:
         logger.info("\n[6/6] 推理测试...")
     if conversations_override is not None:
@@ -1698,6 +1704,7 @@ def _hf_run_generation(model, tokenizer, prompt_file, thinking, max_new_tokens,
             batch_results = _hf_generate_conversation_batch(
                 model, tokenizer, messages, request_tools, thinking,
                 max_new_tokens, first_device, i, batch_size, completed,
+                chat_template_mode,
             )
             results.extend(batch_results)
             completed += batch_size
@@ -1763,6 +1770,7 @@ def hf_inference_check(
     prefill_parallel: str = "pp",
     glm_attn_query_block: Optional[int] = None,
     glm_attn_selected_block: Optional[int] = None,
+    chat_template_mode: str = "auto",
 ) -> List[Dict[str, Any]]:
     """
     通用 HF 推理检查入口。
@@ -1854,6 +1862,7 @@ def hf_inference_check(
         verbose, num_runs=num_runs, concurrency=concurrency,
         stop_predicate=stop_predicate, conversations_override=conversations,
         request_tools_override=request_tools,
+        chat_template_mode=chat_template_mode,
     )
 
     # PPL

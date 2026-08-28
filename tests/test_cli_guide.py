@@ -58,6 +58,7 @@ class TestCliGuide(unittest.TestCase):
             "boundaryFields", "promptFile", "requestJson", "numRuns", "concurrency",
             "maxNewTokens", "noRef", "frameworkReproduced",
             "stopOnFirstBadcase", "repeat4gramMax", "nonprintableMax",
+            "chatTemplateMode",
         }
         self.assertTrue(required.issubset(self.parser.ids))
 

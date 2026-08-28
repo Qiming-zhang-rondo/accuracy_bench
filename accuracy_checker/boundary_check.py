@@ -251,6 +251,7 @@ def _run_transformers_on_path(
     prefill_parallel: str = "pp",
     glm_attn_query_block: Optional[int] = None,
     glm_attn_selected_block: Optional[int] = None,
+    chat_template_mode: str = "auto",
 ) -> List[Dict[str, Any]]:
     """在给定 model_path 上跑原生 Transformers generate, 复用 hf_inference_check 加载链。
 
@@ -299,6 +300,7 @@ def _run_transformers_on_path(
             prefill_parallel=prefill_parallel,
             glm_attn_query_block=glm_attn_query_block,
             glm_attn_selected_block=glm_attn_selected_block,
+            chat_template_mode=chat_template_mode,
         )
     finally:
         try:
@@ -463,11 +465,12 @@ def run_boundary(
     prefill_parallel: str = "pp",
     glm_attn_query_block: Optional[int] = None,
     glm_attn_selected_block: Optional[int] = None,
+    chat_template_mode: str = "auto",
 ) -> BoundaryResult:
     """定界主入口 — 区分 WEIGHT / INFERENCE_FRAMEWORK / BOTH / INCONCLUSIVE / INVALID_RUN。
 
     必给的 Bad Case 来源 (三选一, 优先级 prompt_file > messages > prompt):
-      prompt       : str, 单轮 plain text (自动包为 user message)
+      prompt       : str, 单轮 plain text (由 chat_template_mode 决定是否包装)
       messages     : List[Dict], chat-template 对话
       prompt_file  : vLLM 请求格式或对话列表 JSON
 
@@ -482,6 +485,13 @@ def run_boundary(
       - 量化模型 → hf_inference_check 内 NPU 加速反量化路径 (CPU fallback 未回迁)
       - 非量化模型 → 直接 safetensors 加载
     """
+    from .input_resolver import NEVER_MESSAGES_ERROR, normalize_chat_template_mode
+    try:
+        chat_template_mode = normalize_chat_template_mode(chat_template_mode)
+    except ValueError as exc:
+        return _invalid(str(exc), framework_name, framework_gen_config,
+                         framework_bad_reproduced)
+
     request_payload = dict(request_payload or {})
     if prompt_file and not request_payload:
         try:
@@ -520,6 +530,10 @@ def run_boundary(
         framework_gen_config, framework_bad_reproduced)
     if invalid_result is not None:
         return invalid_result
+    if (chat_template_mode == "never"
+            and not (len(messages) == 1 and messages[0].get("_raw_prompt") is True)):
+        return _invalid(NEVER_MESSAGES_ERROR, framework_name,
+                        framework_gen_config, framework_bad_reproduced)
 
     limitations: List[str] = []
     evidence: Dict[str, Any] = {
@@ -534,6 +548,7 @@ def run_boundary(
         "stop_on_first_badcase": stop_on_first_badcase,
         "expert_chunk_size": expert_chunk_size or 8,
         "prefill_parallel": prefill_parallel,
+        "chat_template_mode": chat_template_mode,
         "resident_experts": os.getenv("ACC_BOUNDARY_RESIDENT_EXPERTS", "1") != "0",
         "expert_cache_per_layer": int(
             os.getenv("ACC_BOUNDARY_EXPERT_CACHE_PER_LAYER", "16")),
@@ -566,7 +581,8 @@ def run_boundary(
         max_new_tokens, framework_gen_config, verbose, bad_pattern,
         evidence, limitations, framework_name, framework_bad_reproduced, fw_reproduced,
         num_runs, concurrency, stop_on_first_badcase, expert_chunk_size,
-        prefill_parallel, glm_attn_query_block, glm_attn_selected_block)
+        prefill_parallel, glm_attn_query_block, glm_attn_selected_block,
+        chat_template_mode)
     if invalid_result is not None:
         return invalid_result
 
@@ -575,7 +591,8 @@ def run_boundary(
         run_ref, ref_model_path, devices, dtype, messages, thinking,
         max_new_tokens, framework_gen_config, verbose, bad_pattern, evidence, limitations,
         num_runs, concurrency, stop_on_first_badcase, expert_chunk_size,
-        prefill_parallel, glm_attn_query_block, glm_attn_selected_block)
+        prefill_parallel, glm_attn_query_block, glm_attn_selected_block,
+        chat_template_mode)
 
     # ---- 分类 ----
     result_kind = classify_boundary(fw_reproduced, tq_reproduced, ref_reproduced)
@@ -607,7 +624,10 @@ def _boundary_resolve_conversation(messages, prompt, prompt_file, framework_name
         except Exception as e:
             return None, _invalid(f"prompt_file 加载失败: {e}", framework_name,
                                   framework_gen_config, framework_bad_reproduced)
-    return [{"role": "user", "content": prompt}], None
+    # Keep plain --prompt as text in auto/never mode.  The marker lets the
+    # shared renderer distinguish it from structured messages; ``always``
+    # will still wrap the text as a user message at render time.
+    return [{"role": "user", "content": prompt, "_raw_prompt": True}], None
 
 
 def _boundary_check_tokenizer(quant_model_path: str, ref_model_path: Optional[str],
@@ -691,7 +711,8 @@ def _boundary_run_quant(run_quant: bool, quant_model_path: str, devices: str,
                        expert_chunk_size: Optional[int],
                        prefill_parallel: str = "pp",
                        glm_attn_query_block: Optional[int] = None,
-                       glm_attn_selected_block: Optional[int] = None) -> Tuple[Optional[BoundaryResult], Optional[bool]]:
+                       glm_attn_selected_block: Optional[int] = None,
+                       chat_template_mode: str = "auto") -> Tuple[Optional[BoundaryResult], Optional[bool]]:
     """transformers(quant) 路径运行; 成功时返回 (None, tq_reproduced),
     失败时返回 (_invalid 结果, None)"""
     if not run_quant:
@@ -704,7 +725,8 @@ def _boundary_run_quant(run_quant: bool, quant_model_path: str, devices: str,
             stop_on_first_badcase=stop_on_first_badcase, bad_pattern=bad_pattern,
             expert_chunk_size=expert_chunk_size, prefill_parallel=prefill_parallel,
             glm_attn_query_block=glm_attn_query_block,
-            glm_attn_selected_block=glm_attn_selected_block)
+            glm_attn_selected_block=glm_attn_selected_block,
+            chat_template_mode=chat_template_mode)
         tq_reproduced, summary = _summarize_transformers_runs(
             qt_outputs, num_runs, concurrency, bad_pattern)
         evidence["transformers_run"]["quant"] = summary
@@ -726,7 +748,8 @@ def _boundary_run_ref(run_ref: bool, ref_model_path: Optional[str],
                      expert_chunk_size: Optional[int],
                      prefill_parallel: str = "pp",
                      glm_attn_query_block: Optional[int] = None,
-                     glm_attn_selected_block: Optional[int] = None) -> Optional[bool]:
+                     glm_attn_selected_block: Optional[int] = None,
+                     chat_template_mode: str = "auto") -> Optional[bool]:
     """transformers(ref) 路径运行 (可选); 失败时记录到 limitations 不中止"""
     if not (run_ref and ref_model_path):
         return None
@@ -738,7 +761,8 @@ def _boundary_run_ref(run_ref: bool, ref_model_path: Optional[str],
             stop_on_first_badcase=stop_on_first_badcase, bad_pattern=bad_pattern,
             expert_chunk_size=expert_chunk_size, prefill_parallel=prefill_parallel,
             glm_attn_query_block=glm_attn_query_block,
-            glm_attn_selected_block=glm_attn_selected_block)
+            glm_attn_selected_block=glm_attn_selected_block,
+            chat_template_mode=chat_template_mode)
         ref_reproduced, summary = _summarize_transformers_runs(
             ref_outputs, num_runs, concurrency, bad_pattern)
         evidence["transformers_run"]["ref"] = summary
@@ -827,6 +851,7 @@ def run_boundary_cli(args):
         prefill_parallel=getattr(args, "prefill_parallel", "pp"),
         glm_attn_query_block=getattr(args, "glm_attn_query_block", None),
         glm_attn_selected_block=getattr(args, "glm_attn_selected_block", None),
+        chat_template_mode=getattr(args, "chat_template_mode", "auto"),
     )
 
     out = boundary_result_to_dict(result)
