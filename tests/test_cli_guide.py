@@ -143,6 +143,12 @@ class TestCliGuide(unittest.TestCase):
             self.assertIn(marker, self.html if "boundary_runs" not in marker else RUN_SCRIPT.read_text(encoding="utf-8"))
         self.assertIn("npu:\" + logicalIds.join", self.html)
         self.assertIn("总结果仍为运行次数", self.html)
+        self.assertIn(
+            'setFieldVisibility("prefillParallelField", (l1Flow || mode === "boundary")',
+            self.html,
+        )
+        boundary_build = self.html.split('} else if (mode === "boundary") {', 2)[2]
+        self.assertIn('line("--prefill_parallel", "tp")', boundary_build)
 
     def test_report_runs_are_archived_and_latest_opens_history(self):
         run_source = RUN_SCRIPT.read_text(encoding="utf-8")

@@ -730,9 +730,9 @@
               <label for="prefillParallel">长 Prefill 并行</label>
               <select id="prefillParallel">
                 <option value="pp">pp · 按层分片（默认）</option>
-                <option value="tp">tp · DSA query 维度跨卡</option>
+                <option value="tp">tp · Query block 跨卡并行</option>
               </select>
-              <span class="hint">GLM 长 prompt 使用 TP 时，按 query block 分配到 Ref/Quant 设备组；每个 score block 受 query_block 限制，完整 K 每层只复制一次，模型层仍按 PP 放置。</span>
+              <span class="hint">GLM/DeepSeek-V4 长 prompt 使用 TP 时，按 query block 分配到对应设备组；完整 K 每层每 helper 只复制一次，模型层仍按 PP 放置。Boundary Quant-only 会使用全部 <code>--devices</code>。</span>
             </div>
             <div id="glmAttnQueryBlockField">
               <label for="glmAttnQueryBlock">GLM attention query block</label>
@@ -1016,7 +1016,7 @@
             <tr><td><code>--activation_quant_backend</code></td><td>auto</td><td>W4A4_DYNAMIC 在 NPU 上默认使用原生 npu_dynamic_quant；torch 仅用于无 NPU 自检或算子差异诊断。</td></tr>
             <tr><td><code>--activation_quant_group_size</code></td><td>128</td><td>W4A4_INT4_PER_GROUP 的 hidden-axis 分组大小；其他激活类型忽略。</td></tr>
             <tr><td><code>--compare_mode</code></td><td>dual</td><td>dual / grouped_dual；MoE 推荐 grouped_dual，DSpark 必须 dual。</td></tr>
-            <tr><td><code>--prefill_parallel</code></td><td>pp</td><td>GLM 长 prefill：pp 保留按层分片及 owner 单卡 blockwise attention；tp 默认按 query block 跨对应 Ref/Quant 设备组并行 indexer 和 sparse attention。Attention 的完整 K/V 每 helper 每层只复制一次，最后只 gather output；不会回到 dense Q×K。ACC_GLM_DSA_TP_STRATEGY=key 仅用于回退 indexer 的旧 K-axis 基线。默认 attention query=64、selected-key=512，可用 ACC_GLM_DSA_ATTN_QUERY_BLOCK / ACC_GLM_DSA_ATTN_SELECTED_BLOCK 调整显存与 launch 次数。</td></tr>
+            <tr><td><code>--prefill_parallel</code></td><td>pp</td><td>GLM/DeepSeek-V4 长 prefill：pp 保留按层分片及 owner 单卡 blockwise attention；tp 按 query block 跨设备组并行 indexer 和 sparse attention。Boundary Quant-only 使用全部 <code>--devices</code>，L1/full 使用对应 Ref/Quant 设备组。模型层 placement 仍为 PP。</td></tr>
             <tr><td><code>--glm_attn_query_block</code></td><td>64</td><td>GLM 长 prefill attention 的 query block 大小。增大可减少 launch 次数，但会增加临时显存；未指定时也可用 ACC_GLM_DSA_ATTN_QUERY_BLOCK。</td></tr>
             <tr><td><code>--glm_attn_selected_block</code></td><td>512</td><td>GLM attention selected top-k 的分块大小。workspace 近似按 query block×selected block 增长；未指定时也可用 ACC_GLM_DSA_ATTN_SELECTED_BLOCK。</td></tr>
             <tr><td><code>--ref_devices</code></td><td>空</td><td>grouped_dual 的 ref 多卡列表，例如 npu:0,1。</td></tr>
@@ -1224,7 +1224,7 @@
         var l2Flow = mode === "l2";
         var grouped = compare === "grouped_dual";
         setFieldVisibility("compareModeField", l1Flow && !dspark);
-        setFieldVisibility("prefillParallelField", l1Flow && !dspark);
+        setFieldVisibility("prefillParallelField", (l1Flow || mode === "boundary") && !dspark);
         setFieldVisibility("glmAttnQueryBlockField", l1Flow && !dspark);
         setFieldVisibility("glmAttnSelectedBlockField", l1Flow && !dspark);
         setFieldVisibility("layersPerShardField", l1Flow && !dspark);
@@ -1491,6 +1491,7 @@
         } else if (mode === "boundary") {
           addStatus("Boundary 仅运行纯 Transformers，不会调用部署框架", "ok");
           addStatus("Boundary 使用完整结构化请求；tokenizer ChatTemplate 只渲染一次", "ok");
+          addStatus("长 Prefill 并行：" + el.prefillParallel.value.toUpperCase(), "ok");
           addStatus("Quant 总运行 " + (el.numRuns.value || "1") + " 次，每批并发 " + (el.concurrency.value || "1") + "，逐次结果全部归档", "ok");
         } else if (type === "dspark") {
           addStatus("DSpark 推荐 2 张物理卡：ref/quant 各使用 1 张", "ok");
@@ -1628,6 +1629,7 @@
           var logicalIds = visibleIds().map(function (_, index) { return index; });
           args.push(line("--devices", "npu:" + logicalIds.join(",")));
           args.push(line("--dtype", el.dtype.value));
+          if (el.prefillParallel.value === "tp") args.push(line("--prefill_parallel", "tp"));
           args.push(line("--num_runs", el.numRuns.value || "1"));
           args.push(line("--concurrency", el.concurrency.value || "1"));
           if (el.expertChunkSize.value) args.push(line("--expert_chunk_size", el.expertChunkSize.value));
