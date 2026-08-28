@@ -89,6 +89,29 @@ def parse_request_json(raw: str) -> Dict[str, Any]:
         raise ValueError(f"request_json 不是合法 JSON: {exc}") from exc
 
 
+def _request_thinking_mode(request_payload: Dict[str, Any], default: str) -> str:
+    """Map OpenAI-style chat_template_kwargs.thinking to our CLI mode.
+
+    DeepSeek requests commonly carry ``{"thinking": false}`` inside
+    ``chat_template_kwargs``.  Without this bridge Boundary would silently
+    use the CLI default (``chat``) and compare a different rendered prompt.
+    Unknown/malformed values deliberately fall back to the explicit CLI mode.
+    """
+    kwargs = request_payload.get("chat_template_kwargs")
+    if not isinstance(kwargs, dict):
+        return default
+    value = kwargs.get("thinking", kwargs.get("enable_thinking"))
+    if isinstance(value, bool):
+        return "chat" if value else "none"
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"chat", "on", "true", "1", "yes"}:
+            return "chat"
+        if normalized in {"none", "off", "false", "0", "no"}:
+            return "none"
+    return default
+
+
 # ----- badcase 启发式判定 -----
 
 def repeat_4gram_ratio(text: str, n: int = 4) -> float:
@@ -505,6 +528,10 @@ def run_boundary(
         request_payload = normalize_request_payload(request_payload)
     if messages is None and isinstance(request_payload.get("messages"), list):
         messages = request_payload["messages"]
+    # A structured request is the source of truth for template-specific
+    # thinking settings.  This keeps DeepSeek-style ``thinking: false`` from
+    # being rendered again with the CLI's default ``--thinking chat``.
+    thinking = _request_thinking_mode(request_payload, thinking)
     if max_new_tokens is None:
         max_new_tokens = int(
             request_payload.get("max_new_tokens")
@@ -543,6 +570,7 @@ def run_boundary(
         "dtype": dtype,
         "max_new_tokens": max_new_tokens,
         "thinking": thinking,
+        "request_chat_template_kwargs": request_payload.get("chat_template_kwargs"),
         "num_runs": num_runs,
         "concurrency": concurrency,
         "stop_on_first_badcase": stop_on_first_badcase,
