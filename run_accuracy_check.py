@@ -794,6 +794,9 @@ def _mode_boundary(args):
         )
     if d.get("limitations"):
         logger.info("    限制: " + "; ".join(d["limitations"])[:500])
+    boundary_error = d.get("evidence", {}).get("error")
+    if boundary_error:
+        logger.error("    Transformers Boundary 错误: " + str(boundary_error))
     out_dir = _resolve_report_run_dir(args, "boundary")
     os.makedirs(out_dir, exist_ok=True)
     bpath = os.path.join(out_dir, "boundary_result.json")

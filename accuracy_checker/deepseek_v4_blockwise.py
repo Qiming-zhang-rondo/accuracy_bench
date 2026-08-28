@@ -787,7 +787,7 @@ def install_deepseek_v4_blockwise_runtime(
             logger.info(
                 "  DeepSeek-V4 blockwise long-prefill 已安装: threshold=%d, "
                 "query_block=%d, key_block=%d, mode=%s, strategy=%s, groups=%s",
-                threshold, query_block, mode,
+                threshold, query_block, key_block, mode,
                 "query_parallel" if mode == "tp" else "owner_blockwise", groups,
             )
             module._acc_v4_runtime_logged = True

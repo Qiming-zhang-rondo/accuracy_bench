@@ -813,6 +813,9 @@ def _invalid(
 ) -> BoundaryResult:
     e = evidence or {}
     e["error"] = reason
+    merged_limitations = list(limitations) if limitations else []
+    if reason not in merged_limitations:
+        merged_limitations.append(reason)
     return BoundaryResult(
         framework_name=framework_name,
         framework_badcase_reproduced=(fw_reproduced
@@ -822,7 +825,7 @@ def _invalid(
         ref_badcase_reproduced=None,
         boundary_result=INVALID_RUN,
         evidence=e,
-        limitations=(list(limitations) if limitations else [reason]),
+        limitations=merged_limitations,
     )
 
 
