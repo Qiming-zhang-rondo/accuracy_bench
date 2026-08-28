@@ -1119,12 +1119,18 @@ function renderHist(){
 // ====================================================================
 function renderBadcase(){
   const root=el("badcase");if(!root)return;
+  const section=el("badcase-section");
+  const navLink=document.querySelector('a[data-target="badcase-section"]');
   const I=R.inference_compare;
   if(!I){
+    if(section)section.style.display="none";
+    if(navLink)navLink.style.display="none";
     root.innerHTML='<div class="empty"><div class="empty-icon">—</div><div class="empty-text">未运行生成输出对比</div>'+
       '<div class="empty-hint">full / boundary 流程可记录 Ref 与 Quant 的实际生成结果</div></div>';
     return;
   }
+  if(section)section.style.display="";
+  if(navLink)navLink.style.display="";
   const rate=num(I.token_match_rate);
   const exact=I.exact_match===true;
   const first=I.first_divergence_pos;
