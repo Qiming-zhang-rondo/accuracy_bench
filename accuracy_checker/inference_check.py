@@ -1617,9 +1617,70 @@ def _hf_verify_model_loaded(model: nn.Module, verbose: bool):
         logger.info("  所有参数已加载到设备 ✅")
 
 
+def _hf_generation_kwargs(generation_config):
+    """Translate supported OpenAI/vLLM sampling fields to ``generate`` kwargs.
+
+    An explicitly positive temperature means sampling, including the common
+    ``temperature=1, top_p=1`` request.  Temperature zero remains greedy.
+    Unsupported OpenAI penalties fail fast instead of silently changing the
+    distribution used by Boundary.
+    """
+    config = dict(generation_config or {})
+    unsupported = []
+    for name in ("frequency_penalty", "presence_penalty"):
+        value = config.get(name)
+        if value not in (None, 0, 0.0):
+            unsupported.append(f"{name}={value}")
+    if unsupported:
+        raise ValueError(
+            "Transformers sampling 暂不支持严格对齐: " + ", ".join(unsupported)
+        )
+
+    temperature = config.get("temperature")
+    explicit_do_sample = config.get("do_sample")
+    if explicit_do_sample is not None:
+        do_sample = bool(explicit_do_sample)
+    elif temperature is not None:
+        do_sample = float(temperature) > 0
+    else:
+        top_p = config.get("top_p")
+        top_k = config.get("top_k")
+        do_sample = (
+            (top_p is not None and float(top_p) < 1.0)
+            or (top_k is not None and int(top_k) > 0)
+        )
+
+    kwargs = {"do_sample": do_sample}
+    if do_sample:
+        if temperature is not None and float(temperature) > 0:
+            kwargs["temperature"] = float(temperature)
+        if config.get("top_p") is not None:
+            kwargs["top_p"] = float(config["top_p"])
+        if config.get("top_k") is not None:
+            # vLLM uses -1/0 for disabled top-k; HF uses 0.
+            kwargs["top_k"] = max(0, int(config["top_k"]))
+    repetition_penalty = config.get("repetition_penalty")
+    if repetition_penalty not in (None, 1, 1.0):
+        kwargs["repetition_penalty"] = float(repetition_penalty)
+    return kwargs
+
+
+def _seed_hf_generation(generation_config):
+    seed = (generation_config or {}).get("seed")
+    if seed is None:
+        return None
+    seed = int(seed)
+    torch.manual_seed(seed)
+    npu = getattr(torch, "npu", None)
+    if npu is not None and hasattr(npu, "manual_seed_all"):
+        npu.manual_seed_all(seed)
+    return seed
+
+
 def _hf_generate_conversation_batch(model, tokenizer, messages, request_tools, thinking,
                                     max_new_tokens, first_device, conv_idx, batch_size,
-                                    run_offset, chat_template_mode="auto"):
+                                    run_offset, chat_template_mode="auto",
+                                    generation_config=None):
     from .input_resolver import resolve_model_input
 
     raw_prompt = (len(messages) == 1 and messages[0].get("_raw_prompt") is True)
@@ -1646,15 +1707,26 @@ def _hf_generate_conversation_batch(model, tokenizer, messages, request_tools, t
     logger.info(f"  输入 token 数: {input_ids.shape[1]}, batch={batch_size}, "
                 f"runs={run_offset + 1}-{run_offset + batch_size}")
 
+    sampling_kwargs = _hf_generation_kwargs(generation_config)
+    seed = _seed_hf_generation(generation_config)
+    sampling_desc = "sampling" if sampling_kwargs["do_sample"] else "greedy"
+    logger.info(
+        f"  生成策略: {sampling_desc}, "
+        f"temperature={sampling_kwargs.get('temperature', 'n/a')}, "
+        f"top_p={sampling_kwargs.get('top_p', 'n/a')}, "
+        f"top_k={sampling_kwargs.get('top_k', 'n/a')}, seed={seed}"
+    )
+
     with torch.no_grad():
         t0 = time.time()
         from transformers import LogitsProcessorList
         from .generation_progress import GenerationProgressProcessor
         progress = GenerationProgressProcessor(input_ids.shape[1], logger=logger)
         output = model.generate(batched_ids, attention_mask=attention_mask,
-                                max_new_tokens=max_new_tokens, do_sample=False,
+                                max_new_tokens=max_new_tokens,
                                 use_cache=True, return_dict_in_generate=True,
-                                logits_processor=LogitsProcessorList([progress]))
+                                logits_processor=LogitsProcessorList([progress]),
+                                **sampling_kwargs)
         gen_time = time.time() - t0
 
     results = []
@@ -1675,6 +1747,7 @@ def _hf_generate_conversation_batch(model, tokenizer, messages, request_tools, t
             "raw_text": decoded["raw_text"], "input_tokens": input_ids.shape[1],
             "output_tokens": len(new_tokens), "batch_time": gen_time, "time": gen_time,
             "thinking_truncated": decoded["thinking_truncated"],
+            "generation_config": {**sampling_kwargs, "seed": seed},
         })
     return results
 
@@ -1684,7 +1757,8 @@ def _hf_run_generation(model, tokenizer, prompt_file, thinking, max_new_tokens,
                        concurrency: int = 1,
                        stop_predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
                        conversations_override=None, request_tools_override=None,
-                       chat_template_mode: str = "auto"):
+                       chat_template_mode: str = "auto",
+                       generation_config=None):
     if verbose:
         logger.info("\n[6/6] 推理测试...")
     if conversations_override is not None:
@@ -1700,11 +1774,15 @@ def _hf_run_generation(model, tokenizer, prompt_file, thinking, max_new_tokens,
     for i, messages in enumerate(conversations):
         completed = 0
         while completed < num_runs:
-            batch_size = min(concurrency, num_runs - completed)
+            # A fixed seed denotes one deterministic request.  Run seeded
+            # requests individually so every repetition starts from that same
+            # RNG state instead of sharing a batch-level random stream.
+            seeded = (generation_config or {}).get("seed") is not None
+            batch_size = 1 if seeded else min(concurrency, num_runs - completed)
             batch_results = _hf_generate_conversation_batch(
                 model, tokenizer, messages, request_tools, thinking,
                 max_new_tokens, first_device, i, batch_size, completed,
-                chat_template_mode,
+                chat_template_mode, generation_config,
             )
             results.extend(batch_results)
             completed += batch_size
@@ -1771,6 +1849,7 @@ def hf_inference_check(
     glm_attn_query_block: Optional[int] = None,
     glm_attn_selected_block: Optional[int] = None,
     chat_template_mode: str = "auto",
+    generation_config: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     通用 HF 推理检查入口。
@@ -1863,6 +1942,7 @@ def hf_inference_check(
         stop_predicate=stop_predicate, conversations_override=conversations,
         request_tools_override=request_tools,
         chat_template_mode=chat_template_mode,
+        generation_config=generation_config,
     )
 
     # PPL

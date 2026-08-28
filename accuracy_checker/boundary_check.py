@@ -112,6 +112,20 @@ def _request_thinking_mode(request_payload: Dict[str, Any], default: str) -> str
     return default
 
 
+def _request_uses_sampling(config: Optional[Dict[str, Any]]) -> bool:
+    if not config:
+        return False
+    if config.get("do_sample") is not None:
+        return bool(config["do_sample"])
+    temperature = config.get("temperature")
+    if temperature is not None:
+        return float(temperature) > 0
+    return (
+        config.get("top_p") not in (None, 1, 1.0)
+        or config.get("top_k") not in (None, -1, 0)
+    )
+
+
 # ----- badcase 启发式判定 -----
 
 def repeat_4gram_ratio(text: str, n: int = 4) -> float:
@@ -324,6 +338,7 @@ def _run_transformers_on_path(
             glm_attn_query_block=glm_attn_query_block,
             glm_attn_selected_block=glm_attn_selected_block,
             chat_template_mode=chat_template_mode,
+            generation_config=framework_gen_config,
         )
     finally:
         try:
@@ -542,7 +557,7 @@ def run_boundary(
         key: request_payload[key]
         for key in (
             "temperature", "top_p", "top_k", "repetition_penalty",
-            "frequency_penalty", "presence_penalty", "seed", "tools",
+            "frequency_penalty", "presence_penalty", "seed", "do_sample", "tools",
         )
         if key in request_payload
     }
@@ -581,7 +596,8 @@ def run_boundary(
         "expert_cache_per_layer": int(
             os.getenv("ACC_BOUNDARY_EXPERT_CACHE_PER_LAYER", "16")),
         "generation_config": {
-            "do_sample": False,  # hf_inference_check 当前固定 greedy
+            "do_sample": _request_uses_sampling(framework_gen_config),
+            **(framework_gen_config or {}),
             "use_cache": True,
         },
         "framework_gen_config": framework_gen_config,
@@ -671,34 +687,32 @@ def _boundary_check_gen_config(framework_gen_config: Optional[Dict],
                                 evidence: Dict[str, Any],
                                 limitations: List[str]):
     """generation config 对齐 + seed 一致性检查"""
+    unsupported = []
     if framework_gen_config:
-        # hf_inference_check 只对齐了 max_new_tokens + thinking(do_sample=False)
-        unsupported = []
-        for k in ("temperature", "top_p", "top_k", "repetition_penalty",
-                  "frequency_penalty", "presence_penalty"):
-            if k in framework_gen_config and framework_gen_config[k] not in (None, 1.0, 0):
-                unsupported.append(f"{k}={framework_gen_config[k]}")
+        for key in ("frequency_penalty", "presence_penalty"):
+            value = framework_gen_config.get(key)
+            if value not in (None, 0, 0.0):
+                unsupported.append(f"{key}={value}")
         if unsupported:
             limitations.append(
-                "原生 Transformers 无法对齐框架 gen_config: "
+                "原生 Transformers 无法严格对齐框架 gen_config: "
                 + ", ".join(unsupported)
-                + " (hf_inference_check 走 greedy)"
             )
-        evidence["framework_gen_diff"] = unsupported
+    evidence["framework_gen_diff"] = unsupported
 
-    # ---- seed ----
-    # do_sample=False 时 greedy 本身确定性; 如框架用 sampling, 记录 limitation
-    fw_sampling = bool(framework_gen_config and (
-        framework_gen_config.get("temperature", 0) not in (None, 0, 1.0)
-        or framework_gen_config.get("top_p") not in (None, 1.0)
-        or framework_gen_config.get("top_k", -1) != -1
-    ))
+    # Sampling parameters are mirrored, but different runtimes do not promise
+    # identical RNG consumption or kernels even with the same seed.
+    fw_sampling = _request_uses_sampling(framework_gen_config)
     if fw_sampling:
         limitations.append(
-            "框架侧疑似用 sampling; 原生 Transformers 走 greedy, 复现性可能不严格"
+            "已对齐 sampling 参数；vLLM/Transformers 的 RNG 消费顺序与采样 kernel "
+            "可能不同，不保证逐 token 位级一致"
         )
-    evidence["seed_consistency"] = ("greedy 确定性" if not fw_sampling
-                                    else "框架 sampling, seed 不可严格对齐")
+    seed = (framework_gen_config or {}).get("seed")
+    evidence["seed_consistency"] = (
+        "greedy 确定性" if not fw_sampling else
+        (f"sampling seed={seed}" if seed is not None else "sampling 未指定 seed")
+    )
 
 
 def _boundary_detect_framework(framework_bad_reproduced: Optional[bool],

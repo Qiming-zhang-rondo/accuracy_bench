@@ -3,6 +3,7 @@
 import json
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 
@@ -96,10 +97,11 @@ class _FakeTokenizer:
 class _FakeModel:
     def __init__(self):
         self.batch_sizes = []
+        self.generate_kwargs = []
 
     def generate(self, input_ids, **kwargs):
-        del kwargs
         self.batch_sizes.append(input_ids.shape[0])
+        self.generate_kwargs.append(kwargs)
         suffix = torch.tensor([[7, 8]]).repeat(input_ids.shape[0], 1)
         return SimpleNamespace(sequences=torch.cat([input_ids, suffix], dim=1))
 
@@ -117,3 +119,36 @@ def test_hf_generation_batches_total_runs_not_runs_times_concurrency():
     assert model.batch_sizes == [3, 3, 3, 1]
     assert len(results) == 10
     assert [result["run_index"] for result in results] == list(range(1, 11))
+
+
+def test_boundary_sampling_config_reaches_transformers_generate():
+    from accuracy_checker.inference_check import _hf_run_generation
+
+    model = _FakeModel()
+    _hf_run_generation(
+        model, _FakeTokenizer(), None, "none", 16, "cpu", False,
+        num_runs=1, concurrency=1,
+        conversations_override=[[{"role": "user", "content": "hello"}]],
+        generation_config={"temperature": 1, "top_p": 1, "top_k": 100},
+    )
+
+    kwargs = model.generate_kwargs[0]
+    assert kwargs["do_sample"] is True
+    assert kwargs["temperature"] == 1.0
+    assert kwargs["top_p"] == 1.0
+    assert kwargs["top_k"] == 100
+
+
+def test_temperature_zero_maps_to_greedy():
+    from accuracy_checker.inference_check import _hf_generation_kwargs
+
+    assert _hf_generation_kwargs({"temperature": 0, "top_k": 100}) == {
+        "do_sample": False,
+    }
+
+
+def test_unsupported_openai_penalty_fails_fast():
+    from accuracy_checker.inference_check import _hf_generation_kwargs
+
+    with pytest.raises(ValueError, match="frequency_penalty"):
+        _hf_generation_kwargs({"temperature": 1, "frequency_penalty": 0.5})
