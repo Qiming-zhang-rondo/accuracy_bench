@@ -26,6 +26,21 @@ class _Tokenizer:
         return {"input_ids": torch.tensor([[1, 2]])}
 
 
+class _DeepSeekV4NoTemplateTokenizer(_Tokenizer):
+    name_or_path = "/models/DeepSeek-V4-Flash-0731-W4A8"
+
+    def apply_chat_template(self, conversation, tokenize=False,
+                            return_tensors=None, **kwargs):
+        raise ValueError(
+            "Cannot use chat template functions because tokenizer.chat_template "
+            "is not set"
+        )
+
+    def __call__(self, text, return_tensors=None, add_special_tokens=True):
+        self.tokenize_calls.append(text)
+        return {"input_ids": torch.tensor([[1, 2, 3]])}
+
+
 def test_auto_prompt_stays_raw():
     tok = _Tokenizer()
     resolved = resolve_model_input(tok, prompt="hello", chat_template_mode="auto")
@@ -100,3 +115,18 @@ def test_request_json_messages_are_structured():
     )
     assert resolved["source_kind"] == "messages"
     assert json.dumps(request["messages"], ensure_ascii=False)
+
+
+def test_deepseek_v4_without_template_uses_runtime_encoder_fallback():
+    tok = _DeepSeekV4NoTemplateTokenizer()
+    resolved = resolve_model_input(
+        tok,
+        messages=[{"role": "user", "content": "hello"}],
+        chat_template_mode="auto",
+        thinking="none",
+    )
+    assert resolved["rendered_text"] == (
+        "<｜begin▁of▁sentence｜><｜User｜>hello"
+        "<｜Assistant｜></think>"
+    )
+    assert resolved["input_ids"].tolist() == [[1, 2, 3]]

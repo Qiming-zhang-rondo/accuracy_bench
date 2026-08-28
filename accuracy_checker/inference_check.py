@@ -1408,6 +1408,24 @@ def _hf_load_tokenizer(model_path: str, verbose: bool):
         tokenizer = AutoTokenizer.from_pretrained(
             model_path, trust_remote_code=True,
             tokenizer_class="PreTrainedTokenizerFast")
+    # Some converted checkpoints carry the tokenizer files but omit the
+    # optional Jinja file.  Load it only into this in-memory tokenizer object;
+    # never write into the quantized model directory.  DeepSeek-V4 official
+    # releases commonly omit this file and are handled by the encoder-format
+    # fallback in input_resolver.py.
+    if not getattr(tokenizer, "chat_template", None):
+        template_path = os.path.join(model_path, "chat_template.jinja")
+        if os.path.isfile(template_path):
+            try:
+                with open(template_path, encoding="utf-8") as f:
+                    tokenizer.chat_template = f.read()
+                if verbose:
+                    logger.info("  已加载模型目录 chat_template.jinja（仅运行时，不修改模型文件）")
+            except OSError as exc:
+                logger.warning("  chat_template.jinja 读取失败: %s", exc)
+        elif "deepseek" in str(model_path).lower() and "v4" in str(model_path).lower():
+            if verbose:
+                logger.info("  DeepSeek-V4 未提供 Jinja chat_template，将使用官方 encoder 兼容格式")
     if verbose:
         logger.info(f"  vocab_size: {tokenizer.vocab_size}")
     return tokenizer
