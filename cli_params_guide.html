@@ -842,7 +842,7 @@
             <div class="wide" id="promptField">
               <label for="prompt">Prompt</label>
               <textarea id="prompt">Write a poem in the style of a limerick about a programmer debugging at 3 AM.</textarea>
-              <span class="hint">普通模式填写部署时真实收到的输入；boundary 模式直接粘贴长文本也可以，生成器会自动改用 <code>--prompt_stdin</code>，不会把全文放进 argv。</span>
+              <span class="hint">L1/full 普通模式填写部署时真实收到的输入；长文本可改用下方 Prompt 文件。</span>
             </div>
             <div id="chatTemplateModeField">
               <label for="chatTemplateMode">Chat Template</label>
@@ -861,15 +861,15 @@
           </div>
 
           <div id="boundaryFields" class="grid-3 hidden" aria-hidden="true">
-            <div class="wide">
-              <label for="promptFile">Boundary 请求文件 <span class="optional">JSON / 原始 TXT / Jinja</span></label>
+            <div class="wide hidden" id="boundaryPromptFileField">
+              <label for="promptFile">Boundary 请求文件 <span class="optional">CLI 兼容入口</span></label>
               <input id="promptFile" type="text" autocomplete="off" placeholder="/path/to/request.json 或 /path/to/prompt.txt">
-              <span class="hint">已有文件时填写；不想创建文件可直接使用下方文本框。</span>
+              <span class="hint">命令行/API 仍兼容；参数页面统一使用下方结构化请求。</span>
             </div>
             <div class="wide">
-              <label for="requestJson">直接粘贴完整请求 JSON <span class="optional">推荐</span></label>
+              <label for="requestJson">Boundary 完整请求 JSON <span class="optional">必填</span></label>
               <textarea id="requestJson" placeholder='{"model":"glm-52","max_tokens":102400,"messages":[{"role":"user","content":"..."}]}'></textarea>
-              <span class="hint">不能带 Markdown 代码围栏；messages 必须为非空数组。读取 messages、tools 和 max_tokens，model 仅记录。</span>
+              <span class="hint">Boundary 只接受结构化请求：填写 <code>model</code>（模型标识）和非空 <code>messages</code>；tokenizer 会按模型自带 ChatTemplate 渲染一次。长 JSON 会通过 heredoc 送入 stdin，不会触发 Argument list too long。</span>
             </div>
             <div><label for="numRuns">总运行次数</label><input id="numRuns" type="number" min="1" value="100"></div>
             <div><label for="concurrency">每批并发数</label><input id="concurrency" type="number" min="1" value="10"><span class="hint">batched Transformers generate；总结果仍为运行次数。</span></div>
@@ -991,8 +991,8 @@
             <tr><td><code>--l1</code> / <code>--l2</code> / <code>--all</code> / <code>--boundary</code></td><td>false</td><td>历史兼容开关；新命令优先使用 <code>--mode</code>。</td></tr>
             <tr><td><code>--prompt</code></td><td>内置中文短句</td><td>对齐或生成输入。应使用真实 bad case 的原始输入。</td></tr>
             <tr><td><code>--messages</code></td><td>空</td><td>Chat messages JSON；在 auto/always 下调用 tokenizer 的 apply_chat_template。</td></tr>
-            <tr><td><code>--chat_template_mode</code></td><td>auto</td><td>auto：structured messages 套模板、普通/原始文本不套；always：普通/原始文本也包装为 user message 后套模板；never：原样 tokenize，structured messages 直接报错。</td></tr>
-            <tr><td><code>--prompt_file</code></td><td>空</td><td>支持完整请求 JSON、对话列表和 .txt/.prompt 原始 Jinja/ChatML prompt；最终是否套模板由 <code>--chat_template_mode</code> 决定。</td></tr>
+            <tr><td><code>--chat_template_mode</code></td><td>auto</td><td>L1/full/inference 的输入控制：auto 为 messages 套模板、普通/原始文本不套；always 将文本包装为 user 后套模板；never 原样 tokenize 且禁止 structured messages。Boundary 页面固定使用 structured messages + auto，避免重复渲染。</td></tr>
+            <tr><td><code>--prompt_file</code></td><td>空</td><td>L1/full 支持完整请求 JSON、对话列表和 .txt/.prompt 原始 Jinja/ChatML prompt；Boundary CLI/API 仍兼容请求文件，参数页面统一使用结构化请求 JSON。</td></tr>
             <tr><td><code>--request_json</code></td><td>空</td><td>直接粘贴完整请求 JSON；短请求适用，内容格式与 prompt_file 相同。</td></tr>
             <tr><td><code>--request_json_stdin</code></td><td>false</td><td>从 stdin 读取完整请求 JSON；适合超长 prompt，避免 shell 的 Argument list too long。</td></tr>
             <tr><td><code>--prompt_stdin</code></td><td>false</td><td>从 stdin 读取 Boundary/L1/full 原始文本/Jinja prompt；页面检测到直接粘贴内容时自动生成，避免 shell 的 Argument list too long。</td></tr>
@@ -1246,7 +1246,11 @@
         setFieldVisibility("frameworkBadOutputField", mode === "boundary");
         setFieldVisibility("boundaryFields", mode === "boundary");
         setFieldVisibility("rawPromptFileField", ["l1", "full"].indexOf(mode) !== -1 && !dspark);
-        setFieldVisibility("chatTemplateModeField", mode !== "screening" && mode !== "l2" && !dspark);
+        setFieldVisibility("chatTemplateModeField", mode !== "screening" && mode !== "l2" && mode !== "boundary" && !dspark);
+        // Boundary uses structured messages and the default auto renderer;
+        // never expose a stale L1/full selection as if it affected boundary.
+        el.chatTemplateMode.disabled = mode === "boundary";
+        if (mode === "boundary") el.chatTemplateMode.value = "auto";
         setFieldVisibility("advancedOptions", mode === "boundary" || (l1Flow && grouped && !dspark));
         var kimiL1 = type === "kimi_k3" && l1Flow;
         setFieldVisibility("kimiKdaField", kimiL1);
@@ -1412,8 +1416,8 @@
           try {
             var requestData = JSON.parse(directRequest);
             if (Array.isArray(requestData)) requestData = { messages: requestData };
-            if (!requestData || typeof requestData !== "object" || !Array.isArray(requestData.messages) || !requestData.messages.length) {
-              addIssue(errors, "requestJson", "完整请求必须是 JSON object，且 messages 为非空数组");
+            if (!requestData || typeof requestData !== "object" || Array.isArray(requestData) || typeof requestData.model !== "string" || !requestData.model.trim() || !Array.isArray(requestData.messages) || !requestData.messages.length) {
+              addIssue(errors, "requestJson", "Boundary 请求必须包含非空 model 和 messages 数组");
             } else {
               requestData.messages.forEach(function (message, index) {
                 if (!message || typeof message !== "object" || typeof message.role !== "string" || (!("content" in message) && !message.tool_calls)) {
@@ -1451,7 +1455,10 @@
         if (mode === "boundary" && el.maxNewTokens.value && Number(el.maxNewTokens.value) * Number(el.concurrency.value) > 65536) {
           warnings.push("max_new_tokens × concurrency 很大，请确认 16 卡 KV cache 余量");
         }
-        if (mode !== "screening" && type !== "dspark" && !el.prompt.value.trim() && !el.rawPromptFile.value.trim() && !(mode === "boundary" && (promptFile || directRequest))) {
+        if (mode === "boundary" && !directRequest && !promptFile) {
+          addIssue(errors, "requestJson", "Boundary 需要填写完整结构化请求 JSON（含 model 和 messages）");
+        }
+        if (mode !== "screening" && mode !== "boundary" && type !== "dspark" && !el.prompt.value.trim() && !el.rawPromptFile.value.trim()) {
           addIssue(errors, "prompt", "该模式需要非空 Prompt");
         }
         var outputDir = el.outputDir.value.trim();
@@ -1483,6 +1490,7 @@
           addStatus("MLA 诊断：" + (el.mlaFine.value === "fine" ? "细粒度" : "粗粒度"), "ok");
         } else if (mode === "boundary") {
           addStatus("Boundary 仅运行纯 Transformers，不会调用部署框架", "ok");
+          addStatus("Boundary 使用完整结构化请求；tokenizer ChatTemplate 只渲染一次", "ok");
           addStatus("Quant 总运行 " + (el.numRuns.value || "1") + " 次，每批并发 " + (el.concurrency.value || "1") + "，逐次结果全部归档", "ok");
         } else if (type === "dspark") {
           addStatus("DSpark 推荐 2 张物理卡：ref/quant 各使用 1 张", "ok");
@@ -1555,12 +1563,17 @@
         }
         dsparkFields.classList.toggle("hidden", !dspark);
         dsparkFields.setAttribute("aria-hidden", dspark ? "false" : "true");
-        promptField.classList.toggle("hidden", dspark || mode === "screening");
+        // Boundary deliberately has a separate structured-request input.  Keep
+        // the legacy prompt/file API available for hand-written CLI scripts,
+        // but do not expose three competing input paths in the guide.
+        promptField.classList.toggle("hidden", dspark || mode === "screening" || mode === "boundary");
         updateModeFields(type, mode, compare, dspark);
 
         commands.push("ASCEND_RT_VISIBLE_DEVICES=" + visible + " OMP_NUM_THREADS=8 \\");
         args.push("python3 run_accuracy_check.py --mode " + mode);
-        if (el.chatTemplateMode.value !== "auto") {
+        // Boundary structured messages always use the model tokenizer's
+        // template exactly once; ChatTemplate is a L1/full input choice.
+        if (mode !== "boundary" && el.chatTemplateMode.value !== "auto") {
           args.push(line("--chat_template_mode", el.chatTemplateMode.value));
         }
 
