@@ -617,7 +617,7 @@ _V2_JS = r"""
 (function(){
 "use strict";
 const R = window.__REPORT__;
-const C={ref:"#176B55",quant:"#C2705C",good:"#238164",warn:"#B87710",bad:"#A53939",na:"#8A929C",deg:"#D97706",ink:"#17202B",muted:"#66717F",border:"#D9D4C9"};
+const C={ref:"#176B55",quant:"#C2705C",topk:"#4F46E5",good:"#238164",warn:"#B87710",bad:"#A53939",na:"#8A929C",deg:"#D97706",ink:"#17202B",muted:"#66717F",border:"#D9D4C9"};
 const el=(id)=>document.getElementById(id);
 const ns="http://www.w3.org/2000/svg";
 function E(tag,attrs){const e=document.createElementNS(ns,tag);if(attrs)for(const k in attrs)e.setAttribute(k,attrs[k]);return e;}
@@ -988,7 +988,7 @@ function renderScatter(){
 function renderLines(){
   const root=el("logits_lines");if(!root)return;
   const L=R.logits;const ps=L.token_positions||[];
-  const ser=[["cos",L.token_wise_cos,C.ref],["topk_overlap",L.token_wise_topk_overlap,C.good]];
+  const ser=[["cos",L.token_wise_cos,C.ref],["topk_overlap",L.token_wise_topk_overlap,C.topk]];
   const W=900,H=240,m=36;const yl=[0,1];
   const X=i=>m+(W-2*m)*(ps.length<=1?0.5:i/(ps.length-1||1));
   const Y=v=>(H-m)-(H-2*m)*(v-yl[0])/(yl[1]-yl[0]);
@@ -1021,7 +1021,7 @@ function renderLines(){
   appendChart(root,s);
   const lg=document.createElement("div");lg.className="tip";lg.innerHTML=
     '<span class="legend-chip" style="background:'+C.ref+'"></span>cos(ref,quant logits) '
-    +'<span class="legend-chip" style="background:'+C.good+'"></span>top-k overlap '
+    +'<span class="legend-chip" style="background:'+C.topk+'"></span>top-k overlap '
     +'KL(平均)='+avgKL();
   root.appendChild(lg);
   // KL mini chart
