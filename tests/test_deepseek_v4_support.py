@@ -46,6 +46,25 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.mlp = _Moe()
 
 
+def test_converted_v4_config_is_not_misclassified_as_v3():
+    from accuracy_checker.model_loader import _looks_like_deepseek_v4_config
+
+    assert _looks_like_deepseek_v4_config({"model_type": "deepseek_v4"})
+    assert _looks_like_deepseek_v4_config({
+        "model_type": "deepseek_v3",
+        "architectures": ["DeepseekV4ForCausalLM"],
+    })
+    assert _looks_like_deepseek_v4_config({
+        "model_type": "deepseek_v3",
+        "hc_mult": 4,
+        "compress_ratios": [128, 128, 4],
+    })
+    assert not _looks_like_deepseek_v4_config({
+        "model_type": "deepseek_v3",
+        "num_hidden_layers": 61,
+    })
+
+
 def test_v4_detection_and_fine_subgraphs():
     from accuracy_checker.subgraph_locate import detect_model_type, get_subgraph_names
 

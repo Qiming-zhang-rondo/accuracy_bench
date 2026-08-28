@@ -15,7 +15,7 @@ import json
 import gc
 import sys
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -73,6 +73,64 @@ def _ensure_deepseek_v4_registered():
 _ensure_deepseek_v4_registered()
 
 
+def _read_raw_model_config(model_path: str) -> Dict[str, Any]:
+    config_path = os.path.join(model_path, "config.json")
+    try:
+        with open(config_path, "r", encoding="utf-8") as handle:
+            value = json.load(handle)
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _looks_like_deepseek_v4_config(raw_config: Dict[str, Any]) -> bool:
+    model_type = str(raw_config.get("model_type", "")).lower()
+    architectures = [
+        str(name).lower() for name in (raw_config.get("architectures") or [])
+    ]
+    if model_type == "deepseek_v4" or any("deepseekv4" in name for name in architectures):
+        return True
+    # Some converted/rotated checkpoints retain ``deepseek_v3`` as the
+    # model_type even though the actual graph is V4.  Require multiple V4-only
+    # architecture fields so ordinary V3 checkpoints are never upgraded by
+    # path-name guesswork.
+    v4_markers = (
+        "hc_mult", "compress_ratios", "compress_rate_csa",
+        "compress_rate_hca", "mlp_layer_types",
+    )
+    return sum(key in raw_config for key in v4_markers) >= 2
+
+
+def _load_model_config(model_path: str):
+    """Load AutoConfig, correcting converted V4 checkpoints misread as V3."""
+    raw_config = _read_raw_model_config(model_path)
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    if not _looks_like_deepseek_v4_config(raw_config):
+        return config
+
+    try:
+        from transformers.models.deepseek_v4.configuration_deepseek_v4 import (
+            DeepseekV4Config,
+        )
+    except ImportError:
+        return config
+
+    if not isinstance(config, DeepseekV4Config) or not hasattr(config, "layer_types"):
+        logger.warning(
+            "  DeepSeek-V4 checkpoint 被 AutoConfig 解析为 %s；"
+            "按原始 V4 config.json 重新构造 DeepseekV4Config",
+            type(config).__name__,
+        )
+        config = DeepseekV4Config.from_dict(raw_config)
+    if not getattr(config, "layer_types", None):
+        raise RuntimeError(
+            "DeepSeek-V4 config 重建后仍缺少 layer_types；请确认 config.json "
+            "包含 V4 的 compress_ratios/layer_types"
+        )
+    config.architectures = ["DeepseekV4ForCausalLM"]
+    return config
+
+
 def require_model_runtime_support(model_path: str) -> None:
     """Fail early with an actionable error for architectures missing in HF.
 
@@ -80,13 +138,8 @@ def require_model_runtime_support(model_path: str) -> None:
     standard ``config.json``: the actual implementation must exist in the
     installed Transformers package.
     """
-    config_path = os.path.join(model_path, "config.json")
-    try:
-        with open(config_path, "r", encoding="utf-8") as handle:
-            model_type = str(json.load(handle).get("model_type", "")).lower()
-    except (OSError, json.JSONDecodeError):
-        return
-    if model_type != "deepseek_v4":
+    raw_config = _read_raw_model_config(model_path)
+    if not _looks_like_deepseek_v4_config(raw_config):
         return
     try:
         from transformers.models.deepseek_v4.configuration_deepseek_v4 import (  # noqa: F401
@@ -2709,7 +2762,7 @@ def create_model_skeleton(
     if is_dspark:
         config = None
     else:
-        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        config = _load_model_config(model_path)
 
     # 多模态 ForConditionalGeneration 模型 (如 Qwen3.6): num_hidden_layers 在 text_config 里
     if config is not None and not hasattr(config, 'num_hidden_layers'):
