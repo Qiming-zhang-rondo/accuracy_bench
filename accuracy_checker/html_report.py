@@ -1085,8 +1085,6 @@ function renderTopK(i){
   const maxp=Math.max(...rows.map(t=>Math.max(num(t.ref_prob)||0,num(t.quant_prob)||0)),0.001);
   const X=v=>mL+(W-mL-mR)*v/maxp;
   const s=svgBox(W,H);
-  const k=Math.max(rf.length,qf.length);
-  const t1=E("text",{x:mL,y:12,"text-anchor":"start",class:"axis"});t1.textContent="Position "+pos+" · "+role+" — Top-"+k+" 概率 (蓝=ref, 橙=quant)";s.appendChild(t1);
   rows.forEach((t,r)=>{const y=mT+r*h;
     const rp=num(t.ref_prob),qp=num(t.quant_prob);
     const lblClean=(t.token_str||'').replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\x00-\x1f\x7f]/g,'').trim();
@@ -1098,7 +1096,7 @@ function renderTopK(i){
     if(qp!==null){const w=Math.max(X(qp)-mL,2);const rr=E("rect",{x:mL,y:y+h/2,width:w,height:h/2-1,fill:C.quant,opacity:0.85,rx:2});s.appendChild(rr);}
   });
   // legend
-  const lg=E("text",{x:W-mR,y:H-4,"text-anchor":"end",class:"axis","font-size":"9"});lg.textContent="蓝(粗)=ref 概率 · 橙(细)=quant 概率";s.appendChild(lg);
+  const lg=E("text",{x:W-mR,y:H-4,"text-anchor":"end",class:"axis","font-size":"9"});lg.textContent="绿(粗)=ref 概率 · 橙(细)=quant 概率";s.appendChild(lg);
   const top1Arr=R.logits.token_wise_top1_match||[];
   const matchCnt=top1Arr.filter(x=>x===true).length;
   const tot=top1Arr.length;
@@ -1109,7 +1107,7 @@ function renderTopK(i){
   const card=document.createElement("div");
   card.className="card";
   card.innerHTML='<h3>Top-K 概率并排 '+hIcon("top1_match")+' <span class="'+summaryCls+'">'+summaryBadge+'</span></h3>'
-    +'<div class="tip">Position '+pos+' · '+role+' — 当前: '+matchBadge+' · 蓝(粗)=ref 概率 · 橙(细)=quant 概率 · 使用 Position 选择器或折线节点切换</div>';
+    +'<div class="tip"><b>Position '+pos+' · '+role+'</b> — 当前: '+matchBadge+' · 绿(粗)=Ref 概率 · 橙(细)=Quant 概率 · 使用下方 Position 选择器或折线节点切换</div>';
   const picker=document.createElement("div");picker.className="position-picker";picker.setAttribute("aria-label","Top-K position selector");
   const overlapArr=L.token_wise_topk_overlap||[];
   L.token_positions.forEach((p,j)=>{const b=document.createElement("button");b.type="button";
