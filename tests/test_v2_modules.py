@@ -51,12 +51,14 @@ class TestReportSchema:
                     ],
                 ),
             ],
+            run_mode="full",
         )
         j = rd.to_json()
         rd2 = ReportData.from_dict(json.loads(j))
         assert rd2.overview.model_name == "GLM-5.1"
         assert rd2.l1_layers[0].cos_sim == 0.965
         assert rd2.l2_results[0].root_suspect == "attn.q_a_proj"
+        assert rd2.run_mode == "full"
 
     def test_nan_inf_sanitized(self):
         from accuracy_checker.report_schema import L1LayerData, ReportData
@@ -232,6 +234,7 @@ class TestHtmlReportV2:
             ),
             l1_layers=[L1LayerData(layer_idx=3, cos_sim=0.97, rel_l2=0.1, snr=15.0)],
             run_status="PARTIAL",
+            run_mode="l1",
         )
         self._write_report(tmp_path / "run_a", rd_a, age_sec=100)
         # run_b: newer, run_status=SUCCESS, boundary=CLEAN
@@ -241,6 +244,7 @@ class TestHtmlReportV2:
                 boundary_result="CLEAN", first_divergence_layer=None,
             ),
             run_status="SUCCESS",
+            run_mode="boundary",
             inference_compare=InferenceCompareData(
                 prompt="yo", ref_output="hello", quant_output="hello",
                 ref_tokens=["hello"], quant_tokens=["hello"],
@@ -278,13 +282,16 @@ class TestHtmlReportV2:
         assert sb[0]["run_status"] == "SUCCESS"
         assert sb[0]["boundary"] == "CLEAN"
         assert sb[0]["token_rate"] == 1.0
+        assert sb[0]["run_mode"] == "BOUNDARY"
         assert sb[1]["model_name"] == "model-A"
         assert sb[1]["run_status"] == "PARTIAL"
+        assert sb[1]["run_mode"] == "L1"
         # First-divergence layer propagates into sidebar summary
         assert sb[1]["first_div"] == 3
         # __switchReport wiring
         assert "window.__switchReport" in html
         assert "renderSidebar" in html
+        assert "si-badge mode" in html
         # Polish: listener-accumulation guard in boot()
         assert "__accInitDone" in html
         # Polish: mobile responsive media query

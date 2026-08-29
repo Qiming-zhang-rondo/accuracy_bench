@@ -196,6 +196,7 @@ class ReportData:
     logits: Optional[LogitsData] = None
     inference_compare: Optional[InferenceCompareData] = None
     run_status: str = PARTIAL               # 默认部分跑通，assemble 时细化
+    run_mode: str = ""                     # l1 / l2 / boundary / full
 
     # ---- 序列化 ----
     def to_dict(self) -> Dict[str, Any]:
@@ -218,6 +219,7 @@ class ReportData:
         return cls(
             overview=ov, l1_layers=l1, l2_results=l2,
             logits=logits, inference_compare=inference_compare, run_status=status,
+            run_mode=str(d.get("run_mode") or ""),
         )
 
 

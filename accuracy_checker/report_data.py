@@ -390,6 +390,7 @@ def assemble_report(
     activation_quant_type: str = "",
     activation_quant_backend: str = "",
     activation_quant_group_size: Optional[int] = None,
+    run_mode: str = "",
 ) -> ReportData:
     """从各模块收集结果, 组装成统一 ReportData JSON。
 
@@ -507,6 +508,7 @@ def assemble_report(
         logits=logits,
         inference_compare=inference_compare,
         run_status=status,
+        run_mode=str(run_mode or "").lower(),
     )
 
 

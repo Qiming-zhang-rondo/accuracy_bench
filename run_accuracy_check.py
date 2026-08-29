@@ -910,6 +910,7 @@ def _mode_boundary(args):
             device_mode=str(devices),
             prompt=prompt_text,
             input_mode="messages",
+            run_mode="boundary",
         )
         report_json_path = os.path.join(out_dir, "report_data.json")
         with open(report_json_path, "w", encoding="utf-8") as f:
@@ -1019,6 +1020,7 @@ def _write_stage_report_artifacts(args, report, mode):
         activation_quant_type=getattr(args, "activation_quant_type", "") or "",
         activation_quant_backend=getattr(args, "activation_quant_backend", "") or "",
         activation_quant_group_size=getattr(args, "activation_quant_group_size", None),
+        run_mode=mode,
     )
     json_path = os.path.join(out_dir, "report_data.json")
     with open(json_path, "w", encoding="utf-8") as f:
@@ -1275,6 +1277,7 @@ def _full_assemble_and_write(args, l1_report, l2_results, boundary_dict,
         activation_quant_type=getattr(args, "activation_quant_type", "") or "",
         activation_quant_backend=getattr(args, "activation_quant_backend", "") or "",
         activation_quant_group_size=getattr(args, "activation_quant_group_size", None),
+        run_mode="full",
     )
     logger.info(f"  run_status = {report_data.run_status}")
 

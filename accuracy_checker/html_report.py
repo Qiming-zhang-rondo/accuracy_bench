@@ -556,9 +556,10 @@ table.grid-tbl tr:hover td { background:var(--accent-soft); }
 .position-btn:hover { color:var(--navy); border-color:var(--border-strong); }
 .position-btn.active { color:#fff; background:var(--accent); border-color:var(--accent); }
 .position-btn.topk-match { color:#176B55; border-color:#B8DCCB; background:#F1FAF5; }
-.position-btn.topk-mismatch { color:#A53939; border-color:#E7B7B2; background:#FDF0EE; }
+.position-btn.topk-mismatch { color:#fff; border-color:var(--bad); background:var(--bad); }
 .position-btn.topk-match.active { color:#fff; background:var(--accent); border-color:var(--accent); }
-.position-btn.topk-mismatch.active { color:#fff; background:var(--bad); border-color:var(--bad); }
+.position-btn.topk-mismatch:hover { color:#fff; border-color:#7F2929; background:#7F2929; }
+.position-btn.topk-mismatch.active { color:#fff; background:#7F2929; border-color:#7F2929; box-shadow:0 0 0 2px rgba(165,57,57,.22); }
 #logits_topk .chart-scroll { max-height:520px; overflow:auto; }
 /* End-to-end generation comparison */
 .output-box { margin:0; max-height:320px; overflow:auto; padding:13px 15px; color:var(--ink); background:#fff;
@@ -1027,22 +1028,12 @@ function renderLines(){
   root.innerHTML="";
   const header=document.createElement("div");header.className="card";
   header.innerHTML='<h3>Token-wise 指标折线 '+hIcon("token_wise_cos")+hIcon("topk_overlap")+hIcon("token_wise_kl")+'</h3>';
-  const picker=document.createElement("div");picker.className="position-picker";picker.setAttribute("aria-label","Logits position selector");
   const overlapArr=L.token_wise_topk_overlap||[];
   const topkMismatchCount=overlapArr.reduce((n,v)=>n+(num(v)!==null&&num(v)<1?1:0),0);
   const topkTotal=overlapArr.length||ps.length;
-  ps.forEach((p,i)=>{const b=document.createElement("button");b.type="button";
-    const overlap=num(overlapArr[i]);
-    const stateClass=overlap===null?"":(overlap<1?" topk-mismatch":" topk-match");
-    b.className="position-btn"+stateClass+(curPos===i?" active":"");
-    b.textContent=String(p)+(L.position_mode==="prompt_prefill"&&i===ps.length-1?" · decode":"");
-    b.setAttribute("aria-label","Position "+p+(overlap!==null?(overlap<1?"，Top-K 不一致":"，Top-K 一致"):""));
-    b.title=overlap!==null?(overlap<1?"Top-K 不一致":"Top-K 一致"):"Top-K overlap 未记录";
-    b.addEventListener("click",()=>window.__selPos(i));picker.appendChild(b);});
-  header.appendChild(picker);
   const topkNote=document.createElement("div");topkNote.className="tip";
   topkNote.innerHTML='<span class="legend-chip" style="background:#A53939"></span>Top-K 不一致 '+topkMismatchCount+'/'+topkTotal+' 个位置'
-    +' · <span style="color:#176B55">绿色=一致</span> · <span style="color:#A53939">红色=不一致</span>';
+    +' · Position 选择器已放在上方的 Top-K 概率卡片中';
   header.appendChild(topkNote);root.appendChild(header);
   appendChart(root,s);
   const lg=document.createElement("div");lg.className="tip";lg.innerHTML=
@@ -1110,6 +1101,20 @@ function renderTopK(i){
   card.className="card";
   card.innerHTML='<h3>Top-K 概率并排 '+hIcon("top1_match")+' <span class="'+summaryCls+'">'+summaryBadge+'</span></h3>'
     +'<div class="tip">Position '+pos+' · '+role+' — 当前: '+matchBadge+' · 蓝(粗)=ref 概率 · 橙(细)=quant 概率 · 使用 Position 选择器或折线节点切换</div>';
+  const picker=document.createElement("div");picker.className="position-picker";picker.setAttribute("aria-label","Top-K position selector");
+  const overlapArr=L.token_wise_topk_overlap||[];
+  L.token_positions.forEach((p,j)=>{const b=document.createElement("button");b.type="button";
+    const overlap=num(overlapArr[j]);
+    const stateClass=overlap===null?"":(overlap<1?" topk-mismatch":" topk-match");
+    b.className="position-btn"+stateClass+(curPos===j?" active":"");
+    b.textContent=String(p)+(L.position_mode==="prompt_prefill"&&j===L.token_positions.length-1?" · decode":"");
+    b.setAttribute("aria-label","Position "+p+(overlap!==null?(overlap<1?"，Top-K 不一致":"，Top-K 一致"):""));
+    b.title=overlap!==null?(overlap<1?"Top-K 不一致（overlap="+overlap.toFixed(3)+"）":"Top-K 一致"):"Top-K overlap 未记录";
+    b.addEventListener("click",()=>window.__selPos(j));picker.appendChild(b);});
+  card.appendChild(picker);
+  const pickerNote=document.createElement("div");pickerNote.className="tip";
+  pickerNote.innerHTML='<span class="legend-chip" style="background:#A53939"></span>红色实心=Top-K overlap &lt; 1 · <span style="color:#176B55">绿色=Top-K 完全一致</span>';
+  card.appendChild(pickerNote);
   root.innerHTML="";
   root.appendChild(card);
   appendChart(card,s);
@@ -1268,6 +1273,12 @@ _SIDEBAR_CSS = """
 .sidebar-item .si-badge.bad { background:rgba(255,139,139,.13); color:#FFB3B3; }
 .sidebar-item .si-badge.warn { background:rgba(255,203,116,.14); color:var(--amber); }
 .sidebar-item .si-badge.na { background:rgba(255,255,255,.08); color:#B5C4CA; }
+.sidebar-item .si-badge.mode { letter-spacing:.05em; }
+.sidebar-item .si-badge.mode-l1 { background:rgba(105,185,255,.16); color:#A9D8FF; }
+.sidebar-item .si-badge.mode-l2 { background:rgba(180,144,255,.17); color:#D5BEFF; }
+.sidebar-item .si-badge.mode-boundary { background:rgba(255,203,116,.16); color:#FFD998; }
+.sidebar-item .si-badge.mode-full { background:rgba(150,230,195,.17); color:var(--mint); }
+.sidebar-item .si-badge.mode-report { background:rgba(255,255,255,.08); color:#C6D2D7; }
 .main-area { flex:1; min-width:0; margin-left:280px; }
 .main-area .wrap { max-width:1120px; margin:0 auto; padding:42px 34px 140px; }
 @media (max-width:720px){
@@ -1285,12 +1296,40 @@ _SIDEBAR_CSS = """
 """
 
 
-def _extract_report_meta(rd, raw: dict) -> dict:
+def _infer_report_mode(rd, dir_hint: str = "") -> str:
+    """Return a stable sidebar mode, including for pre-run_mode reports."""
+    explicit = str(getattr(rd, "run_mode", "") or "").strip().lower()
+    if explicit in {"l1", "l2", "boundary", "full"}:
+        return explicit.upper()
+
+    padded_hint = f"_{str(dir_hint or '').lower()}_"
+    for mode in ("boundary", "full", "l2", "l1"):
+        if f"_{mode}_" in padded_hint:
+            return mode.upper()
+
+    has_l1 = bool(rd.l1_layers)
+    has_l2 = bool(rd.l2_results)
+    has_boundary = rd.overview.boundary_result is not None
+    if has_boundary and (has_l1 or has_l2):
+        return "FULL"
+    if has_boundary:
+        return "BOUNDARY"
+    if has_l1 and has_l2:
+        return "FULL"
+    if has_l2:
+        return "L2"
+    if has_l1:
+        return "L1"
+    return "REPORT"
+
+
+def _extract_report_meta(rd, raw: dict, dir_hint: str = "") -> dict:
     """Extract metadata from a ReportData object for sidebar display."""
     ic = rd.inference_compare
     lg = rd.logits
     return {
         "model_name": rd.overview.model_name,
+        "run_mode": _infer_report_mode(rd, dir_hint),
         "run_status": rd.run_status or "—",
         "first_div": rd.overview.first_divergence_layer,
         "boundary": rd.overview.boundary_result or "—",
@@ -1337,7 +1376,7 @@ def _scan_sibling_reports(output_path: str, current_data: ReportData):
     runs = []
     # 当前报告先放进去 (内存数据, 可能 JSON 还没写)
     current_raw = current_data.to_dict()
-    current_meta = _extract_report_meta(current_data, current_raw)
+    current_meta = _extract_report_meta(current_data, current_raw, current_dir_name)
     current_meta.update({
         "dir": current_dir_name,
         "ts": time.strftime("%m-%d %H:%M"),
@@ -1355,7 +1394,7 @@ def _scan_sibling_reports(output_path: str, current_data: ReportData):
             from .report_schema import ReportData as _RD
             rd = _RD.from_dict(raw)
             mtime = os.path.getmtime(jf)
-            meta = _extract_report_meta(rd, raw)
+            meta = _extract_report_meta(rd, raw, jf_dir)
             meta.update({
                 "dir": jf_dir,
                 "ts": time.strftime("%m-%d %H:%M", time.localtime(mtime)),
@@ -1497,6 +1536,7 @@ def generate_product_html_report(
             'window.__SIDEBAR__.forEach(function(r,i){'
             'var st=r.run_status||"—";'
             'var bc=st.indexOf("SUCCESS")>=0?"good":st.indexOf("INVALID")>=0?"bad":(st.indexOf("PARTIAL")>=0||st.indexOf("INCONCLUSIVE")>=0)?"warn":"na";'
+            'var mode=(r.run_mode||"REPORT").toUpperCase();var mc="mode-"+mode.toLowerCase();'
             'var m="";'
             'if(r.first_div!==null&&r.first_div!==undefined)m+="<span>候选 L"+r.first_div+"</span>";'
             'if(r.scope==="weight_plus_activation_qdq")m+="<span>W + ACT</span>";'
@@ -1506,7 +1546,7 @@ def generate_product_html_report(
             'h+="<div class=\\"sidebar-item\\" data-idx=\\""+i+"\\" onclick=\\"__switchReport("+i+")\\">"'
             '+"<div class=\\"si-ts\\">"+r.ts+"</div>"'
             '+"<div class=\\"si-model\\">"+esc(r.model_name)+"</div>"'
-            '+"<div class=\\"si-meta\\"><span class=\\"si-badge "+bc+"\\">"+st+"</span>"+m+"</div>"'
+            '+"<div class=\\"si-meta\\"><span class=\\"si-badge mode "+mc+"\\">"+mode+"</span><span class=\\"si-badge "+bc+"\\">"+st+"</span>"+m+"</div>"'
             '+"</div>";});'
             'sb.innerHTML=h;}'
             'renderSidebar();'
@@ -1596,25 +1636,16 @@ def generate_index_html(reports_dir: str, output_path: Optional[str] = None) -> 
             rd = ReportData.from_dict(raw)
             mtime = os.path.getmtime(jf)
             ts_str = time.strftime("%m-%d %H:%M", time.localtime(mtime))
-            # Extract key metrics for sidebar
-            ov = rd.overview
-            ic = rd.inference_compare
-            lg = rd.logits
             run_dir = os.path.basename(os.path.dirname(jf)) or "root"
-            runs.append({
+            meta = _extract_report_meta(rd, raw, run_dir)
+            meta.update({
                 "dir": run_dir,
                 "ts": ts_str,
                 "mtime": mtime,
-                "model_name": ov.model_name or run_dir,
-                "run_status": rd.run_status or "—",
-                "first_div": ov.first_divergence_layer,
-                "boundary": ov.boundary_result or "—",
-                "scope": ov.comparison_scope or "unknown",
-                "token_rate": ic.token_match_rate if ic else None,
-                "exact": ic.exact_match if ic else None,
-                "logits_positions": len(lg.token_positions) if lg else 0,
-                "full_data": raw,
             })
+            if not meta["model_name"]:
+                meta["model_name"] = run_dir
+            runs.append(meta)
         except Exception as e:
             logger.debug(f"_scan_sibling_reports parse failed: {e}")
             continue
@@ -1663,6 +1694,7 @@ def generate_index_html(reports_dir: str, output_path: Optional[str] = None) -> 
         'window.__SIDEBAR__.forEach(function(r,i){'
         'var st=r.run_status||"—";'
         'var bc=st.indexOf("SUCCESS")>=0?"good":st.indexOf("INVALID")>=0?"bad":(st.indexOf("PARTIAL")>=0||st.indexOf("INCONCLUSIVE")>=0)?"warn":"na";'
+        'var mode=(r.run_mode||"REPORT").toUpperCase();var mc="mode-"+mode.toLowerCase();'
         'var metrics="";'
         'if(r.first_div!==null&&r.first_div!==undefined)metrics+="<span>候选 L"+esc(r.first_div)+"</span>";'
         'if(r.scope==="weight_plus_activation_qdq")metrics+="<span>W + ACT</span>";'
@@ -1672,7 +1704,7 @@ def generate_index_html(reports_dir: str, output_path: Optional[str] = None) -> 
         'html+="<div class=\\"sidebar-item\\" data-idx=\\""+i+"\\" onclick=\\"__switchReport("+i+")\\">"'
         '+"<div class=\\"si-ts\\">"+r.ts+"</div>"'
         '+"<div class=\\"si-model\\">"+esc(r.model_name)+"</div>"'
-        '+"<div class=\\"si-meta\\"><span class=\\"si-badge "+bc+"\\">"+st+"</span>"+metrics+"</div>"'
+        '+"<div class=\\"si-meta\\"><span class=\\"si-badge mode "+mc+"\\">"+mode+"</span><span class=\\"si-badge "+bc+"\\">"+st+"</span>"+metrics+"</div>"'
         '+"</div>";});'
         'sb.innerHTML=html;}'
         'renderSidebar();'
