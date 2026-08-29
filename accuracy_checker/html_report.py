@@ -458,6 +458,8 @@ section > .sec-desc { color:var(--muted); font-size:14px; margin:0 0 24px 0; lin
 .kv { display:grid; grid-template-columns:100px 1fr; gap:4px 12px; font-size:13px; }
 .kv .k { color:var(--faint); }
 .kv .v { color:var(--ink); word-break:break-all; }
+.kv .v.input-preview { max-height:180px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere;
+  padding:6px 8px; background:#fff; border:1px solid var(--border); border-radius:7px; }
 /* Pills */
 .pill { display:inline-block; padding:4px 12px; border-radius:999px; font-size:12px; font-weight:500; letter-spacing:.01em; }
 .pill.ok { background:#DFF4E9; color:#176B55; }
@@ -740,7 +742,7 @@ function renderOverview(){
         '<span class="k">设备</span><span class="v">'+esc(o.device_mode||"—")+'</span>'+
         '<span class="k">Ref</span><span class="v" style="font-size:11px">'+esc(o.ref_model_path||"—")+'</span>'+
         '<span class="k">Quant</span><span class="v" style="font-size:11px">'+esc(o.quant_model_path||"—")+'</span>'+
-        '<span class="k">输入</span><span class="v" style="font-size:11px">'+esc((o.prompt||"").slice(0,160))+'</span>'+
+        '<span class="k">输入</span><span class="v input-preview" style="font-size:11px">'+esc(o.prompt||"")+'</span>'+
       '</div></div>'+
     '</div>';
 }
