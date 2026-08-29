@@ -657,6 +657,7 @@ const HELP={
   token_wise_cos:{t:"Token-wise Logits Cos",f:"cos(ref_logits, quant_logits) per position",r:"0~1 高=好",i:"每位置全词表 logits 的余弦相似度; 高即分布形状一致。"},
   topk_overlap:{t:"Top-K Overlap",f:"|ref_topk ∩ quant_topk| / k",r:"0~1 高=好",i:"候选词集合重合度; 低即候选集都不同, 解码分歧大。"},
   first_divergence:{t:"L1 首个诊断候选层",f:"Δᵢ=cosᵢ−cosᵢ₋₁；baseline=median(最近 10 个 Δ)；MAD=median(|Δ−baseline|)",r:"优先: Δ < baseline−5×MAD 且 Δ<−0.005，并检查后续 3 层是否持续；回退: 首个 cos<0.99",i:"优先寻找相邻层之间异常且持续的局部突降，避免把逐层缓慢累积误差的首次阈值越界误当成根因。未找到显著突降时，才使用首个 cos_sim<0.99 的层作为辅助候选。"},
+  logits_scatter:{t:"Ref vs Quant Logits 散点图",f:"每个点=(同一 position、同一 token 的 Ref logit, Quant logit)",r:"横轴=Ref logit；纵轴=Quant logit；虚线 y=x 表示完全一致",i:"点越贴近 y=x，量化前后该 token 的 logit 越一致。点在虚线上方表示 Quant logit 高于 Ref，下方表示 Quant logit 低于 Ref；整体平移表示偏置，扇形扩散表示误差随 logit 幅度增大。页面从全部已采集 position×vocab 配对中最多抽样 2000 个点用于展示。"},
   logits_hist_overlay:{t:"Logits 分布直方图 Overlay",f:"横轴=logit 数值区间；纵轴=落入该区间的 Ref/Quant logit 数量",r:"两条分布越重合越好；整体平移、变宽或长尾增多表示量化改变了分布",i:"把所有已采集 position × vocab 的 logits 汇总分箱，并叠加显示 Ref 与 Quant。它适合观察整体偏置、尺度变化和异常值，但不保留 token 对应关系；即使直方图重合，也仍需结合逐位置 cos、KL、Top-K overlap 判断具体 token 是否对齐。"},
   confidence:{t:"定位可信度",f:"启发式: 命中 source+repair=0.9; 仅一项=0.6; 都无=0.2",r:"0.2/0.6/0.9",i:"L2 在首次发散层是否同时给出 source_candidate 和 best_repair_point。"},
   flip_rate:{t:"Flip Rate (离散选择翻转率)",f:"|ref_topk ∩ quant_topk| 不同的比例",r:"<0.01 好, >=0.10 坏",i:"indexer/gate 等离散算子 top-k 选择发生改变的比例; 高则路由/选择被量化颠覆。"},
@@ -991,7 +992,7 @@ function renderScatter(){
   for(let i=0;i<rf.length;i++){s.appendChild(E("circle",{cx:X(rf[i]),cy:Y(qf[i]),r:1.6,fill:C.quant,opacity:0.35}));}
   const t1=E("text",{x:W/2,y:H-4,"text-anchor":"middle",class:"axis"});t1.textContent="ref logit";s.appendChild(t1);
   const t2=E("text",{x:12,y:H/2,"text-anchor":"middle",class:"axis",transform:"rotate(-90 12 "+(H/2)+")"});t2.textContent="quant logit";s.appendChild(t2);
-  root.innerHTML='<div class="card"><h3>Ref vs Quant logits 散点 '+hIcon("token_wise_cos")+'</h3></div>';
+  root.innerHTML='<div class="card"><h3>Ref vs Quant logits 散点 '+hIcon("logits_scatter")+'</h3></div>';
   appendChart(root,s);
   const lg=document.createElement("div");lg.className="tip";lg.innerHTML='<span class="legend-chip" style="background:'+C.quant+'"></span>每个点=词表某位置 (ref_x, quant_y) · 虚线=y=x 完全吻合 · 离线越远=该 token 量化偏离越大';
   root.appendChild(lg);
