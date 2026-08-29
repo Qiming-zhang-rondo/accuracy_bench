@@ -898,7 +898,7 @@ def _mode_boundary(args):
             if message.get("role") == "user":
                 prompt_text = message.get("content", "") or ""
         inference_compare = _build_inference_compare_from_boundary(
-            d, quant, prompt=prompt_text
+            d, quant, prompt=prompt_text, ref_model_path=args.ref_model
         )
         report_data = assemble_report(
             boundary_result=boundary_runs,
@@ -1082,7 +1082,9 @@ def _mode_l2(args, l1_report=None):
     return run_hf_l2(args, ref_device, target_device, dtype, target_layers)
 
 
-def _build_inference_compare_from_boundary(boundary_dict, quant_model_path, prompt=""):
+def _build_inference_compare_from_boundary(
+    boundary_dict, quant_model_path, prompt="", ref_model_path=None
+):
     """从 boundary evidence 提取 ref/quant 生成文本, 构建 InferenceCompareData。
 
     Boundary 步骤已经跑了 ref+quant 模型 generate, 这里复用其输出做 token 级对比,
@@ -1099,15 +1101,21 @@ def _build_inference_compare_from_boundary(boundary_dict, quant_model_path, prom
     if not ref_text and not quant_text:
         return None
 
-    # Tokenize for token-level comparison
+    # Tokenize each side with its own tokenizer. Using the Quant tokenizer for
+    # both sides can make the token table/match rate misleading when the
+    # checkpoints use different vocabularies or segmentation rules.
     ref_tokens = []
     quant_tokens = []
     try:
         from transformers import AutoTokenizer
-        tok = AutoTokenizer.from_pretrained(
+        quant_tok = AutoTokenizer.from_pretrained(
             quant_model_path, trust_remote_code=True, local_files_only=True)
-        ref_tokens = tok.tokenize(ref_text) if ref_text else []
-        quant_tokens = tok.tokenize(quant_text) if quant_text else []
+        ref_tok = quant_tok
+        if ref_text and ref_model_path:
+            ref_tok = AutoTokenizer.from_pretrained(
+                ref_model_path, trust_remote_code=True, local_files_only=True)
+        ref_tokens = ref_tok.tokenize(ref_text) if ref_text else []
+        quant_tokens = quant_tok.tokenize(quant_text) if quant_text else []
     except Exception as e:
         logger.info(f"  [inference_compare] tokenizer 加载失败, 仅做文本级对比: {e}")
 
@@ -1237,7 +1245,8 @@ def _full_build_inference_compare(args, boundary_dict):
     logger.info("\n  [full] 推理结果对比 (复用 Boundary 生成)")
     try:
         return _build_inference_compare_from_boundary(
-            boundary_dict, args.quant_model, prompt=args.prompt or "")
+            boundary_dict, args.quant_model, prompt=args.prompt or "",
+            ref_model_path=args.ref_model)
     except Exception as e:  # noqa: BLE001
         logger.info(f"  [full] 推理对比构建失败: {e}")
         return None
