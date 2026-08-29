@@ -373,6 +373,7 @@ class ShardedBlockComparator:
         # explicit 0 disables the cap (use only when enough host memory is
         # available).
         logits_max_positions: Optional[int] = None,
+        logits_top_k: int = 10,
     ):
         self.ref_model_path = ref_model_path
         self.quant_model_path = quant_model_path
@@ -427,6 +428,7 @@ class ShardedBlockComparator:
         self._streaming_activation_logged = False
         self.collect_full_logits = collect_full_logits
         self.logits_max_positions = logits_max_positions
+        self.logits_top_k = max(1, int(logits_top_k or 10))
         # Preserve the concrete reason when full-logits capture is unavailable
         # so a missing HTML panel is diagnosable instead of silent.
         self._last_logits_error = None
@@ -1419,7 +1421,7 @@ class ShardedBlockComparator:
         ref_hidden_states,
         quant_hidden_states,
         max_positions: Optional[int] = None,
-        top_k: int = 10,
+        top_k: Optional[int] = None,
     ) -> Optional[LogitsData]:
         """采集 last-N 位置的全词表 logits, 跑 compare_logits 出 4 类可视化数据。"""
         if self.tokenizer is None:
@@ -1467,7 +1469,10 @@ class ShardedBlockComparator:
             if self.verbose:
                 logger.info(f"[L1 logits] full logits 采集完成: {N} positions × "
                             f"{ref_logits_np.shape[1]} vocab → compare_logits")
-            comparison = compare_logits(ref_c, quant_c, self.tokenizer, top_k=top_k)
+            comparison = compare_logits(
+                ref_c, quant_c, self.tokenizer,
+                top_k=self.logits_top_k if top_k is None else top_k,
+            )
             return comparison.to_logits_data()
         except Exception as e:
             self._last_logits_error = f"{type(e).__name__}: {e}"
@@ -3585,11 +3590,13 @@ class ShardedBlockComparator:
         try:
             if use_cpu_topk:
                 report.topk_result = self._compute_logits_topk_cpu(
-                    ref_model, quant_model, ref_hidden_states, quant_hidden_states)
+                    ref_model, quant_model, ref_hidden_states, quant_hidden_states,
+                    top_k=self.logits_top_k)
             else:
                 report.topk_result = self._compute_logits_topk(
                     ref_model, quant_model, ref_hidden_states, quant_hidden_states,
                     self.actual_ref_device, self.actual_quant_device,
+                    top_k=self.logits_top_k,
                 )
             if self.verbose:
                 logger.info(report.topk_result)

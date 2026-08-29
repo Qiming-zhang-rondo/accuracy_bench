@@ -555,6 +555,11 @@ table.grid-tbl tr:hover td { background:var(--accent-soft); }
   border-radius:7px; font-family:var(--mono); font-size:10px; font-weight:750; cursor:pointer; }
 .position-btn:hover { color:var(--navy); border-color:var(--border-strong); }
 .position-btn.active { color:#fff; background:var(--accent); border-color:var(--accent); }
+.position-btn.topk-match { color:#176B55; border-color:#B8DCCB; background:#F1FAF5; }
+.position-btn.topk-mismatch { color:#A53939; border-color:#E7B7B2; background:#FDF0EE; }
+.position-btn.topk-match.active { color:#fff; background:var(--accent); border-color:var(--accent); }
+.position-btn.topk-mismatch.active { color:#fff; background:var(--bad); border-color:var(--bad); }
+#logits_topk .chart-scroll { max-height:520px; overflow:auto; }
 /* End-to-end generation comparison */
 .output-box { margin:0; max-height:320px; overflow:auto; padding:13px 15px; color:var(--ink); background:#fff;
   border:1px solid var(--border); border-radius:9px; white-space:pre-wrap; overflow-wrap:anywhere;
@@ -1005,7 +1010,9 @@ function renderLines(){
     s.appendChild(E("path",{d:d,stroke:col,"stroke-width":1.8,fill:"none"}));
   });
   // clickable position markers
-  ps.forEach((p,i)=>{const mk=E("circle",{cx:X(i),cy:Y(0.5),r:5,fill:curPos===i?C.bad:C.muted,opacity:0.6,cursor:"pointer",
+  ps.forEach((p,i)=>{const overlap=num((L.token_wise_topk_overlap||[])[i]);
+    const markerColor=curPos===i?C.bad:(overlap!==null&&overlap<1?C.quant:C.muted);
+    const mk=E("circle",{cx:X(i),cy:Y(0.5),r:5,fill:markerColor,opacity:0.6,cursor:"pointer",
       role:"button",tabindex:"0","aria-label":"选择 Position "+p});
     const choose=()=>window.__selPos(i);
     mk.addEventListener("click",choose);
@@ -1018,10 +1025,22 @@ function renderLines(){
   const header=document.createElement("div");header.className="card";
   header.innerHTML='<h3>Token-wise 指标折线 '+hIcon("token_wise_cos")+hIcon("topk_overlap")+hIcon("token_wise_kl")+'</h3>';
   const picker=document.createElement("div");picker.className="position-picker";picker.setAttribute("aria-label","Logits position selector");
-  ps.forEach((p,i)=>{const b=document.createElement("button");b.type="button";b.className="position-btn"+(curPos===i?" active":"");
+  const overlapArr=L.token_wise_topk_overlap||[];
+  const topkMismatchCount=overlapArr.reduce((n,v)=>n+(num(v)!==null&&num(v)<1?1:0),0);
+  const topkTotal=overlapArr.length||ps.length;
+  ps.forEach((p,i)=>{const b=document.createElement("button");b.type="button";
+    const overlap=num(overlapArr[i]);
+    const stateClass=overlap===null?"":(overlap<1?" topk-mismatch":" topk-match");
+    b.className="position-btn"+stateClass+(curPos===i?" active":"");
     b.textContent=String(p)+(L.position_mode==="prompt_prefill"&&i===ps.length-1?" · decode":"");
-    b.setAttribute("aria-label","Position "+p);b.addEventListener("click",()=>window.__selPos(i));picker.appendChild(b);});
-  header.appendChild(picker);root.appendChild(header);
+    b.setAttribute("aria-label","Position "+p+(overlap!==null?(overlap<1?"，Top-K 不一致":"，Top-K 一致"):""));
+    b.title=overlap!==null?(overlap<1?"Top-K 不一致":"Top-K 一致"):"Top-K overlap 未记录";
+    b.addEventListener("click",()=>window.__selPos(i));picker.appendChild(b);});
+  header.appendChild(picker);
+  const topkNote=document.createElement("div");topkNote.className="tip";
+  topkNote.innerHTML='<span class="legend-chip" style="background:#A53939"></span>Top-K 不一致 '+topkMismatchCount+'/'+topkTotal+' 个位置'
+    +' · <span style="color:#176B55">绿色=一致</span> · <span style="color:#A53939">红色=不一致</span>';
+  header.appendChild(topkNote);root.appendChild(header);
   appendChart(root,s);
   const lg=document.createElement("div");lg.className="tip";lg.innerHTML=
     '<span class="legend-chip" style="background:'+C.ref+'"></span>cos(ref,quant logits) '
@@ -1058,12 +1077,13 @@ function renderTopK(i){
   const map={};const order=[];
   rf.forEach(t=>{if(!map[t.token_id]){map[t.token_id]={token_id:t.token_id,token_str:t.token_str,ref_prob:t.ref_prob,quant_prob:null};order.push(map[t.token_id]);}});
   qf.forEach(t=>{const ex=map[t.token_id];if(ex){ex.quant_prob=t.quant_prob;}else{map[t.token_id]={token_id:t.token_id,token_str:t.token_str,ref_prob:null,quant_prob:t.quant_prob};order.push(map[t.token_id]);}});
-  const rows=order.slice(0,16);
+  const rows=order;
   const W=900,h=22,mL=130,mR=14,mT=10,mB=20;const H=Math.max(rows.length*h+mT+mB,80);
   const maxp=Math.max(...rows.map(t=>Math.max(num(t.ref_prob)||0,num(t.quant_prob)||0)),0.001);
   const X=v=>mL+(W-mL-mR)*v/maxp;
   const s=svgBox(W,H);
-  const t1=E("text",{x:mL,y:12,"text-anchor":"start",class:"axis"});t1.textContent="Position "+pos+" · "+role+" — Top-K 概率 (蓝=ref, 橙=quant)";s.appendChild(t1);
+  const k=Math.max(rf.length,qf.length);
+  const t1=E("text",{x:mL,y:12,"text-anchor":"start",class:"axis"});t1.textContent="Position "+pos+" · "+role+" — Top-"+k+" 概率 (蓝=ref, 橙=quant)";s.appendChild(t1);
   rows.forEach((t,r)=>{const y=mT+r*h;
     const rp=num(t.ref_prob),qp=num(t.quant_prob);
     const lblClean=(t.token_str||'').replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\x00-\x1f\x7f]/g,'').trim();

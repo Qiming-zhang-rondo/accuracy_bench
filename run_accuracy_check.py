@@ -265,6 +265,11 @@ def parse_args():
     parser.add_argument("--logits", action="store_true",
                         help="[full] 额外采集 ref/quant logits 对比")
     parser.add_argument(
+        "--logits_top_k", type=parse_positive_int, default=None,
+        help=("[L1/full] logits Top-K；默认读取输入 JSON 的 generation config.top_k，"
+              "未指定时为 10"),
+    )
+    parser.add_argument(
         "--logits_max_positions", type=int, default=None,
         help=("[L1/full] logits 采集位置上限；默认短 prompt 采集全部、"
               "长 prompt 仅采集最后 32 个；传 0 表示不限制"),
@@ -365,6 +370,52 @@ def _resolve_input(args, tokenizer=None):
         chat_template_mode=getattr(args, "chat_template_mode", "auto"),
     )
     return resolved["rendered_text"], resolved["input_ids"]
+
+
+def _resolve_logits_top_k(args) -> int:
+    """Resolve logits visualization K from an explicit override or request config.
+
+    ``--top_k`` is reserved for selecting L2 layers, so logits K has its own
+    option.  OpenAI/vLLM-style prompt JSON may carry ``top_k`` either at the
+    request root or under ``generation_config``.  Keep the historical Top-10
+    fallback when no generation setting is available.
+    """
+    explicit = getattr(args, "logits_top_k", None)
+    if explicit is not None:
+        return max(1, int(explicit))
+
+    candidates = []
+    raw_messages = getattr(args, "messages", None)
+    if raw_messages:
+        try:
+            candidates.append(json.loads(raw_messages))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    prompt_file = getattr(args, "prompt_file", None)
+    if prompt_file and not prompt_file.lower().endswith((".txt", ".text", ".prompt")):
+        try:
+            with open(prompt_file, encoding="utf-8") as handle:
+                candidates.append(json.load(handle))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+
+    for payload in candidates:
+        if not isinstance(payload, dict):
+            continue
+        values = [payload.get("top_k")]
+        generation = payload.get("generation_config")
+        if isinstance(generation, dict):
+            values.append(generation.get("top_k"))
+        for value in values:
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                continue
+            # vLLM uses 0/-1 to disable top-k; that is not a useful logits
+            # visualization K, so retain the normal fallback in that case.
+            if value > 0:
+                return value
+    return 10
 
 
 def _cache_input_identity(args) -> str:
@@ -564,6 +615,8 @@ def run_hf_l1(args, ref_device, target_device, dtype):
 
     tokenizer = AutoTokenizer.from_pretrained(args.ref_model, trust_remote_code=True)
 
+    logits_top_k = _resolve_logits_top_k(args)
+    logger.info(f"  logits Top-K: {logits_top_k} (generation config/CLI override)")
     comparator = ShardedBlockComparator(
         ref_model_path=args.ref_model,
         quant_model_path=args.quant_model,
@@ -588,6 +641,7 @@ def run_hf_l1(args, ref_device, target_device, dtype):
         expert_chunk_size=getattr(args, 'expert_chunk_size', None),
         kimi_kda_backend=getattr(args, 'kimi_kda_backend', 'auto'),
         logits_max_positions=getattr(args, 'logits_max_positions', None),
+        logits_top_k=logits_top_k,
     )
     prompt_text, input_ids = _resolve_input(args, tokenizer)
     cache_prompt = _cache_input_identity(args)
@@ -694,7 +748,10 @@ def _run_logits(args, ref_device, target_device, dtype):
             quant_model, tokenizer, rendered_text, device=str(target_device),
             max_new_tokens=args.max_new_tokens, input_ids=input_ids,
         )
-        comp = compare_logits(ref_lc, quant_lc, tokenizer)
+        comp = compare_logits(
+            ref_lc, quant_lc, tokenizer,
+            top_k=_resolve_logits_top_k(args),
+        )
         n = len(comp.token_positions)
         logger.info(f"  [full] logits 采集 {n} 位置")
         return comp

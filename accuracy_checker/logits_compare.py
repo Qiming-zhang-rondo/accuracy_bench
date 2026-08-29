@@ -239,6 +239,9 @@ def compare_logits(ref: LogitsCollection, quant: LogitsCollection,
     quant_logits = quant.logits.to(torch.float32)
     n = min(ref_logits.shape[0], quant_logits.shape[0])
     vocab = min(ref_logits.shape[1], quant_logits.shape[1])
+    # Keep the requested generation Top-K, but never ask torch.topk for more
+    # entries than the common vocabulary actually contains.
+    k = max(1, min(int(top_k), vocab))
     ref_logits = ref_logits[:n, :vocab]
     quant_logits = quant_logits[:n, :vocab]
 
@@ -266,8 +269,8 @@ def compare_logits(ref: LogitsCollection, quant: LogitsCollection,
     for i in range(n):
         r_row = ref_logits[i]
         q_row = quant_logits[i]
-        r_ids, r_p = _topk_prob(r_row, top_k)
-        q_ids, q_p = _topk_prob(q_row, top_k)
+        r_ids, r_p = _topk_prob(r_row, k)
+        q_ids, q_p = _topk_prob(q_row, k)
         r_id_to_p = {tid: float(p) for tid, p in zip(r_ids, r_p)}
         q_id_to_p = {tid: float(p) for tid, p in zip(q_ids, q_p)}
         all_ids = list(dict.fromkeys(r_ids + q_ids))  # 保留顺序去重
@@ -294,7 +297,7 @@ def compare_logits(ref: LogitsCollection, quant: LogitsCollection,
         t_kl.append(_kl_divergence(r_row, q_row))
 
         overlap = len(set(r_ids) & set(q_ids))
-        t_overlap.append(overlap / top_k if top_k else None)
+        t_overlap.append(overlap / k if k else None)
         t_top1.append(bool(r_ids[0] == q_ids[0]) if r_ids and q_ids else False)
 
     # 散点: 全词表 logits 成对采样 (避免 50k 点拖垮 HTML)
