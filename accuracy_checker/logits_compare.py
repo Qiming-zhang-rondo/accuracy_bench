@@ -11,7 +11,7 @@ Logits 采集与对比
 
 产出 4 类可视化数据:
   A. ref/quant top-k token probability (按 position 并排柱)
-  B. ref vs quant 全词表 logits 散点 (采样, y=x 参考线)
+  B. ref vs quant generation Top-K 候选 logits 散点 (y=x 参考线)
   C. token-wise cos / KL / topk-overlap / top1-match (折线)
   D. ref/quant logits 分布直方图overlay
 
@@ -20,7 +20,8 @@ LogitsComparison.to_logits_data() 把结果转成 ``report_schema.LogitsData``, 
 数值安全:
   * 所有 logits 在 CPU fp32 上算 (collect 时搬回 CPU, 避免 NPU 内存堆积)。
   * KL 用 softmax 后的概率分布算, 屏蔽数值下溢。
-  * scatter 采样上限 default 2000 点, 防止 50k 词表把 HTML 拖垮。
+  * scatter 候选来自每个位置 Ref/Quant Top-K 并集；超过 default 2000 点时
+    做确定性的均匀下采样，避免全词表随机采样遗漏真正参与解码的候选。
 """
 
 from __future__ import annotations
@@ -232,7 +233,7 @@ def compare_logits(ref: LogitsCollection, quant: LogitsCollection,
         ref/quant: :class:`LogitsCollection` (位置数应一致; 不一致按较小者取)
         tokenizer: 把 token_id 解码成 token_str
         top_k: 每 position 取前 k 个 token 并排
-        scatter_sample: 全词表 logits 散点采样上限 (随机不放回)
+        scatter_sample: Top-K 候选散点展示上限；超限时确定性均匀下采样
         hist_bins: 直方图分箱数
     """
     ref_logits = ref.logits.to(torch.float32)
@@ -265,6 +266,7 @@ def compare_logits(ref: LogitsCollection, quant: LogitsCollection,
     t_kl: List[Optional[float]] = []
     t_overlap: List[Optional[float]] = []
     t_top1: List[bool] = []
+    scatter_flat_indices: List[int] = []
 
     for i in range(n):
         r_row = ref_logits[i]
@@ -274,6 +276,7 @@ def compare_logits(ref: LogitsCollection, quant: LogitsCollection,
         r_id_to_p = {tid: float(p) for tid, p in zip(r_ids, r_p)}
         q_id_to_p = {tid: float(p) for tid, p in zip(q_ids, q_p)}
         all_ids = list(dict.fromkeys(r_ids + q_ids))  # 保留顺序去重
+        scatter_flat_indices.extend(i * vocab + tid for tid in all_ids)
 
         r_list, q_list = [], []
         for tid in all_ids:
@@ -300,17 +303,27 @@ def compare_logits(ref: LogitsCollection, quant: LogitsCollection,
         t_overlap.append(overlap / k if k else None)
         t_top1.append(bool(r_ids[0] == q_ids[0]) if r_ids and q_ids else False)
 
-    # 散点: 全词表 logits 成对采样 (避免 50k 点拖垮 HTML)
+    # 散点只看真正参与 generation Top-K 的候选。Ref/Quant 使用相同扁平
+    # 索引，保证每个点始终是同一 position + token_id 的成对 logits。
+    # 超过 HTML 展示上限时按候选池顺序做确定性均匀下采样；候选池按
+    # position 排列，因此这种方式也能覆盖整个已采集序列。
     ref_flat = ref_logits.flatten()
     quant_flat = quant_logits.flatten()
-    total = ref_flat.numel()
-    if total > scatter_sample:
-        idx = torch.randperm(total)[:scatter_sample]
+    candidate_idx = torch.tensor(scatter_flat_indices, dtype=torch.long)
+    sample_limit = max(0, int(scatter_sample))
+    if sample_limit == 0 or candidate_idx.numel() == 0:
+        sr = ref_flat[:0]
+        sq = quant_flat[:0]
+    elif candidate_idx.numel() > sample_limit:
+        selected = torch.linspace(
+            0, candidate_idx.numel() - 1, steps=sample_limit
+        ).round().to(torch.long)
+        idx = candidate_idx[selected]
         sr = ref_flat[idx]
         sq = quant_flat[idx]
     else:
-        sr = ref_flat
-        sq = quant_flat
+        sr = ref_flat[candidate_idx]
+        sq = quant_flat[candidate_idx]
     bins, r_counts, q_counts = _histogram(ref_flat, quant_flat, hist_bins)
 
     return LogitsComparison(

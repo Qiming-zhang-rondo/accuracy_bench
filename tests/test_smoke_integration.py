@@ -457,6 +457,44 @@ class TestLogitsCompare:
         # 完全相同 -> cos≈1
         assert comp.token_wise_cos[0] > 0.999
 
+    def test_scatter_uses_per_position_topk_union(self):
+        ref = LogitsCollection(
+            token_positions=[0],
+            logits=torch.tensor([[5.0, 4.0, 3.0, 2.0, 1.0]]),
+        )
+        quant = LogitsCollection(
+            token_positions=[0],
+            logits=torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0]]),
+        )
+
+        comp = compare_logits(
+            ref, quant, _FakeTokenizer(), top_k=2, scatter_sample=10
+        )
+
+        # Ref top-2={0,1}, Quant top-2={4,3}; scatter only contains
+        # their per-position union, with identical token pairing on both axes.
+        assert set(zip(comp.scatter_ref, comp.scatter_quant)) == {
+            (5.0, 1.0),
+            (4.0, 2.0),
+            (2.0, 4.0),
+            (1.0, 5.0),
+        }
+
+    def test_scatter_topk_downsample_is_deterministic(self):
+        ref = self._collection(7, n=4, vocab=20)
+        quant = self._collection(8, n=4, vocab=20)
+
+        first = compare_logits(
+            ref, quant, _FakeTokenizer(), top_k=5, scatter_sample=3
+        )
+        second = compare_logits(
+            ref, quant, _FakeTokenizer(), top_k=5, scatter_sample=3
+        )
+
+        assert len(first.scatter_ref) == 3
+        assert first.scatter_ref == second.scatter_ref
+        assert first.scatter_quant == second.scatter_quant
+
 
 # ===========================================================================
 # 6.5 ShardedBlockComparator._collect_full_logits + BlockCompareReport.logits_data
