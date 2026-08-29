@@ -556,8 +556,10 @@ table.grid-tbl tr:hover td { background:var(--accent-soft); }
 .position-btn:hover { color:var(--navy); border-color:var(--border-strong); }
 .position-btn.active { color:#fff; background:var(--accent); border-color:var(--accent); }
 .position-btn.topk-match { color:#176B55; border-color:#B8DCCB; background:#F1FAF5; }
+.position-btn.topk-partial { color:#8A5A08; border-color:#E7C783; background:#FFF7E3; }
 .position-btn.topk-mismatch { color:#fff; border-color:var(--bad); background:var(--bad); }
 .position-btn.topk-match.active { color:#fff; background:var(--accent); border-color:var(--accent); }
+.position-btn.topk-partial.active { color:#fff; background:var(--warn); border-color:var(--warn); box-shadow:0 0 0 2px rgba(184,119,16,.20); }
 .position-btn.topk-mismatch:hover { color:#fff; border-color:#7F2929; background:#7F2929; }
 .position-btn.topk-mismatch.active { color:#fff; background:#7F2929; border-color:#7F2929; box-shadow:0 0 0 2px rgba(165,57,57,.22); }
 #logits_topk .chart-scroll { max-height:520px; overflow:auto; }
@@ -1001,6 +1003,7 @@ function renderScatter(){
 function renderLines(){
   const root=el("logits_lines");if(!root)return;
   const L=R.logits;const ps=L.token_positions||[];
+  const top1Arr=L.token_wise_top1_match||[];
   const ser=[["cos",L.token_wise_cos,C.ref],["topk_overlap",L.token_wise_topk_overlap,C.topk]];
   const W=900,H=240,m=36;const yl=[0,1];
   const X=i=>m+(W-2*m)*(ps.length<=1?0.5:i/(ps.length-1||1));
@@ -1015,8 +1018,10 @@ function renderLines(){
   });
   // clickable position markers
   ps.forEach((p,i)=>{const overlap=num((L.token_wise_topk_overlap||[])[i]);
-    const markerColor=curPos===i?C.bad:(overlap!==null&&overlap<1?C.quant:C.muted);
-    const mk=E("circle",{cx:X(i),cy:Y(0.5),r:5,fill:markerColor,opacity:0.6,cursor:"pointer",
+    const top1Match=top1Arr[i];
+    const markerColor=top1Match===false?C.bad:(overlap!==null&&overlap<1?C.warn:(overlap!==null?C.good:C.muted));
+    const mk=E("circle",{cx:X(i),cy:Y(0.5),r:curPos===i?6:5,fill:markerColor,opacity:0.72,cursor:"pointer",
+      stroke:curPos===i?C.ink:"none","stroke-width":curPos===i?1.5:0,
       role:"button",tabindex:"0","aria-label":"选择 Position "+p});
     const choose=()=>window.__selPos(i);
     mk.addEventListener("click",choose);
@@ -1029,10 +1034,14 @@ function renderLines(){
   const header=document.createElement("div");header.className="card";
   header.innerHTML='<h3>Token-wise 指标折线 '+hIcon("token_wise_cos")+hIcon("topk_overlap")+hIcon("token_wise_kl")+'</h3>';
   const overlapArr=L.token_wise_topk_overlap||[];
-  const topkMismatchCount=overlapArr.reduce((n,v)=>n+(num(v)!==null&&num(v)<1?1:0),0);
+  const top1MismatchCount=ps.reduce((n,p,i)=>n+(top1Arr[i]===false?1:0),0);
+  const topkPartialCount=ps.reduce((n,p,i)=>n+(top1Arr[i]===true&&num(overlapArr[i])!==null&&num(overlapArr[i])<1?1:0),0);
+  const topkExactCount=ps.reduce((n,p,i)=>n+(num(overlapArr[i])!==null&&num(overlapArr[i])>=1?1:0),0);
   const topkTotal=overlapArr.length||ps.length;
   const topkNote=document.createElement("div");topkNote.className="tip";
-  topkNote.innerHTML='<span class="legend-chip" style="background:#A53939"></span>Top-K 不一致 '+topkMismatchCount+'/'+topkTotal+' 个位置'
+  topkNote.innerHTML='<span class="legend-chip" style="background:#A53939"></span>Top-1 不一致 '+top1MismatchCount+'/'+topkTotal
+    +' · <span class="legend-chip" style="background:#B87710"></span>Top-1 一致、Top-K 部分重合 '+topkPartialCount
+    +' · <span style="color:#176B55">Top-K 完全一致 '+topkExactCount+'</span>'
     +' · Position 选择器已放在上方的 Top-K 概率卡片中';
   header.appendChild(topkNote);root.appendChild(header);
   appendChart(root,s);
@@ -1105,15 +1114,19 @@ function renderTopK(i){
   const overlapArr=L.token_wise_topk_overlap||[];
   L.token_positions.forEach((p,j)=>{const b=document.createElement("button");b.type="button";
     const overlap=num(overlapArr[j]);
-    const stateClass=overlap===null?"":(overlap<1?" topk-mismatch":" topk-match");
+    const top1Match=top1Arr[j];
+    const stateClass=overlap===null?"":(top1Match===false?" topk-mismatch":(overlap<1?" topk-partial":" topk-match"));
     b.className="position-btn"+stateClass+(curPos===j?" active":"");
     b.textContent=String(p)+(L.position_mode==="prompt_prefill"&&j===L.token_positions.length-1?" · decode":"");
-    b.setAttribute("aria-label","Position "+p+(overlap!==null?(overlap<1?"，Top-K 不一致":"，Top-K 一致"):""));
-    b.title=overlap!==null?(overlap<1?"Top-K 不一致（overlap="+overlap.toFixed(3)+"）":"Top-K 一致"):"Top-K overlap 未记录";
+    const stateText=overlap===null?"Top-K overlap 未记录":(top1Match===false?"Top-1 不一致":(overlap<1?"Top-1 一致，Top-K 部分重合":"Top-K 完全一致"));
+    b.setAttribute("aria-label","Position "+p+"，"+stateText);
+    b.title=stateText+(overlap!==null?"（overlap="+overlap.toFixed(3)+"）":"");
     b.addEventListener("click",()=>window.__selPos(j));picker.appendChild(b);});
   card.appendChild(picker);
   const pickerNote=document.createElement("div");pickerNote.className="tip";
-  pickerNote.innerHTML='<span class="legend-chip" style="background:#A53939"></span>红色实心=Top-K overlap &lt; 1 · <span style="color:#176B55">绿色=Top-K 完全一致</span>';
+  pickerNote.innerHTML='<span class="legend-chip" style="background:#A53939"></span>红色=Top-1 不一致 · '
+    +'<span class="legend-chip" style="background:#B87710"></span>黄色=Top-1 一致但 Top-K 未完全重合 · '
+    +'<span style="color:#176B55">绿色=Top-K 完全一致</span>';
   card.appendChild(pickerNote);
   root.innerHTML="";
   root.appendChild(card);
