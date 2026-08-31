@@ -26,9 +26,10 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import tempfile as _tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,9 @@ INFERENCE_FRAMEWORK = "INFERENCE_FRAMEWORK"
 BOTH = "BOTH"
 INCONCLUSIVE = "INCONCLUSIVE"
 INVALID_RUN = "INVALID_RUN"
+INTERMITTENT_LOGITS_ALIGNED = "INTERMITTENT_LOGITS_ALIGNED"
+INTERMITTENT_LOGITS_MISMATCH = "INTERMITTENT_LOGITS_MISMATCH"
+INTERMITTENT_RANKING_SENSITIVE = "INTERMITTENT_RANKING_SENSITIVE"
 
 
 @dataclass
@@ -511,6 +515,11 @@ def run_boundary(
     deepseek_v4_key_block: Optional[int] = None,
     chat_template_mode: str = "auto",
     print_full_output: bool = False,
+    boundary_issue_mode: str = "reproducible",
+    captured_logits_json: Optional[str] = None,
+    boundary_logits_cos_threshold: float = 0.99,
+    boundary_logits_kl_threshold: float = 0.05,
+    boundary_logits_margin_threshold: float = 0.05,
 ) -> BoundaryResult:
     """定界主入口 — 区分 WEIGHT / INFERENCE_FRAMEWORK / BOTH / INCONCLUSIVE / INVALID_RUN。
 
@@ -526,6 +535,10 @@ def run_boundary(
     ref (BF16) 可选: 给了 run_ref=True 会跑一次原生参考, 用于区分"quant 回归"
     vs"base-model 本征"(→ BOTH); 不给则只比 framework vs transformers(quant)。
 
+    ``boundary_issue_mode="intermittent"`` 不启动部署框架，也不重新生成文本；
+    它读取 ``captured_logits_json`` 中的 input_ids/positions 和现场 logits，
+    让 Transformers quant checkpoint 在完全相同 token 序列上 replay 一次。
+
     生效条件:
       - 量化模型 → hf_inference_check 内 NPU 加速反量化路径 (CPU fallback 未回迁)
       - 非量化模型 → 直接 safetensors 加载
@@ -536,6 +549,29 @@ def run_boundary(
     except ValueError as exc:
         return _invalid(str(exc), framework_name, framework_gen_config,
                          framework_bad_reproduced)
+
+    boundary_issue_mode = str(boundary_issue_mode or "reproducible").strip().lower()
+    if boundary_issue_mode not in {"reproducible", "intermittent"}:
+        return _invalid(
+            "boundary_issue_mode must be reproducible or intermittent",
+            framework_name, framework_gen_config, framework_bad_reproduced,
+        )
+
+    captured = None
+    if boundary_issue_mode == "intermittent":
+        if not captured_logits_json:
+            return _invalid(
+                "intermittent mode requires --captured_logits_json",
+                framework_name, framework_gen_config, framework_bad_reproduced,
+            )
+        try:
+            from .captured_logits import load_captured_logits
+            captured = load_captured_logits(captured_logits_json)
+        except Exception as exc:
+            return _invalid(
+                f"captured logits JSON 加载失败: {exc}", framework_name,
+                framework_gen_config, framework_bad_reproduced,
+            )
 
     request_payload = dict(request_payload or {})
     if prompt_file and not request_payload:
@@ -573,16 +609,21 @@ def run_boundary(
     elif request_gen_config:
         framework_gen_config = {**request_gen_config, **framework_gen_config}
 
-    # ---- resolve single conversation ----
-    messages, invalid_result = _boundary_resolve_conversation(
-        messages, prompt, prompt_file, framework_name,
-        framework_gen_config, framework_bad_reproduced)
-    if invalid_result is not None:
-        return invalid_result
-    if (chat_template_mode == "never"
-            and not (len(messages) == 1 and messages[0].get("_raw_prompt") is True)):
-        return _invalid(NEVER_MESSAGES_ERROR, framework_name,
-                        framework_gen_config, framework_bad_reproduced)
+    # ---- resolve single conversation (reproducible generation only) ----
+    if captured is None:
+        messages, invalid_result = _boundary_resolve_conversation(
+            messages, prompt, prompt_file, framework_name,
+            framework_gen_config, framework_bad_reproduced)
+        if invalid_result is not None:
+            return invalid_result
+        if (chat_template_mode == "never"
+                and not (len(messages) == 1 and messages[0].get("_raw_prompt") is True)):
+            return _invalid(NEVER_MESSAGES_ERROR, framework_name,
+                            framework_gen_config, framework_bad_reproduced)
+    else:
+        # Captured input_ids are authoritative.  Do not resolve prompt,
+        # messages or chat template, even when metadata contains a prompt.
+        messages = []
 
     limitations: List[str] = []
     evidence: Dict[str, Any] = {
@@ -605,6 +646,8 @@ def run_boundary(
             os.getenv("ACC_DEEPSEEK_V4_KEY_BLOCK", "1024")
         ),
         "chat_template_mode": chat_template_mode,
+        "boundary_issue_mode": boundary_issue_mode,
+        "captured_logits_json": captured_logits_json,
         "resident_experts": os.getenv("ACC_BOUNDARY_RESIDENT_EXPERTS", "1") != "0",
         "expert_cache_per_layer": int(
             os.getenv("ACC_BOUNDARY_EXPERT_CACHE_PER_LAYER", "16")),
@@ -618,6 +661,57 @@ def run_boundary(
         "messages_preview": (messages[-1].get("content", "")[:120]
                              if messages else ""),
     }
+
+    if captured is not None:
+        evidence["captured_logits"] = {
+            "source": captured.source_path,
+            "input_token_count": int(captured.input_ids.shape[1]),
+            "input_ids_shape": list(captured.input_ids.shape),
+            "has_attention_mask": captured.attention_mask is not None,
+            "positions": list(captured.token_positions),
+            "has_full_logits": captured.has_full_logits,
+            "metadata": captured.metadata,
+        }
+        evidence["replay_input_ids_source"] = "captured JSON (no tokenize/chat_template)"
+
+        fw_reproduced = _boundary_detect_framework(
+            framework_bad_reproduced, framework_bad_output, bad_pattern,
+            evidence, limitations)
+        try:
+            replay = _run_transformers_replay_on_path(
+                quant_model_path, devices, dtype, captured, verbose,
+                prefill_parallel=prefill_parallel,
+                glm_attn_query_block=glm_attn_query_block,
+                glm_attn_selected_block=glm_attn_selected_block,
+                deepseek_v4_query_block=deepseek_v4_query_block,
+                deepseek_v4_key_block=deepseek_v4_key_block,
+            )
+            comparison, logits_data, summary = _compare_captured_replay(
+                captured, replay, quant_model_path,
+                framework_gen_config=framework_gen_config,
+                cos_threshold=boundary_logits_cos_threshold,
+                kl_threshold=boundary_logits_kl_threshold,
+                margin_threshold=boundary_logits_margin_threshold,
+            )
+            evidence["captured_logits_replay"] = summary
+            evidence["captured_logits_replay"]["logits_data"] = asdict(logits_data)
+            result_kind = summary["verdict"]
+            return BoundaryResult(
+                framework_name=framework_name,
+                framework_badcase_reproduced=fw_reproduced,
+                transformers_badcase_reproduced=None,
+                ref_badcase_reproduced=None,
+                boundary_result=result_kind,
+                evidence=evidence,
+                limitations=limitations,
+            )
+        except Exception as exc:
+            return _invalid(
+                f"captured logits Transformers replay 失败: {exc}", framework_name,
+                framework_gen_config, framework_bad_reproduced,
+                fw_reproduced=fw_reproduced, evidence=evidence,
+                limitations=limitations,
+            )
 
     # ---- tokenizer 一致性 ----
     _boundary_check_tokenizer(quant_model_path, ref_model_path, evidence, limitations)
@@ -753,6 +847,164 @@ def _boundary_detect_framework(framework_bad_reproduced: Optional[bool],
     evidence["framework_reproduced_reason"] = "未提供框架侧坏输出, 框架复现性未知"
     limitations.append("未提供 framework_bad_output, 无法独立验证框架侧是否复现")
     return fw_reproduced
+
+
+def _run_transformers_replay_on_path(
+    model_path: str, devices: str, dtype: str, captured, verbose: bool,
+    *, prefill_parallel: str = "pp", glm_attn_query_block: Optional[int] = None,
+    glm_attn_selected_block: Optional[int] = None,
+    deepseek_v4_query_block: Optional[int] = None,
+    deepseek_v4_key_block: Optional[int] = None,
+):
+    """Load the quant checkpoint and replay captured ids without generation."""
+    from .inference_check import hf_inference_check
+    return hf_inference_check(
+        model_path=model_path,
+        devices=devices,
+        dtype=dtype,
+        max_new_tokens=1,
+        skip_ppl=True,
+        thinking="none",
+        verbose=verbose,
+        num_runs=1,
+        concurrency=1,
+        prefill_parallel=prefill_parallel,
+        glm_attn_query_block=glm_attn_query_block,
+        glm_attn_selected_block=glm_attn_selected_block,
+        deepseek_v4_query_block=deepseek_v4_query_block,
+        deepseek_v4_key_block=deepseek_v4_key_block,
+        replay_input_ids=captured.input_ids,
+        replay_positions=captured.token_positions,
+        replay_attention_mask=captured.attention_mask,
+    )
+
+
+def _captured_display_tokenizer(model_path: str):
+    try:
+        from transformers import AutoTokenizer
+        return AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=True, local_files_only=True
+        )
+    except Exception:
+        class _Ids:
+            @staticmethod
+            def decode(ids, **kwargs):
+                return f"#{ids[0]}"
+        return _Ids()
+
+
+def _captured_top_k(captured, framework_gen_config: Optional[Dict]) -> int:
+    cfg = framework_gen_config or {}
+    value = cfg.get("top_k")
+    if value is None:
+        value = (captured.metadata.get("generation_config") or {}).get("top_k")
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        value = 10
+    return max(1, value)
+
+
+def _compare_captured_replay(
+    captured, replay, model_path: str, *, framework_gen_config: Optional[Dict],
+    cos_threshold: float, kl_threshold: float, margin_threshold: float,
+):
+    from .logits_compare import LogitsCollection, compare_logits, compare_captured_topk
+    tokenizer = _captured_display_tokenizer(model_path)
+    top_k = _captured_top_k(captured, framework_gen_config)
+    if not captured.has_full_logits and captured.topk:
+        observed = [len(row) for row in captured.topk if row]
+        if observed:
+            # Compare like-for-like when the capture contains fewer
+            # candidates than the request's generation top_k metadata.
+            top_k = min(top_k, min(observed))
+    if captured.has_full_logits:
+        cap_collection = LogitsCollection(
+            token_positions=list(captured.token_positions), logits=captured.logits,
+            input_ids=captured.input_ids, position_mode="captured_vllm",
+        )
+        comparison = compare_logits(
+            cap_collection, replay, tokenizer, top_k=top_k,
+        )
+    else:
+        comparison = compare_captured_topk(
+            captured.topk or [], replay, tokenizer, top_k=top_k,
+        )
+    logits_data = comparison.to_logits_data()
+    logits_data.input_ids = captured.input_ids.tolist()
+
+    cos_values = [v for v in comparison.token_wise_cos
+                  if v is not None and math.isfinite(float(v))]
+    kl_values = [v for v in comparison.token_wise_kl
+                 if v is not None and math.isfinite(float(v))]
+    overlaps = comparison.token_wise_topk_overlap
+    top1 = comparison.token_wise_top1_match
+    mismatches = []
+    top1_flips = []
+    low_margin_flips = []
+    nonfinite_positions = []
+    if captured.has_full_logits:
+        import torch
+        for index, position in enumerate(comparison.token_positions):
+            cap_ok = bool(torch.isfinite(captured.logits[index]).all().item())
+            replay_ok = bool(torch.isfinite(replay.logits[index]).all().item())
+            if not (cap_ok and replay_ok):
+                nonfinite_positions.append(position)
+    for index, position in enumerate(comparison.token_positions):
+        cos_bad = comparison.token_wise_cos[index] is not None and comparison.token_wise_cos[index] < cos_threshold
+        kl_bad = comparison.token_wise_kl[index] is not None and comparison.token_wise_kl[index] > kl_threshold
+        topk_bad = overlaps[index] is not None and overlaps[index] < 1.0
+        if cos_bad or kl_bad or topk_bad:
+            mismatches.append(position)
+        if not top1[index]:
+            top1_flips.append(position)
+            rm = comparison.ref_top1_margin[index] if index < len(comparison.ref_top1_margin) else None
+            qm = comparison.quant_top1_margin[index] if index < len(comparison.quant_top1_margin) else None
+            if rm is not None and qm is not None and max(abs(rm), abs(qm)) <= margin_threshold:
+                low_margin_flips.append(position)
+    for position in nonfinite_positions:
+        if position not in mismatches:
+            mismatches.append(position)
+
+    if not captured.has_full_logits:
+        missing = "full-vocabulary logits absent: cosine/KL/max-abs/histogram unavailable"
+    else:
+        missing = None
+    significant_flips = [p for p in top1_flips if p not in low_margin_flips]
+    if mismatches and significant_flips:
+        verdict = INTERMITTENT_LOGITS_MISMATCH
+    elif top1_flips and not significant_flips:
+        verdict = INTERMITTENT_RANKING_SENSITIVE
+    elif mismatches:
+        verdict = INTERMITTENT_LOGITS_MISMATCH
+    else:
+        verdict = INTERMITTENT_LOGITS_ALIGNED
+    max_abs_diff = None
+    if captured.has_full_logits:
+        max_abs_diff = float((captured.logits - replay.logits[:len(captured.token_positions)]).abs().max().item())
+    summary = {
+        "input_token_count": int(captured.input_ids.shape[1]),
+        "compared_positions": list(comparison.token_positions),
+        "top_k": top_k,
+        "has_full_logits": captured.has_full_logits,
+        "top1_match_count": sum(bool(x) for x in top1),
+        "top1_total": len(top1),
+        "top1_flip_positions": top1_flips,
+        "low_margin_flip_positions": low_margin_flips,
+        "first_mismatch_position": mismatches[0] if mismatches else None,
+        "first_top1_flip_position": top1_flips[0] if top1_flips else None,
+        "nonfinite_positions": nonfinite_positions,
+        "mean_cosine": (sum(cos_values) / len(cos_values)) if cos_values else None,
+        "max_kl": max(kl_values) if kl_values else None,
+        "max_abs_diff": max_abs_diff,
+        "min_topk_overlap": min(overlaps) if overlaps else None,
+        "cos_threshold": cos_threshold,
+        "kl_threshold": kl_threshold,
+        "margin_threshold": margin_threshold,
+        "verdict": verdict,
+        "missing_metrics": missing,
+    }
+    return comparison, logits_data, summary
 
 
 def _boundary_run_quant(run_quant: bool, quant_model_path: str, devices: str,
@@ -926,6 +1178,11 @@ def run_boundary_cli(args):
         deepseek_v4_query_block=getattr(args, "deepseek_v4_query_block", None),
         deepseek_v4_key_block=getattr(args, "deepseek_v4_key_block", None),
         chat_template_mode=getattr(args, "chat_template_mode", "auto"),
+        boundary_issue_mode=getattr(args, "boundary_issue_mode", "reproducible"),
+        captured_logits_json=getattr(args, "captured_logits_json", None),
+        boundary_logits_cos_threshold=getattr(args, "boundary_logits_cos_threshold", 0.99),
+        boundary_logits_kl_threshold=getattr(args, "boundary_logits_kl_threshold", 0.05),
+        boundary_logits_margin_threshold=getattr(args, "boundary_logits_margin_threshold", 0.05),
     )
 
     out = boundary_result_to_dict(result)
@@ -940,6 +1197,19 @@ def run_boundary_cli(args):
         logger.info(f"  transformers_badcase_reproduced : {out['transformers_badcase_reproduced']}")
         logger.info(f"  ref_badcase_reproduced      : {out['ref_badcase_reproduced']}")
         logger.info(f"  >>> boundary_result          : {out['boundary_result']}  <<<")
+        replay_summary = out.get("evidence", {}).get("captured_logits_replay", {})
+        if replay_summary:
+            logger.info(
+                "  captured replay: positions=%d, top1=%s/%s, cosine=%s, KL=%s, overlap=%s"
+                % (
+                    len(replay_summary.get("compared_positions", [])),
+                    replay_summary.get("top1_match_count", 0),
+                    replay_summary.get("top1_total", 0),
+                    replay_summary.get("mean_cosine", "n/a"),
+                    replay_summary.get("max_kl", "n/a"),
+                    replay_summary.get("min_topk_overlap", "n/a"),
+                )
+            )
         if out.get("limitations"):
             logger.info("  limitations:")
             for lim in out["limitations"]:
@@ -950,6 +1220,15 @@ def run_boundary_cli(args):
 
 def print_boundary_verdict_explain(kind: str) -> None:
     explains = {
+        INTERMITTENT_LOGITS_ALIGNED:
+            "vLLM captured logits 与 Transformers replay 基本一致；当前 sampler 前 logits boundary 未发现明显偏差，"
+            "继续关注 sampling/logits processor/request state 或低 margin 分叉",
+        INTERMITTENT_LOGITS_MISMATCH:
+            "同一 input_ids、同一 position 的 vLLM/Transformers sampler 前 logits 明显不一致；"
+            "问题偏向框架执行路径、量化算子、KV cache 或通信并行",
+        INTERMITTENT_RANKING_SENSITIVE:
+            "发现 Top-1 flip，但 Ref/Quant margin 均较小；属于 ranking-sensitive/low-margin flip，"
+            "不能直接判为严重框架异常",
         "WEIGHT_OR_QUANTIZATION":
             "原生 Transformers 在 quant 模型上复现 Bad Case -> "
             "问题在量化权重/模型产物, 进 L1/L2 逐层定位",
@@ -973,6 +1252,8 @@ __all__ = [
     "BoundaryResult",
     "WEIGHT_OR_QUANTIZATION", "INFERENCE_FRAMEWORK", "BOTH",
     "INCONCLUSIVE", "INVALID_RUN",
+    "INTERMITTENT_LOGITS_ALIGNED", "INTERMITTENT_LOGITS_MISMATCH",
+    "INTERMITTENT_RANKING_SENSITIVE",
     "repeat_4gram_ratio", "nonprintable_ratio",
     "detect_badcase", "normalize_request_payload", "parse_request_json",
     "classify_boundary", "run_boundary", "boundary_result_to_dict",

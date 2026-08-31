@@ -56,6 +56,14 @@ def main():
     parser.add_argument("--framework_bad_reproduced", default=None,
                         choices=["true", "false"],
                         help="[boundary] 调用方直接断言框架是否复现 (true/false)")
+    parser.add_argument("--boundary_issue_mode", default="reproducible",
+                        choices=["reproducible", "intermittent"],
+                        help="[boundary] reproducible（默认）或 intermittent captured logits replay")
+    parser.add_argument("--captured_logits_json", default=None,
+                        help="[boundary/intermittent] vLLM 现场 captured logits JSON")
+    parser.add_argument("--boundary_logits_cos_threshold", type=float, default=0.99)
+    parser.add_argument("--boundary_logits_kl_threshold", type=float, default=0.05)
+    parser.add_argument("--boundary_logits_margin_threshold", type=float, default=0.05)
     parser.add_argument("--repeat_4gram_max", type=float, default=None,
                         help="[boundary] 4-gram 重复比阈值, 超过判为 bad; 缺省 0.5")
     parser.add_argument("--nonprintable_max", type=float, default=None,

@@ -871,12 +871,25 @@
           </div>
 
           <div id="boundaryFields" class="grid-3 hidden" aria-hidden="true">
+            <div>
+              <label for="boundaryIssueMode">问题类型</label>
+              <select id="boundaryIssueMode">
+                <option value="reproducible" selected>必现问题</option>
+                <option value="intermittent">偶现问题 · captured logits</option>
+              </select>
+              <span class="hint">必现按原流程生成；偶现导入一次 vLLM logits JSON，Transformers 直接复用其中的 input_ids/positions，不重新 tokenize。</span>
+            </div>
+            <div class="wide hidden" id="capturedLogitsField">
+              <label for="capturedLogitsJson">vLLM captured logits JSON <span class="optional">偶现模式必填</span></label>
+              <input id="capturedLogitsJson" type="text" autocomplete="off" placeholder="/path/to/vllm_logits.json">
+              <span class="hint">JSON 至少包含 input_ids、positions，以及 full vocabulary logits 或 Top-K；不会启动或重复运行 vLLM。现场采集可考虑 batch=1、temperature=0 与确定性环境变量。</span>
+            </div>
             <div class="wide hidden" id="boundaryPromptFileField">
               <label for="promptFile">Boundary 请求文件 <span class="optional">CLI 兼容入口</span></label>
               <input id="promptFile" type="text" autocomplete="off" placeholder="/path/to/request.json 或 /path/to/prompt.txt">
               <span class="hint">命令行/API 仍兼容；参数页面统一使用下方结构化请求。</span>
             </div>
-            <div class="wide">
+            <div class="wide" id="boundaryRequestField">
               <label for="requestJson">Boundary 完整请求 JSON <span class="optional">必填</span></label>
               <textarea id="requestJson" placeholder='{"model":"glm-52","max_tokens":102400,"messages":[{"role":"user","content":"..."}]}'></textarea>
               <span class="hint">Boundary 只接受结构化请求：填写 <code>model</code>（模型标识）和非空 <code>messages</code>；tokenizer 会按模型自带 ChatTemplate 渲染一次。长 JSON 会通过 heredoc 送入 stdin，不会触发 Argument list too long。</span>
@@ -1046,6 +1059,9 @@
             <tr><td><code>--framework_name</code></td><td>空</td><td>部署框架名，例如 vllm-ascend 或 MindIE。</td></tr>
             <tr><td><code>--framework_bad_output</code></td><td>空</td><td>部署框架实际生成的完整坏输出。</td></tr>
             <tr><td><code>--framework_bad_reproduced</code></td><td>空</td><td>true / false；记录外部确认结果，不会调用部署框架。</td></tr>
+            <tr><td><code>--boundary_issue_mode</code></td><td>reproducible</td><td>必现按原流程生成；intermittent 导入一次 vLLM captured logits JSON，Transformers 直接 replay 相同 input_ids/positions。</td></tr>
+            <tr><td><code>--captured_logits_json</code></td><td>空</td><td>Boundary 偶现模式的现场 JSON；需含 input_ids、positions，以及 full vocabulary logits 或 Top-K。</td></tr>
+            <tr><td><code>--boundary_logits_cos_threshold</code><br><code>--boundary_logits_kl_threshold</code><br><code>--boundary_logits_margin_threshold</code></td><td>cos .99 / KL .05 / margin .05</td><td>偶现 logits boundary 的明显偏差与低 margin flip 阈值；不影响必现流程。</td></tr>
             <tr><td><code>--no_ref</code></td><td>false</td><td>Quant-only boundary；适合量化模型独占全部 NPU。</td></tr>
             <tr><td><code>--num_runs</code></td><td>1</td><td>同一 prompt 总生成次数；每次完整结果都会归档。</td></tr>
             <tr><td><code>--concurrency</code></td><td>1</td><td>每个纯 Transformers generate batch 的并发样本数。</td></tr>
@@ -1077,7 +1093,7 @@
         "modelSizeB", "perDeviceMemory", "refDevices", "quantDevices",
         "compareMode", "prefillParallel", "glmAttnQueryBlock", "glmAttnSelectedBlock", "deepseekV4QueryBlock", "deepseekV4KeyBlock", "chatTemplateMode", "kimiKdaBackend", "layersPerShard",
         "quantMethod", "dtype", "activationQuantType", "activationQuantBackend", "activationQuantGroupSize", "cacheTopK", "cacheDir", "mlaFine",
-        "outputDir", "prompt", "rawPromptFile", "promptFile", "requestJson", "numRuns", "concurrency",
+        "outputDir", "prompt", "rawPromptFile", "promptFile", "requestJson", "boundaryIssueMode", "capturedLogitsJson", "numRuns", "concurrency",
         "maxNewTokens", "noRef", "frameworkReproduced", "stopOnFirstBadcase",
         "repeat4gramMax", "nonprintableMax",
         "dsparkSample", "dsparkSeed", "dsparkAnchors", "rotationMatrix",
@@ -1096,6 +1112,8 @@
         var promptField = document.getElementById("promptField");
       var rawPromptFileField = document.getElementById("rawPromptFileField");
       var boundaryFields = document.getElementById("boundaryFields");
+      var boundaryRequestField = document.getElementById("boundaryRequestField");
+      var capturedLogitsField = document.getElementById("capturedLogitsField");
       var kimiKdaField = document.getElementById("kimiKdaField");
       var refDevicesLabel = document.getElementById("refDevicesLabel");
       var quantDevicesLabel = document.getElementById("quantDevicesLabel");
@@ -1262,6 +1280,9 @@
         setFieldVisibility("expertChunkField", mode === "boundary" || (l1Flow && grouped && !dspark));
         setFieldVisibility("frameworkBadOutputField", mode === "boundary");
         setFieldVisibility("boundaryFields", mode === "boundary");
+        var intermittentBoundary = mode === "boundary" && el.boundaryIssueMode.value === "intermittent";
+        setFieldVisibility("capturedLogitsField", intermittentBoundary);
+        setFieldVisibility("boundaryRequestField", mode === "boundary" && !intermittentBoundary);
         setFieldVisibility("rawPromptFileField", ["l1", "full"].indexOf(mode) !== -1 && !dspark);
         setFieldVisibility("chatTemplateModeField", mode !== "screening" && mode !== "l2" && mode !== "boundary" && !dspark);
         // Boundary uses structured messages and the default auto renderer;
@@ -1435,7 +1456,8 @@
         }
         var promptFile = el.promptFile.value.trim() || el.rawPromptFile.value.trim();
         var directRequest = el.requestJson.value.trim();
-        if (mode === "boundary" && directRequest) {
+        var intermittentBoundary = mode === "boundary" && el.boundaryIssueMode.value === "intermittent";
+        if (mode === "boundary" && !intermittentBoundary && directRequest) {
           try {
             var requestData = JSON.parse(directRequest);
             if (Array.isArray(requestData)) requestData = { messages: requestData };
@@ -1457,14 +1479,20 @@
             addIssue(errors, "requestJson", "直接粘贴内容不是合法 JSON；不要包含 ```json 代码围栏");
           }
         }
-        if (mode === "boundary" && directRequest && promptFile) {
+        if (mode === "boundary" && !intermittentBoundary && directRequest && promptFile) {
           warnings.push("同时填写了直接 JSON 与文件路径，将优先使用直接 JSON");
         }
-        if (el.chatTemplateMode.value === "never" && mode === "boundary" && directRequest) {
+        if (el.chatTemplateMode.value === "never" && mode === "boundary" && !intermittentBoundary && directRequest) {
           addIssue(errors, "requestJson", "chat_template_mode=never 时不能使用 structured messages；请改用已渲染的 Prompt/TXT");
         }
-        if (mode === "boundary" && promptFile && !isAbsoluteLinuxPath(promptFile)) {
+        if (mode === "boundary" && !intermittentBoundary && promptFile && !isAbsoluteLinuxPath(promptFile)) {
           addIssue(errors, "promptFile", "请求文件必须是 Linux 绝对路径（支持 .json、.txt、.prompt）");
+        }
+        if (intermittentBoundary) {
+          var capturedPath = el.capturedLogitsJson.value.trim();
+          if (!capturedPath) addIssue(errors, "capturedLogitsJson", "偶现模式必须填写 vLLM captured logits JSON 路径");
+          else if (!isAbsoluteLinuxPath(capturedPath)) addIssue(errors, "capturedLogitsJson", "captured logits JSON 必须是 Linux 绝对路径");
+          if (directRequest || promptFile) warnings.push("偶现模式以 captured logits JSON 为唯一输入，忽略 Boundary 请求/Prompt 文件");
         }
         if (mode === "boundary" && (!/^\d+$/.test(el.numRuns.value) || Number(el.numRuns.value) < 1)) {
           addIssue(errors, "numRuns", "num_runs 必须是大于 0 的整数");
@@ -1478,7 +1506,7 @@
         if (mode === "boundary" && el.maxNewTokens.value && Number(el.maxNewTokens.value) * Number(el.concurrency.value) > 65536) {
           warnings.push("max_new_tokens × concurrency 很大，请确认 16 卡 KV cache 余量");
         }
-        if (mode === "boundary" && !directRequest && !promptFile) {
+        if (mode === "boundary" && !intermittentBoundary && !directRequest && !promptFile) {
           addIssue(errors, "requestJson", "Boundary 需要填写完整结构化请求 JSON（含 model 和 messages）");
         }
         if (mode !== "screening" && mode !== "boundary" && type !== "dspark" && !el.prompt.value.trim() && !el.rawPromptFile.value.trim()) {
@@ -1513,7 +1541,11 @@
           addStatus("MLA 诊断：" + (el.mlaFine.value === "fine" ? "细粒度" : "粗粒度"), "ok");
         } else if (mode === "boundary") {
           addStatus("Boundary 仅运行纯 Transformers，不会调用部署框架", "ok");
-          addStatus("Boundary 使用完整结构化请求；tokenizer ChatTemplate 只渲染一次", "ok");
+          if (el.boundaryIssueMode.value === "intermittent") {
+            addStatus("偶现模式：直接 replay captured input_ids/positions，不重新 tokenize 或套 ChatTemplate", "ok");
+          } else {
+            addStatus("必现模式：使用完整结构化请求；tokenizer ChatTemplate 只渲染一次", "ok");
+          }
           addStatus("长 Prefill 并行：" + el.prefillParallel.value.toUpperCase(), "ok");
           addStatus("Quant 总运行 " + (el.numRuns.value || "1") + " 次，每批并发 " + (el.concurrency.value || "1") + "，逐次结果全部归档", "ok");
         } else if (type === "dspark") {
@@ -1606,6 +1638,9 @@
         if (mode !== "boundary" && el.chatTemplateMode.value !== "auto") {
           args.push(line("--chat_template_mode", el.chatTemplateMode.value));
         }
+        if (mode === "boundary") {
+          args.push(line("--boundary_issue_mode", el.boundaryIssueMode.value || "reproducible"));
+        }
 
         if (mode !== "boundary" || (el.noRef.value === "false" && el.refModel.value.trim())) args.push(line("--ref_model", refPath));
         args.push(line("--quant_model", quantPath));
@@ -1696,6 +1731,8 @@
           args.push(line("--dspark_sample", shellQuote(el.dsparkSample.value, "<DSPARK_SAMPLE_PT>")));
           args.push(line("--dspark_seed", el.dsparkSeed.value || "0"));
           args.push(line("--dspark_max_anchors", el.dsparkAnchors.value || "8"));
+        } else if (mode === "boundary" && el.boundaryIssueMode.value === "intermittent" && el.capturedLogitsJson.value.trim()) {
+          args.push(line("--captured_logits_json", shellQuote(el.capturedLogitsJson.value, "<CAPTURED_LOGITS_JSON>")));
         } else if (mode === "boundary" && el.requestJson.value.trim()) {
           // Keep the large JSON out of argv; the shell feeds it through stdin.
           args.push(line("--request_json_stdin"));
@@ -1728,7 +1765,7 @@
           commands.push(value + suffix);
         });
 
-        if (mode === "boundary" && el.requestJson.value.trim()) {
+        if (mode === "boundary" && el.boundaryIssueMode.value !== "intermittent" && el.requestJson.value.trim()) {
           var requestDelimiter = "__ACC_BENCH_REQUEST__";
           commands[commands.length - 1] += " <<'" + requestDelimiter + "'";
           commands.push(el.requestJson.value.trim());
@@ -1746,7 +1783,9 @@
         recommendTitle.textContent = (modelLabels[type] || type) + " · 推荐 " + recommendation.cards + " 卡";
         applyRecommendation.textContent = "应用推荐 " + recommendation.cards + " 卡";
         if (mode === "boundary") {
-          recommendReason.textContent = "Quant-only Boundary 会把量化模型放到全部可见 NPU；同一 prompt 按 batch=" + (el.concurrency.value || "1") + " 运行，总计 " + (el.numRuns.value || "1") + " 条并保存逐次结果。";
+          recommendReason.textContent = el.boundaryIssueMode.value === "intermittent"
+            ? "偶现模式只 replay 一份 vLLM captured logits JSON；Transformers 直接复用 input_ids，在相同 positions 对比 sampler 前 logits。"
+            : "Quant-only Boundary 会把量化模型放到全部可见 NPU；同一 prompt 按 batch=" + (el.concurrency.value || "1") + " 运行，总计 " + (el.numRuns.value || "1") + " 条并保存逐次结果。";
         } else if (mode === "l2") {
           recommendReason.textContent = "L2 只加载目标层并读取 L1 hidden-state cache；ref/quant 各使用一张卡，不使用 grouped_dual 或 layers_per_shard。";
         } else if (dspark) {

@@ -85,6 +85,8 @@ class OverviewData:
     activation_quant_backend: str = ""       # auto / npu / torch
     activation_quant_group_size: Optional[int] = None
     logits_error: Optional[str] = None       # why L1 full logits is absent
+    boundary_issue_mode: str = "reproducible"  # reproducible / intermittent
+    captured_replay: Optional[Dict[str, Any]] = None  # intermittent summary
 
 
 @dataclass
@@ -140,6 +142,7 @@ class TokenProb:
 class LogitsData:
     """生成序列逐位置 logits 对比 (驱动 4 类可视化: topk 并排柱 / scatter / token-wise 折线 / 直方图)"""
     token_positions: List[int] = field(default_factory=list)
+    input_ids: List[List[int]] = field(default_factory=list)  # replay source ids
     # generation: autoregressive decode steps; prompt_prefill: prompt token
     # positions whose final row predicts the first generated token.
     position_mode: str = "unknown"
@@ -151,6 +154,8 @@ class LogitsData:
     token_wise_kl: List[Optional[float]] = field(default_factory=list)
     token_wise_topk_overlap: List[Optional[float]] = field(default_factory=list)
     token_wise_top1_match: List[bool] = field(default_factory=list)
+    ref_top1_margin: List[Optional[float]] = field(default_factory=list)
+    quant_top1_margin: List[Optional[float]] = field(default_factory=list)
     # visualization B: ref vs quant 全词表 logits 散点 (采样后, 成对样本)
     scatter_ref: List[float] = field(default_factory=list)
     scatter_quant: List[float] = field(default_factory=list)
@@ -256,6 +261,8 @@ def _build_overview(d: Dict[str, Any]) -> OverviewData:
         activation_quant_backend=d.get("activation_quant_backend", ""),
         activation_quant_group_size=activation_quant_group_size,
         logits_error=d.get("logits_error"),
+        boundary_issue_mode=str(d.get("boundary_issue_mode") or "reproducible"),
+        captured_replay=d.get("captured_replay"),
         boundary_result=d.get("boundary_result"),
         first_divergence_layer=d.get("first_divergence_layer"),
         first_threshold_crossing_layer=d.get("first_threshold_crossing_layer"),
@@ -321,6 +328,8 @@ def _build_logits(d: Optional[Dict[str, Any]]) -> Optional[LogitsData]:
         return None
     return LogitsData(
         token_positions=list(d.get("token_positions") or []),
+        input_ids=[list(row) if isinstance(row, (list, tuple)) else []
+                   for row in (d.get("input_ids") or [])],
         position_mode=str(d.get("position_mode") or "unknown"),
         ref_topk=[[_build_token_prob(x) for x in pos] for pos in d.get("ref_topk") or []],
         quant_topk=[[_build_token_prob(x) for x in pos] for pos in d.get("quant_topk") or []],
@@ -330,6 +339,8 @@ def _build_logits(d: Optional[Dict[str, Any]]) -> Optional[LogitsData]:
         token_wise_kl=list(d.get("token_wise_kl") or []),
         token_wise_topk_overlap=list(d.get("token_wise_topk_overlap") or []),
         token_wise_top1_match=list(d.get("token_wise_top1_match") or []),
+        ref_top1_margin=list(d.get("ref_top1_margin") or []),
+        quant_top1_margin=list(d.get("quant_top1_margin") or []),
         scatter_ref=list(d.get("scatter_ref") or []),
         scatter_quant=list(d.get("scatter_quant") or []),
         hist_bins=list(d.get("hist_bins") or []),

@@ -46,8 +46,9 @@ from .validity_checks import (
 # ---- Logits 对比 (依赖 report_schema) ----
 from .logits_compare import (
     LogitsCollection, LogitsComparison,
-    collect_logits, collect_last_logits, compare_logits,
+    collect_logits, collect_last_logits, compare_logits, compare_captured_topk,
 )
+from .captured_logits import CapturedToken, CapturedLogits, load_captured_logits
 from .inference_compare import compare_inference, detect_repeat, detect_garbled
 
 # ---- HTML 报告 (standalone, v1 + v2) ----
@@ -80,6 +81,8 @@ from .inference_check import (
     parse_devices,
     run_boundary, classify_boundary, BoundaryResult,
     boundary_result_to_dict,
+    INTERMITTENT_LOGITS_ALIGNED, INTERMITTENT_LOGITS_MISMATCH,
+    INTERMITTENT_RANKING_SENSITIVE,
 )
 
 __all__ = [
@@ -102,7 +105,8 @@ __all__ = [
     "worst_status", "aggregate_overall",
     # logits 对比
     "LogitsCollection", "LogitsComparison",
-    "collect_logits", "collect_last_logits", "compare_logits",
+    "collect_logits", "collect_last_logits", "compare_logits", "compare_captured_topk",
+    "CapturedToken", "CapturedLogits", "load_captured_logits",
     "compare_inference", "detect_repeat", "detect_garbled",
     # HTML 报告
     "generate_html_report", "generate_product_html_report", "generate_index_html", "assemble_report",
@@ -123,4 +127,6 @@ __all__ = [
     "parse_devices",
     "run_boundary", "classify_boundary", "BoundaryResult",
     "boundary_result_to_dict",
+    "INTERMITTENT_LOGITS_ALIGNED", "INTERMITTENT_LOGITS_MISMATCH",
+    "INTERMITTENT_RANKING_SENSITIVE",
 ]

@@ -716,6 +716,9 @@ function renderOverview(){
   if(o.boundary_result==="CLEAN"){bndClass="ok";bndTxt="生成通顺 (量化本身可能 OK)";}
   else if(o.boundary_result==="GARBLED"){bndClass="bad";bndTxt="生成乱码 (量化本身有问题)";}
   else if(o.boundary_result==="TRUNCATED"){bndClass="warn";bndTxt="思维链截断";}
+  else if(o.boundary_result==="INTERMITTENT_LOGITS_ALIGNED"){bndClass="ok";bndTxt="当前 logits boundary 未发现明显偏差";}
+  else if(o.boundary_result==="INTERMITTENT_RANKING_SENSITIVE"){bndClass="warn";bndTxt="Top-1 低 margin 敏感分叉";}
+  else if(o.boundary_result==="INTERMITTENT_LOGITS_MISMATCH"){bndClass="bad";bndTxt="sampler 前 logits 已出现明显偏差";}
   let gtHit="";
   if(o.ground_truth_hit===true)gtHit='<span class="pill ok">GT 命中</span>';
   else if(o.ground_truth_hit===false)gtHit='<span class="pill bad">GT 未命中</span>';
@@ -723,13 +726,34 @@ function renderOverview(){
   const confBar = conf===null?'<div class="val">—</div><div class="tip">无对应 L2 定位证据</div>':
     ('<div class="conf-wrap"><div class="conf-bar" style="width:'+clamp(conf*100,0,100).toFixed(0)+'%"></div></div>'
     +'<div class="tip">可信度 '+pct(conf,0)+'</div>');
-  const inputMode=o.input_mode==="messages"?"Chat messages · apply_chat_template":(o.input_mode==="prompt"?"Raw prompt":(o.input_mode||"—"));
+  const inputMode=o.input_mode==="messages"?"Chat messages · apply_chat_template":(o.input_mode==="captured_logits"?"Captured vLLM input_ids · replay":(o.input_mode==="prompt"?"Raw prompt":(o.input_mode||"—")));
   const activationGroup=o.activation_quant_group_size==null?"":(" · group "+o.activation_quant_group_size);
   const activationText=o.activation_quant_enabled===true?("ON · "+(o.activation_quant_type||"AUTO")+" · "+(o.activation_quant_backend||"auto")+activationGroup):
     (o.activation_quant_enabled===false?"OFF":"未记录");
   let alert="";
   if(st==="INVALID_RUN"){alert='<div class="alert-invalid">输入无效 (模型加载/forward 失败或全 NaN)。以下排名仅供参考, 不可作为定论。'+hIcon("baseline_l2")+'</div>';}
   if(st==="INCONCLUSIVE"){alert='<div class="alert-invalid">结论存疑: L1 逐层对齐结果与生成定界不一致, 需人工复核 (可能 framework 层误差/截断/采样差异)。'+hIcon("cos_sim")+'</div>';}
+  let capturedPanel="";
+  const cr=o.captured_replay;
+  if(o.boundary_issue_mode==="intermittent"&&cr){
+    const verdict=cr.verdict||"—";
+    const verdictCls=verdict==="INTERMITTENT_LOGITS_ALIGNED"?"ok":(verdict==="INTERMITTENT_RANKING_SENSITIVE"?"warn":"bad");
+    const cosVal=cr.mean_cosine==null?"—":fix(cr.mean_cosine,6);
+    const klVal=cr.max_kl==null?"—":fix(cr.max_kl,6);
+    const overlapVal=cr.min_topk_overlap==null?"—":pct(cr.min_topk_overlap,1);
+    capturedPanel='<div class="card" style="margin-top:12px;border-left:3px solid '+(verdictCls==="ok"?C.good:(verdictCls==="warn"?C.warn:C.bad))+'">'
+      +'<h3>Captured vLLM vs Transformers Replay</h3>'
+      +'<div class="scope-meta"><span class="pill muted">'+esc(cr.input_token_count||0)+' input tokens</span>'
+      +'<span class="pill muted">'+esc((cr.compared_positions||[]).length)+' positions</span>'
+      +'<span class="pill '+verdictCls+'">'+esc(verdict)+'</span></div>'
+      +'<div class="kv" style="margin-top:8px"><span class="k">Top-1 match</span><span class="v">'+esc(cr.top1_match_count||0)+' / '+esc(cr.top1_total||0)+'</span>'
+      +'<span class="k">Mean cosine</span><span class="v">'+cosVal+'</span>'
+      +'<span class="k">Max KL</span><span class="v">'+klVal+'</span>'
+      +'<span class="k">Min Top-K overlap</span><span class="v">'+overlapVal+'</span>'
+      +'<span class="k">First mismatch</span><span class="v">'+esc(cr.first_mismatch_position==null?"—":cr.first_mismatch_position)+'</span>'
+      +'<span class="k">First Top-1 flip</span><span class="v">'+esc(cr.first_top1_flip_position==null?"—":cr.first_top1_flip_position)+'</span></div>'
+      +(cr.missing_metrics?'<div class="tip">'+esc(cr.missing_metrics)+'</div>':"")+'</div>';
+  }
   root.innerHTML = alert+renderScopeBanner(o)+
     '<div class="grid cols-3">'+
       '<div class="card"><h3>定界结论'+hIcon("baseline_l2")+'</h3><div class="pill '+bndClass+'">'+bndTxt+'</div><div class="sub">'+esc(o.boundary_result||"—")+'</div></div>'+
@@ -755,7 +779,7 @@ function renderOverview(){
         '<span class="k">Quant</span><span class="v" style="font-size:11px">'+esc(o.quant_model_path||"—")+'</span>'+
         '<span class="k">输入</span><span class="v input-preview" style="font-size:11px">'+esc(o.prompt||"")+'</span>'+
       '</div></div>'+
-    '</div>';
+    '</div>'+capturedPanel;
 }
 
 // ====================================================================
@@ -981,6 +1005,8 @@ function renderScatter(){
   const root=el("logits_scatter");if(!root)return;
   const rf=R.logits.scatter_ref||[],qf=R.logits.scatter_quant||[];
   if(!rf.length){root.innerHTML='<div class="empty">无散点样本</div>';return;}
+  const leftName=R.logits.position_mode==="captured_replay"?"vLLM capture":"Ref";
+  const rightName=R.logits.position_mode==="captured_replay"?"Transformers replay":"Quant";
   const W=900,H=300,m=40;const xs=rf,qx=qf;
   let lo=Math.min(...rf,...qf),hi=Math.max(...rf,...qf);if(hi-lo<1)hi=lo+1;
   const X=v=>m+(W-2*m)*(v-lo)/(hi-lo),Y=v=>(H-m)-(H-2*m)*(v-lo)/(hi-lo);
@@ -993,11 +1019,11 @@ function renderScatter(){
   // y=x 参考线
   s.appendChild(E("line",{x1:X(lo),y1:Y(lo),x2:X(hi),y2:Y(hi),stroke:C.muted,"stroke-dasharray":"4 3"}));
   for(let i=0;i<rf.length;i++){s.appendChild(E("circle",{cx:X(rf[i]),cy:Y(qf[i]),r:1.6,fill:C.quant,opacity:0.35}));}
-  const t1=E("text",{x:W/2,y:H-4,"text-anchor":"middle",class:"axis"});t1.textContent="ref logit";s.appendChild(t1);
-  const t2=E("text",{x:12,y:H/2,"text-anchor":"middle",class:"axis",transform:"rotate(-90 12 "+(H/2)+")"});t2.textContent="quant logit";s.appendChild(t2);
-  root.innerHTML='<div class="card"><h3>Ref vs Quant logits 散点 '+hIcon("logits_scatter")+'</h3></div>';
+  const t1=E("text",{x:W/2,y:H-4,"text-anchor":"middle",class:"axis"});t1.textContent=leftName+" logit";s.appendChild(t1);
+  const t2=E("text",{x:12,y:H/2,"text-anchor":"middle",class:"axis",transform:"rotate(-90 12 "+(H/2)+")"});t2.textContent=rightName+" logit";s.appendChild(t2);
+  root.innerHTML='<div class="card"><h3>'+leftName+' vs '+rightName+' logits 散点 '+hIcon("logits_scatter")+'</h3></div>';
   appendChart(root,s);
-  const lg=document.createElement("div");lg.className="tip";lg.innerHTML='<span class="legend-chip" style="background:'+C.quant+'"></span>每个点=某 position 的 Ref/Quant Top-K 并集候选 (ref_x, quant_y) · 虚线=y=x 完全吻合 · 离线越远=该 token 量化偏离越大';
+  const lg=document.createElement("div");lg.className="tip";lg.innerHTML='<span class="legend-chip" style="background:'+C.quant+'"></span>每个点=某 position 的 '+leftName+'/'+rightName+' Top-K 并集候选 ('+leftName+'_x, '+rightName+'_y) · 虚线=y=x 完全吻合 · 离线越远=该 token 偏离越大';
   root.appendChild(lg);
 }
 function renderLines(){
@@ -1075,6 +1101,10 @@ function renderTopK(i){
   const pos=L.token_positions[i]===undefined?i:L.token_positions[i];
   const isFirstDecode=L.position_mode==="prompt_prefill"&&i===L.token_positions.length-1;
   const role=L.position_mode==="prompt_prefill"?(isFirstDecode?"首个 Decode Token":"Prompt 内 next-token 预测"):(L.position_mode==="generation"?"Decode step":"Token position");
+  const inputRows=L.input_ids||[];const inputRow=inputRows[0]||[];
+  const inputToken=(pos>=0&&pos<inputRow.length)?("#"+inputRow[pos]):"—";
+  const leftName=L.position_mode==="captured_replay"?"vLLM capture":"Ref";
+  const rightName=L.position_mode==="captured_replay"?"Transformers replay":"Quant";
   const rf=L.ref_topk[i]||[];const qf=L.quant_topk[i]||[];
   // merge by token_id: 同一 token 取 ref_prob 与 quant_prob 并排
   const map={};const order=[];
@@ -1096,18 +1126,22 @@ function renderTopK(i){
     if(qp!==null){const w=Math.max(X(qp)-mL,2);const rr=E("rect",{x:mL,y:y+h/2,width:w,height:h/2-1,fill:C.quant,opacity:0.85,rx:2});s.appendChild(rr);}
   });
   // legend
-  const lg=E("text",{x:W-mR,y:H-4,"text-anchor":"end",class:"axis","font-size":"9"});lg.textContent="绿(粗)=ref 概率 · 橙(细)=quant 概率";s.appendChild(lg);
+  const lg=E("text",{x:W-mR,y:H-4,"text-anchor":"end",class:"axis","font-size":"9"});lg.textContent="绿(粗)="+leftName+" 概率 · 橙(细)="+rightName+" 概率";s.appendChild(lg);
   const top1Arr=R.logits.token_wise_top1_match||[];
   const matchCnt=top1Arr.filter(x=>x===true).length;
   const tot=top1Arr.length;
   const top1=R.logits.token_wise_top1_match&&R.logits.token_wise_top1_match[i];
+  const refMargin=num((R.logits.ref_top1_margin||[])[i]);
+  const quantMargin=num((R.logits.quant_top1_margin||[])[i]);
   const matchBadge=top1?'<span class="pill ok">Top-1 一致</span>':'<span class="pill bad">Top-1 不一致</span>';
   const summaryBadge=matchCnt+'/'+tot+' positions match';
   const summaryCls=matchCnt===tot?"pill ok":(matchCnt>tot/2?"pill warn":"pill bad");
   const card=document.createElement("div");
   card.className="card";
   card.innerHTML='<h3>Top-K 概率并排 '+hIcon("top1_match")+' <span class="'+summaryCls+'">'+summaryBadge+'</span></h3>'
-    +'<div class="tip"><b>Position '+pos+' · '+role+'</b> — 当前: '+matchBadge+' · 绿(粗)=Ref 概率 · 橙(细)=Quant 概率 · 使用下方 Position 选择器或折线节点切换</div>';
+    +'<div class="tip"><b>Position '+pos+' · '+role+'</b> · 输入 token '+inputToken+' — 当前: '+matchBadge+' · 绿(粗)='+leftName+' 概率 · 橙(细)='+rightName+' 概率'
+    +' · Top-1 margin ('+leftName+'/'+rightName+')='+(refMargin===null?"—":refMargin.toFixed(4))+'/'+(quantMargin===null?"—":quantMargin.toFixed(4))
+    +' · 使用下方 Position 选择器或折线节点切换</div>';
   const picker=document.createElement("div");picker.className="position-picker";picker.setAttribute("aria-label","Top-K position selector");
   const overlapArr=L.token_wise_topk_overlap||[];
   L.token_positions.forEach((p,j)=>{const b=document.createElement("button");b.type="button";

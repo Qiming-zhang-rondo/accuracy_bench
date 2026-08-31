@@ -1835,6 +1835,61 @@ def _hf_run_generation(model, tokenizer, prompt_file, thinking, max_new_tokens,
     return results
 
 
+def _hf_replay_logits(model, input_ids, positions, first_device, verbose=True,
+                      attention_mask=None):
+    """Replay one captured input-id sequence and return logits at exact positions.
+
+    This path deliberately bypasses tokenizer/chat-template/generate.  It is
+    used by Boundary intermittent mode, where the captured vLLM input_ids are
+    the source of truth and only sampler-input vocabulary logits are needed.
+    """
+    from .logits_compare import LogitsCollection
+
+    ids = torch.as_tensor(input_ids, dtype=torch.long)
+    if ids.dim() == 1:
+        ids = ids.unsqueeze(0)
+    if ids.dim() != 2 or ids.shape[0] != 1:
+        raise ValueError("captured replay input_ids must have shape [1,S]")
+    pos = [int(p) for p in positions]
+    if not pos:
+        raise ValueError("captured replay positions must be non-empty")
+    if min(pos) < 0 or max(pos) >= ids.shape[1]:
+        raise ValueError(
+            f"captured replay position outside input sequence: S={ids.shape[1]}, positions={pos}"
+        )
+    ids = ids.to(first_device)
+    if attention_mask is None:
+        attention_mask = torch.ones_like(ids)
+    else:
+        attention_mask = torch.as_tensor(attention_mask, dtype=torch.long)
+        if attention_mask.dim() == 1:
+            attention_mask = attention_mask.unsqueeze(0)
+        if attention_mask.shape != ids.shape:
+            raise ValueError("captured replay attention_mask must match input_ids")
+        attention_mask = attention_mask.to(first_device)
+    if verbose:
+        logger.info(
+            "  [intermittent replay] direct input_ids forward: S=%d, positions=%s",
+            ids.shape[1], pos if len(pos) <= 12 else f"{pos[:6]}...{pos[-3:]}",
+        )
+    with torch.no_grad():
+        try:
+            output = model(ids, attention_mask=attention_mask,
+                           use_cache=False, return_dict=True)
+        except TypeError:
+            output = model(ids, attention_mask=attention_mask, use_cache=False)
+    logits = output.logits if hasattr(output, "logits") else output[0]
+    if logits is None or logits.dim() != 3:
+        raise RuntimeError("Transformers replay did not return [B,S,V] vocabulary logits")
+    selected = logits[0, pos, :].detach().to("cpu", dtype=torch.float32)
+    return LogitsCollection(
+        token_positions=pos,
+        logits=selected,
+        input_ids=ids.detach().to("cpu"),
+        position_mode="captured_replay",
+    )
+
+
 def _hf_run_ppl(model, tokenizer, first_device, skip_ppl: bool):
     """[可选] PPL 计算"""
     if skip_ppl:
@@ -1896,7 +1951,10 @@ def hf_inference_check(
     chat_template_mode: str = "auto",
     generation_config: Optional[Dict[str, Any]] = None,
     print_full_output: bool = False,
-) -> List[Dict[str, Any]]:
+    replay_input_ids=None,
+    replay_positions=None,
+    replay_attention_mask=None,
+) -> Any:
     """
     通用 HF 推理检查入口。
 
@@ -1982,6 +2040,14 @@ def hf_inference_check(
 
     model.eval()
     first_device = device_list[0]
+
+    if replay_input_ids is not None:
+        if replay_positions is None:
+            raise ValueError("replay_positions is required with replay_input_ids")
+        return _hf_replay_logits(
+            model, replay_input_ids, replay_positions, first_device, verbose=verbose,
+            attention_mask=replay_attention_mask,
+        )
 
     # ---- Step 6: 推理 ----
     results = _hf_run_generation(
@@ -2147,6 +2213,8 @@ def qwen35_inference_check(
 from .boundary_check import (
     BoundaryResult,
     WEIGHT_OR_QUANTIZATION, INFERENCE_FRAMEWORK, BOTH, INCONCLUSIVE, INVALID_RUN,
+    INTERMITTENT_LOGITS_ALIGNED, INTERMITTENT_LOGITS_MISMATCH,
+    INTERMITTENT_RANKING_SENSITIVE,
     repeat_4gram_ratio, nonprintable_ratio,
     detect_badcase,
     classify_boundary, run_boundary, boundary_result_to_dict,

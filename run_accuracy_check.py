@@ -246,6 +246,23 @@ def parse_args():
                         help="[boundary] 部署框架实际生成的坏文本")
     parser.add_argument("--framework_bad_reproduced", choices=["true", "false"], default=None,
                         help="[boundary] 外部确认部署框架是否复现，不会调用该框架")
+    parser.add_argument(
+        "--boundary_issue_mode", choices=["reproducible", "intermittent"],
+        default="reproducible",
+        help=("[boundary] reproducible=按原流程生成（默认）；"
+              "intermittent=导入一次 vLLM captured logits JSON 做 replay"),
+    )
+    parser.add_argument(
+        "--captured_logits_json", type=str, default=None,
+        help=("[boundary/intermittent] vLLM 现场 logits JSON；需含 input_ids、"
+              "positions，以及 full logits 或 Top-K 字段"),
+    )
+    parser.add_argument("--boundary_logits_cos_threshold", type=float, default=0.99,
+                        help="[boundary/intermittent] cosine 明显偏差阈值")
+    parser.add_argument("--boundary_logits_kl_threshold", type=float, default=0.05,
+                        help="[boundary/intermittent] KL 明显偏差阈值")
+    parser.add_argument("--boundary_logits_margin_threshold", type=float, default=0.05,
+                        help="[boundary/intermittent] 低 margin flip 阈值")
     parser.add_argument("--no_ref", action="store_true",
                         help="[boundary] Quant-only；不加载参考模型")
     parser.add_argument("--num_runs", type=parse_positive_int, default=1,
@@ -851,6 +868,11 @@ def _mode_boundary(args):
         deepseek_v4_key_block=getattr(args, "deepseek_v4_key_block", None),
         chat_template_mode=getattr(args, "chat_template_mode", "auto"),
         print_full_output=getattr(args, "print_full_output", False),
+        boundary_issue_mode=getattr(args, "boundary_issue_mode", "reproducible"),
+        captured_logits_json=getattr(args, "captured_logits_json", None),
+        boundary_logits_cos_threshold=getattr(args, "boundary_logits_cos_threshold", 0.99),
+        boundary_logits_kl_threshold=getattr(args, "boundary_logits_kl_threshold", 0.05),
+        boundary_logits_margin_threshold=getattr(args, "boundary_logits_margin_threshold", 0.05),
     )
     d = boundary_result_to_dict(result)
     logger.info("\n  定界结果: " + d["boundary_result"])
@@ -864,6 +886,19 @@ def _mode_boundary(args):
             f"    quant runs={quant_summary.get('completed_runs')}/"
             f"{quant_summary.get('requested_runs')} bad={quant_summary.get('badcase_runs')} "
             f"rate={quant_summary.get('badcase_rate')}"
+        )
+    replay_summary = d.get("evidence", {}).get("captured_logits_replay", {})
+    if replay_summary:
+        logger.info(
+            "    captured replay positions=%d top1=%s/%s cosine=%s KL=%s overlap=%s"
+            % (
+                len(replay_summary.get("compared_positions", [])),
+                replay_summary.get("top1_match_count", 0),
+                replay_summary.get("top1_total", 0),
+                replay_summary.get("mean_cosine", "n/a"),
+                replay_summary.get("max_kl", "n/a"),
+                replay_summary.get("min_topk_overlap", "n/a"),
+            )
         )
     if d.get("limitations"):
         logger.info("    限制: " + "; ".join(d["limitations"])[:500])
@@ -897,21 +932,39 @@ def _mode_boundary(args):
         for message in messages or []:
             if message.get("role") == "user":
                 prompt_text = message.get("content", "") or ""
+        if getattr(args, "boundary_issue_mode", "reproducible") == "intermittent":
+            captured_meta = d.get("evidence", {}).get("captured_logits", {}).get("metadata", {})
+            prompt_text = captured_meta.get("prompt") or "[captured vLLM input_ids replay]"
         inference_compare = _build_inference_compare_from_boundary(
             d, quant, prompt=prompt_text, ref_model_path=args.ref_model
         )
         report_data = assemble_report(
             boundary_result=boundary_runs,
             inference_compare_data=inference_compare,
+            logits_comparison=(
+                d.get("evidence", {}).get("captured_logits_replay", {}).get("logits_data")
+                if getattr(args, "boundary_issue_mode", "reproducible") == "intermittent"
+                else None
+            ),
             model_name=args.model_name or os.path.basename(quant),
             ref_model_path=args.ref_model or "",
             quant_model_path=quant,
             quant_format=getattr(args, "quant_format", "") or "",
             device_mode=str(devices),
             prompt=prompt_text,
-            input_mode="messages",
+            input_mode=("captured_logits" if getattr(args, "boundary_issue_mode", "reproducible") == "intermittent" else "messages"),
             run_mode="boundary",
         )
+        report_data.overview.boundary_issue_mode = getattr(
+            args, "boundary_issue_mode", "reproducible"
+        )
+        # assemble_report has no per-run entry for intermittent replay, so
+        # preserve the authoritative Boundary verdict explicitly in overview.
+        report_data.overview.boundary_result = d.get("boundary_result")
+        captured_summary = d.get("evidence", {}).get("captured_logits_replay")
+        if captured_summary:
+            report_data.overview.captured_replay = dict(captured_summary)
+            report_data.overview.captured_replay.pop("logits_data", None)
         report_json_path = os.path.join(out_dir, "report_data.json")
         with open(report_json_path, "w", encoding="utf-8") as f:
             f.write(report_data.to_json(indent=2))

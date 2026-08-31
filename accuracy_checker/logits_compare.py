@@ -152,6 +152,7 @@ class LogitsComparison:
     """ref vs quant logits 对比结果 (含 4 类可视化数据)"""
     token_positions: List[int] = field(default_factory=list)
     position_mode: str = "unknown"
+    input_ids: Optional[List[List[int]]] = None
     ref_topk: List[List[TokenProb]] = field(default_factory=list)
     quant_topk: List[List[TokenProb]] = field(default_factory=list)
     ref_argmax_logits: List[float] = field(default_factory=list)       # 每 position ref argmax logit
@@ -160,6 +161,8 @@ class LogitsComparison:
     token_wise_kl: List[Optional[float]] = field(default_factory=list)        # KL(quant || ref)
     token_wise_topk_overlap: List[Optional[float]] = field(default_factory=list)
     token_wise_top1_match: List[bool] = field(default_factory=list)
+    ref_top1_margin: List[Optional[float]] = field(default_factory=list)
+    quant_top1_margin: List[Optional[float]] = field(default_factory=list)
     scatter_ref: List[float] = field(default_factory=list)             # 采样成对样本
     scatter_quant: List[float] = field(default_factory=list)
     hist_bins: List[float] = field(default_factory=list)
@@ -170,6 +173,7 @@ class LogitsComparison:
         """转成 report_schema.LogitsData (供 HTML 报告直接消费)。"""
         return LogitsData(
             token_positions=list(self.token_positions),
+            input_ids=list(self.input_ids or []),
             position_mode=self.position_mode,
             ref_topk=[list(pos) for pos in self.ref_topk],
             quant_topk=[list(pos) for pos in self.quant_topk],
@@ -179,6 +183,8 @@ class LogitsComparison:
             token_wise_kl=list(self.token_wise_kl),
             token_wise_topk_overlap=list(self.token_wise_topk_overlap),
             token_wise_top1_match=list(self.token_wise_top1_match),
+            ref_top1_margin=list(self.ref_top1_margin),
+            quant_top1_margin=list(self.quant_top1_margin),
             scatter_ref=list(self.scatter_ref),
             scatter_quant=list(self.scatter_quant),
             hist_bins=list(self.hist_bins),
@@ -266,6 +272,8 @@ def compare_logits(ref: LogitsCollection, quant: LogitsCollection,
     t_kl: List[Optional[float]] = []
     t_overlap: List[Optional[float]] = []
     t_top1: List[bool] = []
+    t_margin1: List[Optional[float]] = []
+    t_margin2: List[Optional[float]] = []
     scatter_flat_indices: List[int] = []
 
     for i in range(n):
@@ -302,6 +310,10 @@ def compare_logits(ref: LogitsCollection, quant: LogitsCollection,
         overlap = len(set(r_ids) & set(q_ids))
         t_overlap.append(overlap / k if k else None)
         t_top1.append(bool(r_ids[0] == q_ids[0]) if r_ids and q_ids else False)
+        r_top2 = torch.topk(r_row, k=2).values if vocab >= 2 else None
+        q_top2 = torch.topk(q_row, k=2).values if vocab >= 2 else None
+        t_margin1.append(float((r_top2[0] - r_top2[1]).item()) if r_top2 is not None else None)
+        t_margin2.append(float((q_top2[0] - q_top2[1]).item()) if q_top2 is not None else None)
 
     # 散点只看真正参与 generation Top-K 的候选。Ref/Quant 使用相同扁平
     # 索引，保证每个点始终是同一 position + token_id 的成对 logits。
@@ -329,6 +341,8 @@ def compare_logits(ref: LogitsCollection, quant: LogitsCollection,
     return LogitsComparison(
         token_positions=positions,
         position_mode=position_mode,
+        input_ids=(ref.input_ids.tolist() if ref.input_ids is not None else
+                   (quant.input_ids.tolist() if quant.input_ids is not None else None)),
         ref_topk=ref_topk,
         quant_topk=quant_topk,
         ref_argmax_logits=ref_argmax,
@@ -337,11 +351,90 @@ def compare_logits(ref: LogitsCollection, quant: LogitsCollection,
         token_wise_kl=t_kl,
         token_wise_topk_overlap=t_overlap,
         token_wise_top1_match=t_top1,
+        ref_top1_margin=t_margin1,
+        quant_top1_margin=t_margin2,
         scatter_ref=sr.tolist(),
         scatter_quant=sq.tolist(),
         hist_bins=bins,
         hist_ref_counts=r_counts,
         hist_quant_counts=q_counts,
+    )
+
+
+def compare_captured_topk(captured_topk, replay: LogitsCollection,
+                          tokenizer, top_k: int = 10) -> LogitsComparison:
+    """Compare a Top-K-only capture against replay full logits.
+
+    Full-vocabulary cosine/KL/histogram are intentionally left unavailable;
+    this helper only reports metrics supported by the captured candidate set.
+    """
+    n = min(len(captured_topk), replay.num_positions)
+    if n <= 0:
+        raise ValueError("captured Top-K and replay logits have no common positions")
+    vocab = int(replay.logits.shape[1])
+    k = max(1, min(int(top_k), vocab))
+    positions = list(replay.token_positions[:n])
+    ref_topk: List[List[TokenProb]] = []
+    quant_topk: List[List[TokenProb]] = []
+    ref_argmax: List[float] = []
+    quant_argmax: List[float] = []
+    overlaps: List[Optional[float]] = []
+    top1_matches: List[bool] = []
+    ref_margins: List[Optional[float]] = []
+    quant_margins: List[Optional[float]] = []
+
+    for i in range(n):
+        cap = list(captured_topk[i] or [])[:k]
+        cap_by_id = {int(t.token_id): t for t in cap}
+        q_ids, q_probs = _topk_prob(replay.logits[i], k)
+        q_by_id = {tid: float(prob) for tid, prob in zip(q_ids, q_probs)}
+        all_ids = list(dict.fromkeys(list(cap_by_id) + q_ids))
+
+        r_rows: List[TokenProb] = []
+        q_rows: List[TokenProb] = []
+        for tid in all_ids:
+            token = cap_by_id.get(tid)
+            try:
+                token_str = _clean_token_str(tokenizer.decode([tid]), tid)
+            except Exception:
+                token_str = f"#{tid}"
+            cap_prob = token.probability if token is not None else None
+            r_rows.append(TokenProb(tid, token_str, cap_prob, None))
+            q_rows.append(TokenProb(tid, token_str, None, q_by_id.get(tid)))
+        ref_topk.append(r_rows)
+        quant_topk.append(q_rows)
+
+        cap_ids = list(cap_by_id)
+        overlaps.append(len(set(cap_ids) & set(q_ids)) / k if k else None)
+        top1_matches.append(bool(cap_ids and q_ids and cap_ids[0] == q_ids[0]))
+        cap_values = [t.value for t in cap if t.value is not None]
+        ref_margins.append(
+            float(cap_values[0] - cap_values[1]) if len(cap_values) >= 2 else None
+        )
+        q_top2 = torch.topk(replay.logits[i], k=2).values if vocab >= 2 else None
+        quant_margins.append(float((q_top2[0] - q_top2[1]).item()) if q_top2 is not None else None)
+        ref_argmax.append(float(cap_values[0]) if cap_values else float("nan"))
+        quant_argmax.append(float(replay.logits[i].max().item()))
+
+    return LogitsComparison(
+        token_positions=positions,
+        position_mode="captured_replay",
+        input_ids=replay.input_ids.tolist() if replay.input_ids is not None else None,
+        ref_topk=ref_topk,
+        quant_topk=quant_topk,
+        ref_argmax_logits=ref_argmax,
+        quant_argmax_logits=quant_argmax,
+        token_wise_cos=[None] * n,
+        token_wise_kl=[None] * n,
+        token_wise_topk_overlap=overlaps,
+        token_wise_top1_match=top1_matches,
+        ref_top1_margin=ref_margins,
+        quant_top1_margin=quant_margins,
+        # Top-K-only captures may contain probabilities or log-probabilities,
+        # not raw vocabulary logits.  Do not render a misleading mixed-unit
+        # scatter plot; full-vocabulary captures use compare_logits instead.
+        scatter_ref=[],
+        scatter_quant=[],
     )
 
 
@@ -360,5 +453,6 @@ def run_logits_compare(ref_model, ref_tokenizer, quant_model, quant_tokenizer,
 
 __all__ = [
     "LogitsCollection", "LogitsComparison",
-    "collect_logits", "collect_last_logits", "compare_logits", "run_logits_compare",
+    "collect_logits", "collect_last_logits", "compare_logits",
+    "compare_captured_topk", "run_logits_compare",
 ]

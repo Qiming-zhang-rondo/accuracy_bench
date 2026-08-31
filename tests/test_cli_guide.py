@@ -59,6 +59,7 @@ class TestCliGuide(unittest.TestCase):
             "maxNewTokens", "noRef", "frameworkReproduced",
             "stopOnFirstBadcase", "repeat4gramMax", "nonprintableMax",
             "chatTemplateMode", "deepseekV4QueryBlock", "deepseekV4KeyBlock",
+            "boundaryIssueMode", "capturedLogitsJson", "capturedLogitsField",
         }
         self.assertTrue(required.issubset(self.parser.ids))
 
