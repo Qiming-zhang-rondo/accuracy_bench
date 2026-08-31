@@ -852,7 +852,7 @@
             <div class="wide" id="promptField">
               <label for="prompt">Prompt</label>
               <textarea id="prompt">Write a poem in the style of a limerick about a programmer debugging at 3 AM.</textarea>
-              <span class="hint">L1/full 普通模式填写部署时真实收到的输入；长文本可改用下方 Prompt 文件。</span>
+              <span class="hint">L1/L2/full 普通模式填写部署时真实收到的输入；L2 必须与生成 L1 cache 时的输入一致。长文本可改用下方 Prompt 文件。</span>
             </div>
             <div id="chatTemplateModeField">
               <label for="chatTemplateMode">Chat Template</label>
@@ -861,10 +861,10 @@
                 <option value="always">强制套用模型 ChatTemplate</option>
                 <option value="never">原样输入，不套模板</option>
               </select>
-              <span class="hint">自动：Messages / Request JSON 使用模型模板，普通 Prompt 和已渲染文本保持原样；强制套用会把普通文本包装为 user message；原样适合包含 <code>[gMASK]</code>、<code>&lt;|user|&gt;</code> 等特殊标记的完整输入。</span>
+              <span class="hint">自动：Messages / Request JSON 使用模型模板，普通 Prompt 和已渲染文本保持原样；强制套用会把普通文本包装为 user message；原样适合包含 <code>[gMASK]</code>、<code>&lt;|user|&gt;</code> 等特殊标记的完整输入。L2 请选择与生成 L1 cache 时相同的模式。</span>
             </div>
             <div class="wide hidden" id="rawPromptFileField">
-              <label for="rawPromptFile">原始 Prompt 文件 <span class="optional">L1 / full · TXT/Jinja</span></label>
+              <label for="rawPromptFile">原始 Prompt 文件 <span class="optional">L1 / L2 / full · TXT/Jinja</span></label>
               <input id="rawPromptFile" type="text" autocomplete="off" placeholder="/path/to/prompt.txt">
               <span class="hint">填写后会生成 <code>--prompt_file</code>；文件内容原样作为 tokenizer 输入，适合很长的已渲染 prompt。</span>
             </div>
@@ -1012,13 +1012,13 @@
             <tr><td><code>--ref_model</code></td><td>空</td><td>BF16/FP16 参考模型路径。L1 必需；boundary 中建议提供。</td></tr>
             <tr><td><code>--quant_model</code></td><td>空</td><td>量化模型路径。除 report / inference 特殊输入外通常必需。</td></tr>
             <tr><td><code>--l1</code> / <code>--l2</code> / <code>--all</code> / <code>--boundary</code></td><td>false</td><td>历史兼容开关；新命令优先使用 <code>--mode</code>。</td></tr>
-            <tr><td><code>--prompt</code></td><td>内置中文短句</td><td>对齐或生成输入。应使用真实 bad case 的原始输入。</td></tr>
+            <tr><td><code>--prompt</code></td><td>内置中文短句</td><td>对齐或生成输入。L1/L2/full 应使用真实 bad case 的原始输入；L2 必须与生成 L1 cache 时一致。</td></tr>
             <tr><td><code>--messages</code></td><td>空</td><td>Chat messages JSON；在 auto/always 下调用 tokenizer 的 apply_chat_template。</td></tr>
-            <tr><td><code>--chat_template_mode</code></td><td>auto</td><td>L1/full/inference 的输入控制：auto 为 messages 套模板、普通/原始文本不套；always 将文本包装为 user 后套模板；never 原样 tokenize 且禁止 structured messages。Boundary 页面固定使用 structured messages + auto，避免重复渲染。</td></tr>
-            <tr><td><code>--prompt_file</code></td><td>空</td><td>L1/full 支持完整请求 JSON、对话列表和 .txt/.prompt 原始 Jinja/ChatML prompt；Boundary CLI/API 仍兼容请求文件，参数页面统一使用结构化请求 JSON。</td></tr>
+            <tr><td><code>--chat_template_mode</code></td><td>auto</td><td>L1/L2/full/inference 的输入控制：auto 为 messages 套模板、普通/原始文本不套；always 将文本包装为 user 后套模板；never 原样 tokenize 且禁止 structured messages。L2 应选择与生成 L1 cache 时相同的模式。</td></tr>
+            <tr><td><code>--prompt_file</code></td><td>空</td><td>L1/L2/full 支持完整请求 JSON、对话列表和 .txt/.prompt 原始 Jinja/ChatML prompt；Boundary CLI/API 仍兼容请求文件，参数页面统一使用结构化请求 JSON。</td></tr>
             <tr><td><code>--request_json</code></td><td>空</td><td>直接粘贴完整请求 JSON；短请求适用，内容格式与 prompt_file 相同。</td></tr>
             <tr><td><code>--request_json_stdin</code></td><td>false</td><td>从 stdin 读取完整请求 JSON；适合超长 prompt，避免 shell 的 Argument list too long。</td></tr>
-            <tr><td><code>--prompt_stdin</code></td><td>false</td><td>从 stdin 读取 Boundary/L1/full 原始文本/Jinja prompt；页面检测到直接粘贴内容时自动生成，避免 shell 的 Argument list too long。</td></tr>
+            <tr><td><code>--prompt_stdin</code></td><td>false</td><td>从 stdin 读取 Boundary/L1/L2/full 原始文本/Jinja prompt；页面检测到直接粘贴内容时自动生成，避免 shell 的 Argument list too long。</td></tr>
             <tr><td><code>--target_layers</code> / <code>--target-layers</code></td><td>空</td><td>L2 目标层，支持逗号或空格分隔。</td></tr>
             <tr><td><code>--device</code></td><td>cuda（自动解析）</td><td>通用设备；NPU 建议显式指定 ref/quant 设备参数。</td></tr>
             <tr><td><code>--ref_device</code></td><td>继承 device</td><td>dual / DSpark 的参考模型设备。</td></tr>
@@ -1283,10 +1283,10 @@
         var intermittentBoundary = mode === "boundary" && el.boundaryIssueMode.value === "intermittent";
         setFieldVisibility("capturedLogitsField", intermittentBoundary);
         setFieldVisibility("boundaryRequestField", mode === "boundary" && !intermittentBoundary);
-        setFieldVisibility("rawPromptFileField", ["l1", "full"].indexOf(mode) !== -1 && !dspark);
-        setFieldVisibility("chatTemplateModeField", mode !== "screening" && mode !== "l2" && mode !== "boundary" && !dspark);
+        setFieldVisibility("rawPromptFileField", ["l1", "l2", "full"].indexOf(mode) !== -1 && !dspark);
+        setFieldVisibility("chatTemplateModeField", mode !== "screening" && mode !== "boundary" && !dspark);
         // Boundary uses structured messages and the default auto renderer;
-        // never expose a stale L1/full selection as if it affected boundary.
+        // never expose a stale L1/L2/full selection as if it affected boundary.
         el.chatTemplateMode.disabled = mode === "boundary";
         if (mode === "boundary") el.chatTemplateMode.value = "auto";
         setFieldVisibility("advancedOptions", mode === "boundary" || (l1Flow && grouped && !dspark));
@@ -1607,7 +1607,7 @@
           && !el.requestJson.value.trim()
           && !el.promptFile.value.trim()
           && el.prompt.value.trim();
-        var inlineRawPromptStdin = ["l1", "full"].indexOf(mode) !== -1
+        var inlineRawPromptStdin = ["l1", "l2", "full"].indexOf(mode) !== -1
           && el.rawPromptFile.value.trim()
           && !isAbsoluteLinuxPath(el.rawPromptFile.value.trim());
         recommendedCardCount = recommendation.cards;
@@ -1634,7 +1634,7 @@
         commands.push("ASCEND_RT_VISIBLE_DEVICES=" + visible + " OMP_NUM_THREADS=8 \\");
         args.push("python3 run_accuracy_check.py --mode " + mode);
         // Boundary structured messages always use the model tokenizer's
-        // template exactly once; ChatTemplate is a L1/full input choice.
+        // template exactly once; ChatTemplate is a L1/L2/full input choice.
         if (mode !== "boundary" && el.chatTemplateMode.value !== "auto") {
           args.push(line("--chat_template_mode", el.chatTemplateMode.value));
         }
@@ -1746,7 +1746,7 @@
           // The raw-prompt field is normally a server path.  If the user
           // pastes the prompt itself, stream it instead of putting it in argv.
           args.push(line("--prompt_stdin"));
-        } else if (["l1", "full"].indexOf(mode) !== -1 && el.rawPromptFile.value.trim()) {
+        } else if (["l1", "l2", "full"].indexOf(mode) !== -1 && el.rawPromptFile.value.trim()) {
           args.push(line("--prompt_file", shellQuote(el.rawPromptFile.value, "<PROMPT_FILE>")));
         } else if (mode !== "screening") {
           args.push(line("--prompt", shellQuote(el.prompt.value, "<PROMPT>")));
