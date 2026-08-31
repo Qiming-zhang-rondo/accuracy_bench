@@ -656,7 +656,7 @@ const HELP={
   input_recovery:{t:"Input Recovery (上游输入恢复)",f:"(baseline_l2 − patched_input_l2) / baseline_l2",r:"0~1 高=上游污染重",i:"把上游输入改回 ref 后整层误差的消除比例; 高即上游污染严重, 问题在前面层。"},
   baseline_l2:{t:"整层基线误差",f:"rel_l2(quant_out, ref_out) = ‖a−b‖₂/‖b‖₂",r:"<0.05 OK, >=0.20 坏",i:"整层量化输出的相对 L2 误差, L2 诊断的基线 (反事实的对照)。"},
   top1_match:{t:"Top-1 Token Match",f:"argmax(ref_logits)==argmax(quant_logits)",r:"True/False",i:"该位置 ref 和 quant 选中的下一个 token 是否一致; False 即量化改变了贪心解码路径。"},
-  token_wise_kl:{t:"Token-wise KL(quant‖ref)",f:"Σ p·log(p/q), p=quant, q=ref 概率",r:"越低越好 ~0",i:"每位置量化vs参考分布的 KL; 高则两分布差异大, 选词路径可能分叉。"},
+  token_wise_kl:{t:"Token-wise KL(ref‖quant)",f:"Σ p·log(p/q), p=ref, q=quant 概率",r:"越低越好 ~0",i:"每位置参考分布相对量化分布的 KL; 高则两分布差异大, 选词路径可能分叉。"},
   token_wise_cos:{t:"Token-wise Logits Cos",f:"cos(ref_logits, quant_logits) per position",r:"0~1 高=好",i:"每位置全词表 logits 的余弦相似度; 高即分布形状一致。"},
   topk_overlap:{t:"Top-K Overlap",f:"|ref_topk ∩ quant_topk| / k",r:"0~1 高=好",i:"候选词集合重合度; 低即候选集都不同, 解码分歧大。"},
   first_divergence:{t:"L1 首个诊断候选层",f:"Δᵢ=cosᵢ−cosᵢ₋₁；baseline=median(最近 10 个 Δ)；MAD=median(|Δ−baseline|)",r:"优先: Δ < baseline−5×MAD 且 Δ<−0.005，并检查后续 3 层是否持续；回退: 首个 cos<0.99",i:"优先寻找相邻层之间异常且持续的局部突降，避免把逐层缓慢累积误差的首次阈值越界误当成根因。未找到显著突降时，才使用首个 cos_sim<0.99 的层作为辅助候选。"},
@@ -1090,7 +1090,7 @@ function renderLines(){
       sk.appendChild(bar);});
     for(let g=0;g<=2;g++){const v=maxk*g/2;const y=Y2(v);const t=E("text",{x:m2-6,y:y+3,"text-anchor":"end",class:"axis"});t.textContent=v.toFixed(3);sk.appendChild(t);sk.appendChild(E("line",{x1:m2,x2:kw-m2,y1:y,y2:y,class:"gridline"}));}
     sk.appendChild(E("line",{x1:m2,y1:kh-m2,x2:kw-m2,y2:kh-m2,stroke:C.border}));
-    const tk=E("text",{x:kw/2,y:kh-2,"text-anchor":"middle",class:"axis"});tk.textContent="KL(quant‖ref) per position";sk.appendChild(tk);
+    const tk=E("text",{x:kw/2,y:kh-2,"text-anchor":"middle",class:"axis"});tk.textContent="KL(ref‖quant) per position";sk.appendChild(tk);
     appendChart(root,sk);
   }
 }
