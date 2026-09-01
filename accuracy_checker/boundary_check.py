@@ -919,6 +919,111 @@ def _captured_top_k(captured, framework_gen_config: Optional[Dict]) -> int:
     return max(1, value)
 
 
+def _detect_sustained_logits_branch(logits_data, tokenizer):
+    """Find a sustained regime change, not the first isolated Top-1 flip.
+
+    This is deliberately a report hint rather than a Boundary verdict.  It
+    requires both a lasting Top-1 flip-rate increase and a lasting Top-N
+    overlap drop across three adjacent windows.
+    """
+    import statistics
+
+    positions = list(logits_data.all_token_positions or logits_data.token_positions)
+    counts_by_rank = logits_data.topn_overlap_counts or {}
+    ranks = sorted((int(rank) for rank in counts_by_rank), reverse=True)
+    if len(positions) < 32 or not ranks or "1" not in counts_by_rank:
+        return None
+    rank = ranks[0]
+    top_counts = list(counts_by_rank.get(str(rank)) or [])
+    top1_counts = list(counts_by_rank.get("1") or [])
+    n = min(len(positions), len(top_counts), len(top1_counts))
+    if n < 32:
+        return None
+
+    window = max(16, min(512, math.ceil(n / 256)))
+    windows = []
+    for start in range(0, n, window):
+        end = min(n, start + window)
+        size = end - start
+        if size <= 0:
+            continue
+        flip_rate = sum(1 for value in top1_counts[start:end] if int(value) < 1) / size
+        mean_overlap = sum(float(value) / rank for value in top_counts[start:end]) / size
+        windows.append((start, end, flip_rate, mean_overlap))
+    if len(windows) < 6:
+        return None
+
+    baseline_window_count = max(3, min(32, len(windows) // 4))
+    baseline = windows[:baseline_window_count]
+    baseline_flip = statistics.median(item[2] for item in baseline)
+    baseline_overlap = statistics.median(item[3] for item in baseline)
+    flip_threshold = max(0.15, baseline_flip + 0.15)
+    overlap_threshold = min(0.85, baseline_overlap - 0.15)
+
+    run = 0
+    candidate_window = None
+    for index, item in enumerate(windows):
+        bad = item[2] >= flip_threshold and item[3] <= overlap_threshold
+        run = run + 1 if bad else 0
+        if run >= 3:
+            candidate_window = index - 2
+            break
+    if candidate_window is None:
+        return None
+
+    start, _, post_flip, post_overlap = windows[candidate_window]
+    position = int(positions[start])
+    input_rows = logits_data.input_ids or []
+    input_ids = list(input_rows[0]) if input_rows else []
+    target_index = position + 1
+    target_id = input_ids[target_index] if 0 <= target_index < len(input_ids) else None
+    prefix_end_id = input_ids[position] if 0 <= position < len(input_ids) else None
+    target_text = None
+    prefix_end_text = None
+    context_text = None
+    if prefix_end_id is not None:
+        try:
+            prefix_end_text = tokenizer.decode([int(prefix_end_id)])
+        except Exception:
+            prefix_end_text = None
+    if target_id is not None:
+        try:
+            target_text = tokenizer.decode([int(target_id)])
+        except Exception:
+            target_text = None
+        try:
+            left = max(0, target_index - 16)
+            right = min(len(input_ids), target_index + 17)
+            context_text = tokenizer.decode([int(token_id) for token_id in input_ids[left:right]])
+        except Exception:
+            context_text = None
+    confidence = min(1.0, max(
+        0.0,
+        ((post_flip - baseline_flip) + (baseline_overlap - post_overlap)) / 2,
+    ))
+    return {
+        "position": position,
+        "target_token_position": target_index,
+        "target_token_id": int(target_id) if target_id is not None else None,
+        "target_token_text": target_text,
+        "prefix_end_token_position": position,
+        "prefix_end_token_id": int(prefix_end_id) if prefix_end_id is not None else None,
+        "prefix_end_token_text": prefix_end_text,
+        "context_text": context_text,
+        "top_k": rank,
+        "window_size": window,
+        "sustain_windows": 3,
+        "baseline_flip_rate": baseline_flip,
+        "post_flip_rate": post_flip,
+        "baseline_overlap": baseline_overlap,
+        "post_overlap": post_overlap,
+        "confidence": confidence,
+        "generation_prefix_token_count": min(len(input_ids), position + 1),
+        "recapture_prefix_token_count": min(len(input_ids), position + 2),
+        "heuristic": True,
+    }
+
+
 def _compare_captured_replay(
     captured, replay, model_path: str, *, framework_gen_config: Optional[Dict],
     cos_threshold: float, kl_threshold: float, margin_threshold: float,
@@ -996,6 +1101,7 @@ def _compare_captured_replay(
     max_abs_diff = None
     if captured.has_full_logits:
         max_abs_diff = float((captured.logits - replay.logits[:len(captured.token_positions)]).abs().max().item())
+    branch_candidate = _detect_sustained_logits_branch(logits_data, tokenizer)
     summary = {
         "input_token_count": int(captured.input_ids.shape[1]),
         "compared_positions": list(comparison.token_positions),
@@ -1010,6 +1116,7 @@ def _compare_captured_replay(
             str(rank): len(positions)
             for rank, positions in logits_data.topn_mismatch_positions.items()
         },
+        "branch_candidate": branch_candidate,
         "low_margin_flip_positions": low_margin_flips,
         "low_margin_flip_count": len(low_margin_flips),
         "first_mismatch_position": mismatches[0] if mismatches else None,

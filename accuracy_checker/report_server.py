@@ -9,18 +9,19 @@ that can delete exactly one archived run directory under ``reports/``.
 from __future__ import annotations
 
 import argparse
-from functools import partial
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
 import os
 import shutil
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 from urllib.parse import urlparse
 
 
 logger = logging.getLogger(__name__)
 DELETE_ENDPOINT = "/__accuracy_bench__/delete-report"
+HEALTH_ENDPOINT = "/__accuracy_bench__/health"
 
 
 def _repo_root() -> str:
@@ -75,6 +76,16 @@ class ReportRequestHandler(SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+        if urlparse(self.path).path == HEALTH_ENDPOINT:
+            self._json_response(200, {
+                "ok": True,
+                "service": "accuracy_bench_report_server",
+                "delete_endpoint": DELETE_ENDPOINT,
+            })
+            return
+        super().do_GET()
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
         if urlparse(self.path).path != DELETE_ENDPOINT:
@@ -151,4 +162,7 @@ def main() -> None:
     )
 
 
-__all__ = ["DELETE_ENDPOINT", "ReportRequestHandler", "delete_report_directory", "serve_reports"]
+__all__ = [
+    "DELETE_ENDPOINT", "HEALTH_ENDPOINT", "ReportRequestHandler",
+    "delete_report_directory", "serve_reports",
+]

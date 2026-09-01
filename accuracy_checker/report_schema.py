@@ -154,6 +154,9 @@ class LogitsData:
     # 全量 Top-N 候选集合不一致 position；HTML 用它做筛选/范围计数，
     # 不需要把每个 position 的大块概率明细都塞进页面。
     topn_mismatch_positions: Dict[str, List[int]] = field(default_factory=dict)
+    # 全量轻量序列用于 Canvas/虚拟列表；详细概率仍可单独采样，避免大 DOM。
+    all_token_positions: List[int] = field(default_factory=list)
+    topn_overlap_counts: Dict[str, List[int]] = field(default_factory=dict)
     ref_topk: List[List[TokenProb]] = field(default_factory=list)   # 每 position top-k (并排柱状图原料)
     quant_topk: List[List[TokenProb]] = field(default_factory=list)
     ref_logits: List[float] = field(default_factory=list)            # 每 position ref argmax logit (折线)
@@ -347,6 +350,11 @@ def _build_logits(d: Optional[Dict[str, Any]]) -> Optional[LogitsData]:
         topn_mismatch_positions={
             str(key): [int(position) for position in (positions or [])]
             for key, positions in (d.get("topn_mismatch_positions") or {}).items()
+        },
+        all_token_positions=[int(position) for position in (d.get("all_token_positions") or [])],
+        topn_overlap_counts={
+            str(key): [int(count) for count in (counts or [])]
+            for key, counts in (d.get("topn_overlap_counts") or {}).items()
         },
         ref_topk=[[_build_token_prob(x) for x in pos] for pos in d.get("ref_topk") or []],
         quant_topk=[[_build_token_prob(x) for x in pos] for pos in d.get("quant_topk") or []],

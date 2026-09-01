@@ -8,6 +8,7 @@ torch = pytest.importorskip("torch")
 
 from accuracy_checker.captured_logits import load_captured_logits
 from accuracy_checker.logits_compare import LogitsCollection, compare_captured_topk
+from accuracy_checker.report_schema import LogitsData
 
 
 def test_load_full_vocab_capture_selects_positions(tmp_path):
@@ -179,8 +180,45 @@ def test_prompt_logprobs_topn_excludes_but_displays_fixed_request_token(tmp_path
     )
 
     assert comparison.topn_mismatch_positions == {"1": [0]}
+    assert comparison.topn_overlap_counts == {"1": [0]}
     assert [row.token_id for row in comparison.ref_topk[0]] == [2, 9]
     assert [row.token_id for row in comparison.quant_topk[0]] == [2, 3, 9]
+
+
+def test_sustained_branch_hint_ignores_isolated_flips_and_builds_exact_prefix():
+    from accuracy_checker.boundary_check import _detect_sustained_logits_branch
+
+    n = 1024
+    top1 = [1] * n
+    top10 = [10] * n
+    # An isolated early flip is not a branch.  The tail is a sustained regime
+    # change in both actual Top-1 choice and Top-10 candidate overlap.
+    top1[101] = 0
+    top10[101] = 9
+    for index in range(640, n):
+        top1[index] = 0
+        top10[index] = 1
+    logits = LogitsData(
+        token_positions=list(range(n)),
+        all_token_positions=list(range(n)),
+        topn_overlap_counts={"1": top1, "10": top10},
+        input_ids=[list(range(n + 1))],
+    )
+    tokenizer = type("Tokenizer", (), {
+        "decode": lambda self, ids: "|".join(str(value) for value in ids),
+    })()
+
+    branch = _detect_sustained_logits_branch(logits, tokenizer)
+
+    assert branch is not None
+    assert 620 <= branch["position"] <= 660
+    assert branch["position"] != 101
+    assert branch["prefix_end_token_id"] == branch["position"]
+    assert branch["target_token_id"] == branch["position"] + 1
+    assert branch["generation_prefix_token_count"] == branch["position"] + 1
+    assert branch["recapture_prefix_token_count"] == branch["position"] + 2
+    assert branch["post_flip_rate"] > branch["baseline_flip_rate"]
+    assert branch["post_overlap"] < branch["baseline_overlap"]
 
 
 def test_native_vllm_prompt_logprobs_auto_find_logprob_request(tmp_path):

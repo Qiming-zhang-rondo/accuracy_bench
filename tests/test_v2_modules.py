@@ -151,6 +151,11 @@ class TestHtmlReportV2:
             },
             "logits": {
                 "token_positions": list(range(n)),
+                "all_token_positions": list(range(n)),
+                "topn_overlap_counts": {
+                    "1": [1 if i != 777 else 0 for i in range(n)],
+                    "10": [10 if i != 777 else 4 for i in range(n)],
+                },
                 "input_ids": [list(range(n))],
                 "ref_topk": [[{"token_id": i}] for i in range(n)],
                 "quant_topk": [[{"token_id": i}] for i in range(n)],
@@ -169,6 +174,8 @@ class TestHtmlReportV2:
         assert len(logits["token_positions"]) == 32
         assert 777 in logits["token_positions"]
         assert len(logits["ref_topk"]) == 32
+        assert logits["all_token_positions"] == list(range(n))
+        assert len(logits["topn_overlap_counts"]["10"]) == n
         assert len(logits["input_ids"][0]) == n
         assert logits["full_top1_total"] == n
         assert logits["full_top1_match_count"] == n - 1
