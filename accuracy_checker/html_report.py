@@ -587,7 +587,8 @@ table.grid-tbl tr:hover td { background:var(--accent-soft); }
   border-radius:7px; font:750 10px var(--mono); cursor:pointer; }
 .replay-actions button:hover { color:#fff; background:#4F46E5; border-color:#4F46E5; }
 .logits-overview-card { padding:14px 16px; }
-.logits-overview-card canvas { display:block; width:100%; height:230px; margin-top:8px; border:1px solid var(--border);
+.logits-overview-scroll { overflow-x:auto; overflow-y:hidden; margin-top:8px; border:1px solid var(--border); border-radius:8px; background:#fff; }
+.logits-overview-card canvas { display:block; width:auto; min-width:100%; height:104px; border:0;
   border-radius:8px; background:#fff; cursor:crosshair; }
 .logits-overview-legend { display:flex; gap:12px; flex-wrap:wrap; color:var(--muted); font-size:10px; margin-top:7px; }
 .virtual-position-card { padding:12px 14px; }
@@ -1082,8 +1083,10 @@ function logitsPageIndices(){
 function chooseFirstVisible(){
   ensureLogitsMaps();const positions=filteredLogicalPositions();if(!positions.length){logitsSelectedPosition=null;curPos=-1;return;}
   if(logitsSelectedPosition===null||!positions.includes(Number(logitsSelectedPosition))){
-    const branch=(((R.overview||{}).captured_replay||{}).branch_candidate||{}).position;
-    logitsSelectedPosition=branch!==undefined&&positions.includes(Number(branch))?Number(branch):positions[0];
+    // Start at the beginning so the default view is a continuous 0,1,2…
+    // sequence.  The sustained branch candidate remains separately marked
+    // and has an explicit “定位” action.
+    logitsSelectedPosition=positions[0];
   }
   curPos=logitsDetailIndex.has(Number(logitsSelectedPosition))?logitsDetailIndex.get(Number(logitsSelectedPosition)):-1;
 }
@@ -1120,28 +1123,21 @@ function renderLogitsFilter(){
 function renderLogitsOverview(){
   const root=el("logits_overview"),L=R.logits;if(!root||!L||L.position_mode!=="captured_replay")return;
   const ranks=logitsRanks(),rank=logitsRankFilter>0?logitsRankFilter:(ranks[0]||1),positions=allLogitsPositions();
-  root.innerHTML='<div class="card logits-overview-card"><h3>全量 Position 趋势 · Top-'+rank+'</h3><canvas id="logits-overview-canvas" aria-label="全量 logits position 趋势"></canvas>'
+  root.innerHTML='<div class="card logits-overview-card"><h3>全量 Position 连续趋势 · Top-'+rank+'</h3><div class="logits-overview-scroll"><canvas id="logits-overview-canvas" aria-label="全量 logits position 连续趋势"></canvas></div>'
     +'<div class="logits-overview-legend"><span><span class="legend-chip" style="background:#176B55"></span>绿色=完全重合</span><span><span class="legend-chip" style="background:#B87710"></span>黄色=Top-1 一致但候选变化</span>'
-    +'<span><span class="legend-chip" style="background:#A53939"></span>红色=Top-1 翻转</span><span><span class="legend-chip" style="background:#4F46E5"></span>靛蓝线=Top-'+rank+' 平均 overlap</span>点击图中位置可定位虚拟按钮。</div></div>';
-  const canvas=el("logits-overview-canvas"),rect=canvas.getBoundingClientRect(),cssW=Math.max(320,Math.floor(rect.width||900)),cssH=230,dpr=Math.min(2,window.devicePixelRatio||1);
-  canvas.width=cssW*dpr;canvas.height=cssH*dpr;const ctx=canvas.getContext("2d");ctx.scale(dpr,dpr);ctx.clearRect(0,0,cssW,cssH);
-  const left=42,right=12,top=18,graphBottom=158,stripTop=174,stripBottom=208,w=cssW-left-right;
-  const begin=lowerBound(positions,logitsRangeStart),end=lowerBound(positions,logitsRangeEnd+1),count=Math.max(0,end-begin),bins=Math.max(1,Math.min(Math.floor(w),count||1));
-  const stats=[];for(let x=0;x<bins;x++){
-    const a=begin+Math.floor(count*x/bins),b=begin+Math.max(1,Math.floor(count*(x+1)/bins));let red=0,yellow=0,overlap=0,n=0;
-    for(let j=a;j<Math.min(end,b);j++){const st=positionState(positions[j],rank);n++;overlap+=st.overlap/st.k;if(!st.top1)red++;else if(st.overlap<st.k)yellow++;}
-    stats.push({red:n?red/n:0,yellow:n?yellow/n:0,green:n?(n-red-yellow)/n:0,overlap:n?overlap/n:1});
-  }
-  ctx.font="10px sans-serif";ctx.fillStyle=C.muted;ctx.fillText("1.0",8,top+4);ctx.fillText("0.5",8,(top+graphBottom)/2+3);ctx.fillText("0.0",8,graphBottom+3);
-  ctx.strokeStyle=C.border;ctx.lineWidth=1;[top,(top+graphBottom)/2,graphBottom].forEach(y=>{ctx.beginPath();ctx.moveTo(left,y);ctx.lineTo(cssW-right,y);ctx.stroke();});
-  const bw=w/bins;stats.forEach((s,x)=>{let y=stripBottom;const gx=bw*x+left;const gh=(stripBottom-stripTop)*s.green,yh=(stripBottom-stripTop)*s.yellow,rh=(stripBottom-stripTop)*s.red;
-    ctx.fillStyle="#B8DCCB";ctx.fillRect(gx,y-gh,bw+.5,gh);y-=gh;ctx.fillStyle="#E7C783";ctx.fillRect(gx,y-yh,bw+.5,yh);y-=yh;ctx.fillStyle="#A53939";ctx.fillRect(gx,y-rh,bw+.5,rh);});
-  ctx.strokeStyle=C.topk;ctx.lineWidth=1.5;ctx.beginPath();stats.forEach((s,x)=>{const xx=left+(x+.5)*bw,yy=graphBottom-(graphBottom-top)*s.overlap;if(x===0)ctx.moveTo(xx,yy);else ctx.lineTo(xx,yy);});ctx.stroke();
+    +'<span><span class="legend-chip" style="background:#A53939"></span>红色=Top-1 翻转</span><span><span class="legend-chip" style="background:#4F46E5"></span>靛蓝线=每个 position 的 Top-'+rank+' overlap</span>横向滚动查看连续 position；点击任意点可定位。</div></div>';
+  const canvas=el("logits-overview-canvas"),begin=lowerBound(positions,logitsRangeStart),end=lowerBound(positions,logitsRangeEnd+1),count=Math.max(0,end-begin),scale=count>0?Math.max(1,Math.ceil(900/count)):1,cssW=Math.max(320,count*scale),cssH=104,dpr=cssW>12000?1:Math.min(2,window.devicePixelRatio||1);
+  canvas.style.width=cssW+"px";canvas.width=cssW*dpr;canvas.height=cssH*dpr;const ctx=canvas.getContext("2d");ctx.scale(dpr,dpr);ctx.clearRect(0,0,cssW,cssH);
+  const top=8,graphBottom=45,stripTop=57,stripBottom=80,step=Math.max(1,scale);ctx.font="10px sans-serif";ctx.fillStyle=C.muted;ctx.fillText("1.0",4,top+4);ctx.fillText("0.5",4,(top+graphBottom)/2+3);ctx.fillText("0.0",4,graphBottom+3);
+  ctx.strokeStyle=C.border;ctx.lineWidth=1;[top,(top+graphBottom)/2,graphBottom].forEach(y=>{ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(cssW,y);ctx.stroke();});
+  let previousY=null;for(let j=begin;j<end;j++){const st=positionState(positions[j],rank),x=(j-begin)*step,yy=graphBottom-(graphBottom-top)*(st.overlap/st.k);
+    ctx.fillStyle=st.top1?(st.overlap>=st.k?"#B8DCCB":"#E7C783"):"#A53939";ctx.fillRect(x,stripTop,step,stripBottom-stripTop);
+    ctx.strokeStyle=C.topk;ctx.lineWidth=1;if(previousY===null)ctx.beginPath(),ctx.moveTo(x,yy);else ctx.lineTo(x,yy);previousY=yy;}
+  if(count){ctx.stroke();ctx.fillStyle=C.muted;ctx.fillText(String(positions[begin]),4,98);const endText=String(positions[end-1]),tw=ctx.measureText(endText).width;ctx.fillText(endText,cssW-tw-4,98);}
   const branch=(((R.overview||{}).captured_replay||{}).branch_candidate||{}).position;
-  const mark=(position,color,dash)=>{if(position===null||position===undefined||logitsRangeEnd===logitsRangeStart)return;const x=left+w*(Number(position)-logitsRangeStart)/(logitsRangeEnd-logitsRangeStart);ctx.save();ctx.strokeStyle=color;ctx.lineWidth=2;if(dash)ctx.setLineDash([4,3]);ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,stripBottom);ctx.stroke();ctx.restore();};
+  const mark=(position,color,dash)=>{if(position===null||position===undefined||!count)return;const at=lowerBound(positions,Number(position));if(at<begin||at>=end)return;const x=(at-begin)*step;ctx.save();ctx.strokeStyle=color;ctx.lineWidth=2;if(dash)ctx.setLineDash([4,3]);ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,stripBottom);ctx.stroke();ctx.restore();};
   mark(branch,C.warn,true);mark(logitsSelectedPosition,C.ink,false);
-  ctx.fillStyle=C.muted;ctx.fillText(String(logitsRangeStart),left,225);const endText=String(logitsRangeEnd),tw=ctx.measureText(endText).width;ctx.fillText(endText,cssW-right-tw,225);
-  canvas.addEventListener("click",event=>{if(!positions.length)return;const box=canvas.getBoundingClientRect(),x=clamp(event.clientX-box.left-left,0,w),target=logitsRangeStart+(logitsRangeEnd-logitsRangeStart)*x/w,at=clamp(lowerBound(positions,target),0,positions.length-1);selectLogicalPosition(positions[at]);scrollVirtualToPosition(positions[at]);});
+  canvas.addEventListener("click",event=>{if(!count)return;const box=canvas.getBoundingClientRect(),x=clamp(event.clientX-box.left,0,cssW-1),at=clamp(begin+Math.floor(x/step),begin,end-1);selectLogicalPosition(positions[at]);scrollVirtualToPosition(positions[at]);});
 }
 function renderVirtualPositions(scrollToSelected){
   const root=el("logits_positions"),L=R.logits;if(!root||!L||L.position_mode!=="captured_replay")return;
