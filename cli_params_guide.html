@@ -882,7 +882,7 @@
             <div class="wide hidden" id="capturedLogitsField">
               <label for="capturedLogitsJson">vLLM captured logits JSON <span class="optional">偶现模式必填</span></label>
               <input id="capturedLogitsJson" type="text" autocomplete="off" placeholder="/path/to/vllm_logits.json">
-              <span class="hint">JSON 至少包含 input_ids、positions，以及 full vocabulary logits 或 Top-K；不会启动或重复运行 vLLM。现场采集可考虑 batch=1、temperature=0 与确定性环境变量。</span>
+              <span class="hint">可直接读取 vLLM 原生 text_completion 的 <code>choices[0].prompt_logprobs</code>；请求需同时设置 <code>return_token_ids: true</code>，使响应包含 <code>prompt_token_ids</code>。也兼容含 input_ids、positions、full logits 或 Top-K 的通用格式。不会启动或重复运行 vLLM。</span>
             </div>
             <div class="wide hidden" id="boundaryPromptFileField">
               <label for="promptFile">Boundary 请求文件 <span class="optional">CLI 兼容入口</span></label>
@@ -1060,7 +1060,7 @@
             <tr><td><code>--framework_bad_output</code></td><td>空</td><td>部署框架实际生成的完整坏输出。</td></tr>
             <tr><td><code>--framework_bad_reproduced</code></td><td>空</td><td>true / false；记录外部确认结果，不会调用部署框架。</td></tr>
             <tr><td><code>--boundary_issue_mode</code></td><td>reproducible</td><td>必现按原流程生成；intermittent 导入一次 vLLM captured logits JSON，Transformers 直接 replay 相同 input_ids/positions。</td></tr>
-            <tr><td><code>--captured_logits_json</code></td><td>空</td><td>Boundary 偶现模式的现场 JSON；需含 input_ids、positions，以及 full vocabulary logits 或 Top-K。</td></tr>
+            <tr><td><code>--captured_logits_json</code></td><td>空</td><td>Boundary 偶现模式的现场 JSON；可直接使用 vLLM text_completion prompt_logprobs 响应，但必须由 <code>return_token_ids: true</code> 同时返回 prompt_token_ids；也兼容 input_ids/positions/full logits/Top-K 通用格式。</td></tr>
             <tr><td><code>--boundary_logits_cos_threshold</code><br><code>--boundary_logits_kl_threshold</code><br><code>--boundary_logits_margin_threshold</code></td><td>cos .99 / KL .05 / margin .05</td><td>偶现 logits boundary 的明显偏差与低 margin flip 阈值；不影响必现流程。</td></tr>
             <tr><td><code>--no_ref</code></td><td>false</td><td>Quant-only boundary；适合量化模型独占全部 NPU。</td></tr>
             <tr><td><code>--num_runs</code></td><td>1</td><td>同一 prompt 总生成次数；每次完整结果都会归档。</td></tr>
@@ -1575,7 +1575,7 @@
         if (!dspark && ["l1", "l2", "full"].indexOf(mode) !== -1 && el.rotationMatrix.value.trim()) addStatus("已加入 rotation_matrix；请确认 ref/quant 旋转契约一致", "ok");
         else if (["l1", "l2", "full"].indexOf(mode) !== -1) addStatus("未使用旋转矩阵：适用于非旋转量化或 R 已融合 checkpoint", "");
         if (["l1", "l2", "full"].indexOf(mode) !== -1) {
-          addStatus("运行成功后自动归档 JSON + HTML；latest.html 左侧可切换当前与历史报告", "ok");
+          addStatus("运行成功后自动归档 JSON + HTML；latest.html 左侧可切换当前与历史报告。文件位于 reports/<模型_模式_时间>/；运行 python3 serve_reports.py 后可右键删除并同步释放本地目录", "ok");
         }
 
         var valid = validation.errors.length === 0;

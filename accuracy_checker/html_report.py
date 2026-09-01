@@ -1324,6 +1324,21 @@ _SIDEBAR_CSS = """
 .sidebar-item .si-badge.mode-boundary { background:rgba(255,203,116,.16); color:#FFD998; }
 .sidebar-item .si-badge.mode-full { background:rgba(150,230,195,.17); color:var(--mint); }
 .sidebar-item .si-badge.mode-report { background:rgba(255,255,255,.08); color:#C6D2D7; }
+.sidebar-delete-hint { float:right; color:#6F8A96; font-size:9px; font-weight:600; letter-spacing:0; text-transform:none; }
+.history-context-menu { display:none; position:fixed; z-index:1000; width:240px; padding:8px;
+                        color:#D7E4E9; background:#102B38; border:1px solid rgba(255,255,255,.14);
+                        border-radius:10px; box-shadow:0 14px 40px rgba(0,0,0,.32); }
+.history-context-menu.open { display:block; }
+.history-context-menu .hm-title { padding:4px 6px 2px; color:#F4F8F9; font-size:12px; font-weight:750;
+                                  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.history-context-menu .hm-path { padding:0 6px 7px; color:#91A8B2; font-family:var(--mono); font-size:9px;
+                                 overflow-wrap:anywhere; }
+.history-context-menu button { width:100%; padding:8px 9px; color:#FFB3B3; background:rgba(255,139,139,.08);
+                               border:1px solid rgba(255,139,139,.22); border-radius:7px; cursor:pointer;
+                               font:700 11px var(--sans); text-align:left; }
+.history-context-menu button:hover { background:rgba(255,139,139,.15); }
+.history-context-menu button:disabled { opacity:.55; cursor:wait; }
+.history-context-menu .hm-tip { padding:7px 6px 2px; color:#78919B; font-size:9px; line-height:1.4; }
 .main-area { flex:1; min-width:0; margin-left:280px; }
 .main-area .wrap { max-width:1120px; margin:0 auto; padding:42px 34px 140px; }
 @media (max-width:720px){
@@ -1339,6 +1354,37 @@ _SIDEBAR_CSS = """
   .nav { flex-wrap:wrap; gap:8px; }
 }
 """
+
+
+_HISTORY_MENU_HTML = (
+    '<div id="history-menu" class="history-context-menu" role="menu">'
+    '<div id="history-menu-title" class="hm-title">历史报告</div>'
+    '<div id="history-menu-path" class="hm-path"></div>'
+    '<button id="history-delete-button" type="button" onclick="__deleteHistoryReport()">删除并释放本地文件</button>'
+    '<div class="hm-tip">删除整个运行目录，并自动重建 latest.html 历史索引。</div>'
+    '</div>'
+)
+
+
+_HISTORY_MENU_JS = (
+    'window.__closeHistoryMenu=function(){var m=document.getElementById("history-menu");if(m)m.classList.remove("open");};'
+    'window.__openHistoryMenu=function(ev,idx){ev.preventDefault();ev.stopPropagation();'
+    'window.__HISTORY_MENU_IDX=idx;var r=window.__SIDEBAR__[idx]||{};var m=document.getElementById("history-menu");'
+    'document.getElementById("history-menu-title").textContent=r.model_name||"历史报告";'
+    'document.getElementById("history-menu-path").textContent="reports/"+(r.report_relpath||r.dir||"?")+"/";'
+    'm.classList.add("open");var x=Math.min(ev.clientX,window.innerWidth-m.offsetWidth-8);'
+    'var y=Math.min(ev.clientY,window.innerHeight-m.offsetHeight-8);m.style.left=Math.max(8,x)+"px";m.style.top=Math.max(8,y)+"px";return false;};'
+    'window.__deleteHistoryReport=async function(){var idx=window.__HISTORY_MENU_IDX;var r=window.__SIDEBAR__[idx]||{};'
+    'var rel=r.report_relpath;if(!rel||rel==="."){alert("该条目不是可删除的独立报告目录");return;}'
+    'if(!confirm("确认删除本地报告目录 reports/"+rel+"/？\\n此操作会释放该目录占用的磁盘空间。"))return;'
+    'if(location.protocol==="file:"){alert("静态 file:// 页面没有删除本地文件的权限。\\n请运行 python3 serve_reports.py，再从 http://127.0.0.1:8765/latest.html 打开。");return;}'
+    'var b=document.getElementById("history-delete-button");b.disabled=true;b.textContent="正在删除…";'
+    'try{var resp=await fetch("/__accuracy_bench__/delete-report",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:rel})});'
+    'var body=await resp.json().catch(function(){return {};});if(!resp.ok)throw new Error(body.error||("HTTP "+resp.status));'
+    'location.assign("/latest.html?refresh="+Date.now());}catch(err){alert("删除失败："+err.message+"\\n请确认页面由 serve_reports.py 提供服务。");'
+    'b.disabled=false;b.textContent="删除并释放本地文件";}};'
+    'document.addEventListener("click",window.__closeHistoryMenu);window.addEventListener("blur",window.__closeHistoryMenu);'
+)
 
 
 def _infer_report_mode(rd, dir_hint: str = "") -> str:
@@ -1424,6 +1470,7 @@ def _scan_sibling_reports(output_path: str, current_data: ReportData):
     current_meta = _extract_report_meta(current_data, current_raw, current_dir_name)
     current_meta.update({
         "dir": current_dir_name,
+        "report_relpath": os.path.relpath(out_dir, reports_root).replace(os.sep, "/"),
         "ts": time.strftime("%m-%d %H:%M"),
         "mtime": time.time(),
         "_is_current": True,
@@ -1442,6 +1489,9 @@ def _scan_sibling_reports(output_path: str, current_data: ReportData):
             meta = _extract_report_meta(rd, raw, jf_dir)
             meta.update({
                 "dir": jf_dir,
+                "report_relpath": os.path.relpath(
+                    os.path.dirname(jf), reports_root
+                ).replace(os.sep, "/"),
                 "ts": time.strftime("%m-%d %H:%M", time.localtime(mtime)),
                 "mtime": mtime,
                 "_is_current": False,
@@ -1588,13 +1638,14 @@ def generate_product_html_report(
             'else if(r.scope==="weight_only")m+="<span>WEIGHT</span>";'
             'if(r.token_rate!==null&&r.token_rate!==undefined)m+="<span>"+(r.token_rate*100).toFixed(0)+"% match</span>";'
             'if(r.logits_positions>0)m+="<span>"+r.logits_positions+" logits</span>";'
-            'h+="<div class=\\"sidebar-item\\" data-idx=\\""+i+"\\" onclick=\\"__switchReport("+i+")\\">"'
+            'h+="<div class=\\"sidebar-item\\" data-idx=\\""+i+"\\" onclick=\\"__switchReport("+i+")\\" oncontextmenu=\\"return __openHistoryMenu(event,"+i+")\\">"'
             '+"<div class=\\"si-ts\\">"+r.ts+"</div>"'
             '+"<div class=\\"si-model\\">"+esc(r.model_name)+"</div>"'
             '+"<div class=\\"si-meta\\"><span class=\\"si-badge mode "+mc+"\\">"+mode+"</span><span class=\\"si-badge "+bc+"\\">"+st+"</span>"+m+"</div>"'
             '+"</div>";});'
             'sb.innerHTML=h;}'
             'renderSidebar();'
+            + _HISTORY_MENU_JS +
             'if(document.readyState!=="loading")window.__switchReport(' + str(current_idx) + ');'
             'else document.addEventListener("DOMContentLoaded",function(){window.__switchReport(' + str(current_idx) + ');});\n})();'
         )
@@ -1603,10 +1654,10 @@ def generate_product_html_report(
             '<div class="layout">'
             '<div class="sidebar"><div class="sidebar-brand"><span class="brand-mark">AB</span>'
             '<div>acc_bench<small>report archive</small></div></div>'
-            '<h2>历史报告</h2><div id="sidebar-list"></div></div>'
+            '<h2>历史报告<span class="sidebar-delete-hint">右键删除</span></h2><div id="sidebar-list"></div></div>'
             '<div class="main-area"><div class="wrap">'
             + body_sections
-            + '</div></div></div>'
+            + '</div></div></div>' + _HISTORY_MENU_HTML
         )
 
         html_doc = (
@@ -1685,6 +1736,9 @@ def generate_index_html(reports_dir: str, output_path: Optional[str] = None) -> 
             meta = _extract_report_meta(rd, raw, run_dir)
             meta.update({
                 "dir": run_dir,
+                "report_relpath": os.path.relpath(
+                    os.path.dirname(jf), reports_dir
+                ).replace(os.sep, "/"),
                 "ts": ts_str,
                 "mtime": mtime,
             })
@@ -1746,13 +1800,14 @@ def generate_index_html(reports_dir: str, output_path: Optional[str] = None) -> 
         'else if(r.scope==="weight_only")metrics+="<span>WEIGHT</span>";'
         'if(r.token_rate!==null&&r.token_rate!==undefined)metrics+="<span>"+esc((r.token_rate*100).toFixed(0))+"% match</span>";'
         'if(r.logits_positions>0)metrics+="<span>"+esc(r.logits_positions)+" logits</span>";'
-        'html+="<div class=\\"sidebar-item\\" data-idx=\\""+i+"\\" onclick=\\"__switchReport("+i+")\\">"'
+        'html+="<div class=\\"sidebar-item\\" data-idx=\\""+i+"\\" onclick=\\"__switchReport("+i+")\\" oncontextmenu=\\"return __openHistoryMenu(event,"+i+")\\">"'
         '+"<div class=\\"si-ts\\">"+r.ts+"</div>"'
         '+"<div class=\\"si-model\\">"+esc(r.model_name)+"</div>"'
         '+"<div class=\\"si-meta\\"><span class=\\"si-badge mode "+mc+"\\">"+mode+"</span><span class=\\"si-badge "+bc+"\\">"+st+"</span>"+metrics+"</div>"'
         '+"</div>";});'
         'sb.innerHTML=html;}'
         'renderSidebar();'
+        + _HISTORY_MENU_JS +
         'if(document.readyState!=="loading")window.__switchReport(0);'
         'else document.addEventListener("DOMContentLoaded",function(){window.__switchReport(0);});\n})();'
     )
@@ -1761,7 +1816,7 @@ def generate_index_html(reports_dir: str, output_path: Optional[str] = None) -> 
         '<div class="layout">'
         '<div class="sidebar"><div class="sidebar-brand"><span class="brand-mark">AB</span>'
         '<div>acc_bench<small>report archive</small></div></div>'
-        '<h2>历史报告</h2><div id="sidebar-list"></div></div>'
+        '<h2>历史报告<span class="sidebar-delete-hint">右键删除</span></h2><div id="sidebar-list"></div></div>'
         '<div class="main-area"><div class="wrap">'
         '<div class="topbar"><div class="report-kicker"><span class="brand-mark">AB</span>'
         '<span>ACC BENCH / ALIGNMENT REPORT</span></div><h1>精度对齐报告</h1>'
@@ -1800,7 +1855,7 @@ def generate_index_html(reports_dir: str, output_path: Optional[str] = None) -> 
         '<div id="helpModal" class="modal-ov" role="dialog" aria-modal="true" aria-hidden="true" aria-label="指标说明" onclick="__closeModal()"><div class="modal" '
         'onclick="event.stopPropagation()"><button type="button" class="close" aria-label="关闭指标说明" onclick="__closeModal()">✕</button>'
         '<div id="helpBody"></div></div></div>'
-        '</div></div></div>'
+        '</div></div></div>' + _HISTORY_MENU_HTML
     )
 
     html_doc = (

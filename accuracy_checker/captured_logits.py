@@ -2,8 +2,11 @@
 
 The capture format is intentionally permissive: existing tools use slightly
 different names (``positions``/``token_positions`` and ``logits``/
-``captured_logits``).  The normalized object always has the recorded input
-ids and positions; full vocabulary logits are optional.
+``captured_logits``).  Native vLLM ``text_completion`` responses containing
+``choices[0].prompt_logprobs`` are accepted directly when the response also
+contains ``prompt_token_ids`` (produced by ``return_token_ids=true``).  The
+normalized object always has the recorded input ids and positions; full
+vocabulary logits are optional.
 """
 
 from __future__ import annotations
@@ -15,11 +18,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 
-_ID_KEYS = ("input_ids", "tokens")
+_ID_KEYS = ("input_ids", "prompt_token_ids", "tokens")
 _MASK_KEYS = ("attention_mask", "attn_mask", "key_padding_mask")
 _POSITION_KEYS = ("token_positions", "positions", "position_ids", "position")
 _LOGITS_KEYS = ("logits", "captured_logits", "vllm_logits", "vocab_logits")
-_TOPK_KEYS = ("topk", "top_k_logits", "logprobs", "token_logprobs", "top_k")
+_TOPK_KEYS = (
+    "prompt_logprobs", "topk", "top_k_logits", "logprobs",
+    "token_logprobs", "top_k",
+)
 
 
 @dataclass
@@ -54,6 +60,16 @@ def _first(mapping: Dict[str, Any], keys: Tuple[str, ...]):
 
 def _unwrap(data: Any) -> Dict[str, Any]:
     if isinstance(data, dict):
+        # Native /v1/completions response.  vLLM stores prompt_logprobs and
+        # prompt_token_ids on each choice, not at the response root.
+        choices = data.get("choices")
+        if data.get("object") == "text_completion" and isinstance(choices, list):
+            choice = next((item for item in choices if isinstance(item, dict)), None)
+            if choice is not None and choice.get("prompt_logprobs") is not None:
+                merged = dict(data)
+                merged.update(choice)
+                merged["_capture_format"] = "vllm_text_completion_prompt_logprobs"
+                return merged
         for key in ("data", "capture", "result", "payload"):
             child = data.get(key)
             if isinstance(child, dict) and (
@@ -81,6 +97,18 @@ def _as_input_ids(value: Any) -> torch.Tensor:
     if ids.ndim != 2 or ids.shape[1] == 0:
         raise ValueError("captured input_ids must have shape [B,S]")
     return ids.cpu()
+
+
+def _vllm_prompt_input_ids(payload: Dict[str, Any]) -> torch.Tensor:
+    value = _first(payload, _ID_KEYS)
+    if value is None:
+        raise ValueError(
+            "vLLM prompt_logprobs response missing prompt_token_ids; "
+            "prompt_logprobs[0] is null, so the first prompt token cannot be "
+            "reconstructed exactly. Re-run the vLLM request with "
+            "return_token_ids=true, or add the exact prompt_token_ids to this JSON"
+        )
+    return _as_input_ids(value)
 
 
 def _records_payload(records: Any):
@@ -165,7 +193,12 @@ def _token_from_item(item: Any) -> Optional[CapturedToken]:
             token_id=int(tid),
             value=float(value) if value is not None else None,
             probability=float(probability) if probability is not None else None,
-            token_str=str(item.get("token_str") or item.get("text") or ""),
+            token_str=str(
+                item.get("token_str")
+                or item.get("decoded_token")
+                or item.get("text")
+                or ""
+            ),
         )
     if isinstance(item, (list, tuple)) and len(item) >= 2:
         return CapturedToken(token_id=int(item[0]), value=float(item[1]))
@@ -192,6 +225,15 @@ def _normalize_topk(raw: Any) -> Optional[List[List[CapturedToken]]]:
                     items.append(value)
                 else:
                     items.append((int(key), value))
+            # Native vLLM prompt_logprobs inserts the observed prompt token as
+            # well as the requested Top-N candidates.  The observed token is
+            # not necessarily rank 1, so JSON insertion order must not be used
+            # as Top-1.  Rank-sorted order makes Top-1/margin comparisons valid.
+            items.sort(key=lambda item: (
+                int(item.get("rank"))
+                if isinstance(item, dict) and item.get("rank") is not None
+                else 2 ** 31
+            ))
         else:
             items = row if isinstance(row, list) else [row]
         tokens = [token for token in (_token_from_item(x) for x in items) if token]
@@ -203,6 +245,10 @@ def load_captured_logits(path: str) -> CapturedLogits:
     with open(path, encoding="utf-8") as handle:
         raw = json.load(handle)
     payload = _unwrap(raw)
+    native_prompt_logprobs = (
+        payload.get("_capture_format")
+        == "vllm_text_completion_prompt_logprobs"
+    )
     record_data = _records_payload(payload.get("records"))
 
     if record_data is not None:
@@ -213,7 +259,11 @@ def load_captured_logits(path: str) -> CapturedLogits:
         logits_raw = record_logits
         topk_raw = record_topk
     else:
-        input_ids = _as_input_ids(_first(payload, _ID_KEYS))
+        input_ids = (
+            _vllm_prompt_input_ids(payload)
+            if native_prompt_logprobs
+            else _as_input_ids(_first(payload, _ID_KEYS))
+        )
         logits_raw = _first(payload, _LOGITS_KEYS)
         topk_raw = _first(payload, _TOPK_KEYS)
         positions_raw = _first(payload, _POSITION_KEYS)
@@ -238,6 +288,29 @@ def load_captured_logits(path: str) -> CapturedLogits:
         logits = _normalize_full_logits(logits_raw, positions, input_ids)
 
     topk = _normalize_topk(topk_raw)
+    if native_prompt_logprobs:
+        if logits is not None:
+            raise ValueError(
+                "native vLLM prompt_logprobs response unexpectedly contains full logits"
+            )
+        if len(positions) != int(input_ids.shape[1]):
+            raise ValueError(
+                "vLLM prompt_logprobs rows must match prompt_token_ids length"
+            )
+        # prompt_logprobs[i] is the distribution used to score prompt token i,
+        # while Hugging Face logits at row i-1 predict that token.  Drop the
+        # leading null row and shift positions by one for exact alignment.
+        aligned = [
+            (prompt_position - 1, row)
+            for prompt_position, row in zip(positions, topk or [])
+            if prompt_position > 0 and row
+        ]
+        positions = [position for position, _ in aligned]
+        topk = [row for _, row in aligned]
+        if not topk:
+            raise ValueError(
+                "vLLM prompt_logprobs response has no comparable prompt positions"
+            )
     if logits is None and topk is None:
         raise ValueError(
             "captured logits JSON must contain full logits or Top-K fields"
@@ -249,6 +322,13 @@ def load_captured_logits(path: str) -> CapturedLogits:
         for key in ("model", "tokenizer", "tokenizer_path", "prompt", "generation_config", "temperature", "top_p", "top_k")
         if key in payload
     }
+    if native_prompt_logprobs:
+        metadata.update({
+            "capture_format": "vllm_text_completion_prompt_logprobs",
+            "response_id": payload.get("id"),
+            "response_text": payload.get("text"),
+            "finish_reason": payload.get("finish_reason"),
+        })
     attention_mask = _first(payload, _MASK_KEYS)
     if attention_mask is not None:
         attention_mask = torch.as_tensor(attention_mask, dtype=torch.long)

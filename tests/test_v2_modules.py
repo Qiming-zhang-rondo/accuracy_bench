@@ -283,15 +283,21 @@ class TestHtmlReportV2:
         assert sb[0]["boundary"] == "CLEAN"
         assert sb[0]["token_rate"] == 1.0
         assert sb[0]["run_mode"] == "BOUNDARY"
+        assert sb[0]["report_relpath"] == "run_b"
         assert sb[1]["model_name"] == "model-A"
         assert sb[1]["run_status"] == "PARTIAL"
         assert sb[1]["run_mode"] == "L1"
+        assert sb[1]["report_relpath"] == "run_a"
         # First-divergence layer propagates into sidebar summary
         assert sb[1]["first_div"] == 3
         # __switchReport wiring
         assert "window.__switchReport" in html
         assert "renderSidebar" in html
         assert "si-badge mode" in html
+        assert "__openHistoryMenu" in html
+        assert "__deleteHistoryReport" in html
+        assert "/__accuracy_bench__/delete-report" in html
+        assert "右键删除" in html
         # Polish: listener-accumulation guard in boot()
         assert "__accInitDone" in html
         # Polish: mobile responsive media query

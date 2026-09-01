@@ -254,8 +254,9 @@ def parse_args():
     )
     parser.add_argument(
         "--captured_logits_json", type=str, default=None,
-        help=("[boundary/intermittent] vLLM 现场 logits JSON；需含 input_ids、"
-              "positions，以及 full logits 或 Top-K 字段"),
+        help=("[boundary/intermittent] vLLM 现场 logits JSON；支持原生 "
+              "text_completion prompt_logprobs 响应（需 return_token_ids=true），"
+              "或含 input_ids/positions/full logits/Top-K 的通用格式"),
     )
     parser.add_argument("--boundary_logits_cos_threshold", type=float, default=0.99,
                         help="[boundary/intermittent] cosine 明显偏差阈值")

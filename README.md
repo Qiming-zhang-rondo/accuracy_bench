@@ -145,6 +145,22 @@ python3 run_accuracy_check.py --mode boundary \\
 | **A4 激活量化** | MXFP4 (E2M1) + INT4 per-token / hidden-axis per-group, W4A4 全链路 | ✅ |
 | **Bad Case 工作流** | manifest + 单点 clip + GT 对比 | ✅ |
 
+## 报告历史与本地删除
+
+每次 L1/L2/full/boundary 报告默认归档在：
+
+```text
+reports/<模型名>_<模式>_<时间戳>/
+```
+
+仓库根目录的 `latest.html` 指向 `reports/index.html`。直接用 `file://` 打开时浏览器只能读取报告，不能删除本地文件；需要同步释放磁盘时启动本地报告服务：
+
+```bash
+python3 serve_reports.py
+```
+
+然后打开 `http://127.0.0.1:8765/latest.html`，在左侧历史记录上点击右键，选择“删除并释放本地文件”。服务只允许删除 `reports/` 内含 `report_data.json` 的独立运行目录，删除后会自动重建历史索引。远程机器需要端口转发时可改用 `--host 0.0.0.0 --port 8765`。
+
 ## 对比
 
 | 工具 | L1 找坏层 | 定界 (框架 vs 权重) | L2 反事实根因 | 端到端评测 |
