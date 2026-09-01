@@ -163,6 +163,8 @@ class LogitsComparison:
     token_wise_top1_match: List[bool] = field(default_factory=list)
     ref_top1_margin: List[Optional[float]] = field(default_factory=list)
     quant_top1_margin: List[Optional[float]] = field(default_factory=list)
+    available_top_k: int = 0
+    topn_mismatch_positions: dict[str, List[int]] = field(default_factory=dict)
     scatter_ref: List[float] = field(default_factory=list)             # 采样成对样本
     scatter_quant: List[float] = field(default_factory=list)
     hist_bins: List[float] = field(default_factory=list)
@@ -180,6 +182,11 @@ class LogitsComparison:
             full_top1_match_count=sum(
                 value is True for value in self.token_wise_top1_match
             ),
+            available_top_k=self.available_top_k,
+            topn_mismatch_positions={
+                str(rank): list(positions)
+                for rank, positions in self.topn_mismatch_positions.items()
+            },
             ref_topk=[list(pos) for pos in self.ref_topk],
             quant_topk=[list(pos) for pos in self.quant_topk],
             ref_logits=list(self.ref_argmax_logits),
@@ -280,6 +287,8 @@ def compare_logits(ref: LogitsCollection, quant: LogitsCollection,
     t_margin1: List[Optional[float]] = []
     t_margin2: List[Optional[float]] = []
     scatter_flat_indices: List[int] = []
+    tracked_ranks = [rank for rank in (1, 2, 5, 10) if rank <= k]
+    rank_mismatches = {str(rank): [] for rank in tracked_ranks}
 
     for i in range(n):
         r_row = ref_logits[i]
@@ -315,6 +324,9 @@ def compare_logits(ref: LogitsCollection, quant: LogitsCollection,
         overlap = len(set(r_ids) & set(q_ids))
         t_overlap.append(overlap / k if k else None)
         t_top1.append(bool(r_ids[0] == q_ids[0]) if r_ids and q_ids else False)
+        for rank in tracked_ranks:
+            if set(r_ids[:rank]) != set(q_ids[:rank]):
+                rank_mismatches[str(rank)].append(positions[i])
         r_top2 = torch.topk(r_row, k=2).values if vocab >= 2 else None
         q_top2 = torch.topk(q_row, k=2).values if vocab >= 2 else None
         t_margin1.append(float((r_top2[0] - r_top2[1]).item()) if r_top2 is not None else None)
@@ -358,6 +370,8 @@ def compare_logits(ref: LogitsCollection, quant: LogitsCollection,
         token_wise_top1_match=t_top1,
         ref_top1_margin=t_margin1,
         quant_top1_margin=t_margin2,
+        available_top_k=k,
+        topn_mismatch_positions=rank_mismatches,
         scatter_ref=sr.tolist(),
         scatter_quant=sq.tolist(),
         hist_bins=bins,
@@ -387,18 +401,39 @@ def compare_captured_topk(captured_topk, replay: LogitsCollection,
     top1_matches: List[bool] = []
     ref_margins: List[Optional[float]] = []
     quant_margins: List[Optional[float]] = []
+    tracked_ranks = [rank for rank in (1, 2, 5, 10) if rank <= k]
+    rank_mismatches = {str(rank): [] for rank in tracked_ranks}
 
     for i in range(n):
-        cap = list(captured_topk[i] or [])[:k]
+        captured_row = list(captured_topk[i] or [])
+        cap = captured_row[:k]
         cap_by_id = {int(t.token_id): t for t in cap}
-        q_ids, q_probs = _topk_prob(replay.logits[i], k)
+        q_all_probs = torch.softmax(replay.logits[i], dim=-1)
+        q_probs, q_indices = torch.topk(q_all_probs, k=k, dim=-1)
+        q_ids = q_indices.tolist()
         q_by_id = {tid: float(prob) for tid, prob in zip(q_ids, q_probs)}
-        all_ids = list(dict.fromkeys(list(cap_by_id) + q_ids))
+        # Native prompt_logprobs also records the fixed request token even
+        # when it ranks outside Top-K.  Keep that teacher-forced target in the
+        # detail chart, but never let it pollute the Top-N candidate-set test.
+        target_id = None
+        target_position = positions[i] + 1
+        if (
+            replay.input_ids is not None
+            and replay.input_ids.ndim == 2
+            and 0 <= target_position < replay.input_ids.shape[1]
+        ):
+            target_id = int(replay.input_ids[0, target_position].item())
+        display_cap_by_id = {int(t.token_id): t for t in captured_row}
+        if target_id is not None and 0 <= target_id < vocab:
+            q_by_id[target_id] = float(q_all_probs[target_id].item())
+        all_ids = list(dict.fromkeys(
+            list(cap_by_id) + q_ids + ([target_id] if target_id is not None else [])
+        ))
 
         r_rows: List[TokenProb] = []
         q_rows: List[TokenProb] = []
         for tid in all_ids:
-            token = cap_by_id.get(tid)
+            token = display_cap_by_id.get(tid)
             try:
                 token_str = _clean_token_str(tokenizer.decode([tid]), tid)
             except Exception:
@@ -412,6 +447,9 @@ def compare_captured_topk(captured_topk, replay: LogitsCollection,
         cap_ids = list(cap_by_id)
         overlaps.append(len(set(cap_ids) & set(q_ids)) / k if k else None)
         top1_matches.append(bool(cap_ids and q_ids and cap_ids[0] == q_ids[0]))
+        for rank in tracked_ranks:
+            if set(cap_ids[:rank]) != set(q_ids[:rank]):
+                rank_mismatches[str(rank)].append(positions[i])
         cap_values = [t.value for t in cap if t.value is not None]
         ref_margins.append(
             float(cap_values[0] - cap_values[1]) if len(cap_values) >= 2 else None
@@ -435,6 +473,8 @@ def compare_captured_topk(captured_topk, replay: LogitsCollection,
         token_wise_top1_match=top1_matches,
         ref_top1_margin=ref_margins,
         quant_top1_margin=quant_margins,
+        available_top_k=k,
+        topn_mismatch_positions=rank_mismatches,
         # Top-K-only captures may contain probabilities or log-probabilities,
         # not raw vocabulary logits.  Do not render a misleading mixed-unit
         # scatter plot; full-vocabulary captures use compare_logits instead.

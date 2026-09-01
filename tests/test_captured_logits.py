@@ -7,6 +7,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from accuracy_checker.captured_logits import load_captured_logits
+from accuracy_checker.logits_compare import LogitsCollection, compare_captured_topk
 
 
 def test_load_full_vocab_capture_selects_positions(tmp_path):
@@ -147,6 +148,39 @@ def test_native_vllm_prompt_logprobs_use_paired_token_id_request(tmp_path):
     assert capture.token_positions == [0, 1]
     assert capture.metadata["input_ids_source"] == "paired_request_prompt_ids"
     assert capture.metadata["paired_request_json"] == str(request_path.resolve())
+    assert capture.metadata["prompt_logprobs_top_k"] == 1
+
+
+def test_prompt_logprobs_topn_excludes_but_displays_fixed_request_token(tmp_path):
+    response_path = tmp_path / "response.json"
+    request_path = tmp_path / "request.json"
+    response_path.write_text(json.dumps({
+        "object": "text_completion",
+        "choices": [{"prompt_logprobs": [None, {
+            "9": {"logprob": -9.0, "rank": 100},
+            "2": {"logprob": -0.1, "rank": 1},
+        }]}],
+    }), encoding="utf-8")
+    request_path.write_text(json.dumps({
+        "prompt": [1, 9], "prompt_logprobs": 1,
+    }), encoding="utf-8")
+    capture = load_captured_logits(str(response_path), request_path=str(request_path))
+    replay_logits = torch.full((1, 12), -10.0)
+    replay_logits[0, 3] = 5.0
+    replay_logits[0, 9] = -2.0
+    replay = LogitsCollection(
+        token_positions=[0], logits=replay_logits,
+        input_ids=torch.tensor([[1, 9]]), position_mode="captured_replay",
+    )
+
+    comparison = compare_captured_topk(
+        capture.topk, replay, tokenizer=type("T", (), {"decode": lambda self, ids: str(ids[0])})(),
+        top_k=1,
+    )
+
+    assert comparison.topn_mismatch_positions == {"1": [0]}
+    assert [row.token_id for row in comparison.ref_topk[0]] == [2, 9]
+    assert [row.token_id for row in comparison.quant_topk[0]] == [2, 3, 9]
 
 
 def test_native_vllm_prompt_logprobs_auto_find_logprob_request(tmp_path):

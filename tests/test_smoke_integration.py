@@ -430,6 +430,8 @@ class TestLogitsCompare:
         assert isinstance(ld, LogitsData)
         assert ld.token_positions == [0, 1, 2]
         assert ld.position_mode == "generation"
+        assert ld.available_top_k == 5
+        assert set(ld.topn_mismatch_positions) == {"1", "2", "5"}
 
     def test_compare_preserves_prompt_positions_and_mode(self):
         ref = LogitsCollection(

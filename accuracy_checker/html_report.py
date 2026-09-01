@@ -558,10 +558,34 @@ table.grid-tbl tr:hover td { background:var(--accent-soft); }
 .position-btn.topk-match { color:#176B55; border-color:#B8DCCB; background:#F1FAF5; }
 .position-btn.topk-partial { color:#8A5A08; border-color:#E7C783; background:#FFF7E3; }
 .position-btn.topk-mismatch { color:#fff; border-color:var(--bad); background:var(--bad); }
+.position-btn.topn-filtered { color:#3730A3; border-color:#A5B4FC; background:#EEF2FF; }
 .position-btn.topk-match.active { color:#fff; background:var(--accent); border-color:var(--accent); }
 .position-btn.topk-partial.active { color:#fff; background:var(--warn); border-color:var(--warn); box-shadow:0 0 0 2px rgba(184,119,16,.20); }
 .position-btn.topk-mismatch:hover { color:#fff; border-color:#7F2929; background:#7F2929; }
 .position-btn.topk-mismatch.active { color:#fff; background:#7F2929; border-color:#7F2929; box-shadow:0 0 0 2px rgba(165,57,57,.22); }
+.position-btn.topn-filtered.active { color:#fff; background:#4F46E5; border-color:#4F46E5; box-shadow:0 0 0 2px rgba(79,70,229,.18); }
+.logits-filter { display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap; margin:0 0 12px; padding:12px 14px;
+  background:#F8F6F0; border:1px solid var(--border); border-radius:10px; }
+.logits-filter:empty { display:none; }
+.logits-filter .filter-group { display:flex; gap:5px; align-items:center; flex-wrap:wrap; }
+.logits-filter #logits-rank-buttons { display:inline-flex; gap:5px; flex-wrap:wrap; }
+.logits-filter label { color:var(--muted); font-size:11px; font-weight:750; }
+.logits-filter button { padding:5px 9px; color:var(--muted); background:#fff; border:1px solid var(--border);
+  border-radius:7px; font:750 10px var(--mono); cursor:pointer; }
+.logits-filter button:hover { color:var(--navy); border-color:var(--border-strong); }
+.logits-filter button.active { color:#fff; background:#4F46E5; border-color:#4F46E5; }
+.logits-filter button:disabled { opacity:.45; cursor:not-allowed; }
+.logits-filter input { width:96px; padding:5px 7px; color:var(--ink); background:#fff; border:1px solid var(--border);
+  border-radius:7px; font:700 10px var(--mono); }
+.logits-filter .filter-summary { flex-basis:100%; color:var(--muted); font-size:11px; line-height:1.5; }
+.logits-filter .filter-summary b { color:var(--navy); }
+.replay-next-step { margin-top:10px; padding:10px 12px; color:var(--muted); background:#F7F8FF;
+  border:1px solid #D8DAF5; border-left:4px solid #4F46E5; border-radius:8px; font-size:11px; line-height:1.55; }
+.replay-next-step b { color:var(--navy); }
+.replay-actions { display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; }
+.replay-actions button { padding:5px 9px; color:#3730A3; background:#fff; border:1px solid #A5B4FC;
+  border-radius:7px; font:750 10px var(--mono); cursor:pointer; }
+.replay-actions button:hover { color:#fff; background:#4F46E5; border-color:#4F46E5; }
 #logits_topk .chart-scroll { max-height:520px; overflow:auto; }
 /* End-to-end generation comparison */
 .output-box { margin:0; max-height:320px; overflow:auto; padding:13px 15px; color:var(--ink); background:#fff;
@@ -644,6 +668,13 @@ function recTier(v){const n=num(v);if(n===null)return C.na;if(n<0)return C.bad;i
 function isDegradedQuantType(qt){if(!qt)return false;const s=String(qt).toUpperCase();return s.indexOf("W4")>=0;}
 function clamp(x,a,b){return Math.max(a,Math.min(b,x));}
 function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]));}
+async function copyReportText(text,button){
+  try{
+    if(navigator.clipboard&&window.isSecureContext)await navigator.clipboard.writeText(text);
+    else{const a=document.createElement("textarea");a.value=text;a.style.position="fixed";a.style.opacity="0";document.body.appendChild(a);a.select();document.execCommand("copy");a.remove();}
+    if(button){const old=button.textContent;button.textContent="已复制";window.setTimeout(()=>button.textContent=old,1200);}
+  }catch(err){window.prompt("复制下面内容：",text);}
+}
 
 // ---- metric 指标解释 ----
 const HELP={
@@ -978,22 +1009,88 @@ function appendChart(root,s){const w=document.createElement("div");w.className="
 // ====================================================================
 // LOGITS 可视化
 // ====================================================================
-let curPos=-1;
+let curPos=-1,logitsRankFilter=null,logitsRangeStart=null,logitsRangeEnd=null,logitsPage=0,logitsDataRef=null;
+const LOGITS_PAGE_SIZE=200;
+function logitsRanks(){
+  const L=R.logits||{},cat=L.topn_mismatch_positions||{};
+  const ranks=Object.keys(cat).map(Number).filter(k=>Number.isFinite(k)&&k>0).sort((a,b)=>b-a);
+  if(ranks.length)return ranks;
+  const maxK=Number(L.available_top_k||0);return [10,5,2,1].filter(k=>k<=Math.max(1,maxK));
+}
+function rankedIds(rows,side,k){
+  const key=side==="ref"?"ref_prob":"quant_prob";
+  return (rows||[]).filter(t=>num(t[key])!==null).slice().sort((a,b)=>num(b[key])-num(a[key])).slice(0,k).map(t=>Number(t.token_id));
+}
+function detailTopNMismatch(index,k){
+  const L=R.logits||{};
+  const a=rankedIds((L.ref_topk||[])[index],"ref",k),b=rankedIds((L.quant_topk||[])[index],"quant",k);
+  if(a.length<k||b.length<k)return false;
+  const bs=new Set(b);return a.some(id=>!bs.has(id));
+}
+function mismatchPositions(k){
+  const L=R.logits||{};if(Number(k)<=0)return (L.token_positions||[]).map(Number);
+  const cat=L.topn_mismatch_positions||{},saved=cat[String(k)];
+  if(Array.isArray(saved))return saved.map(Number);
+  return (L.token_positions||[]).filter((p,i)=>detailTopNMismatch(i,k)).map(Number);
+}
+function rangeMismatchPositions(){
+  return mismatchPositions(logitsRankFilter).filter(p=>p>=logitsRangeStart&&p<=logitsRangeEnd);
+}
+function detailFilteredIndices(){
+  const L=R.logits||{},wanted=new Set(mismatchPositions(logitsRankFilter));
+  return (L.token_positions||[]).map((p,i)=>[Number(p),i]).filter(([p])=>p>=logitsRangeStart&&p<=logitsRangeEnd&&wanted.has(p)).map(([,i])=>i);
+}
+function logitsPageIndices(){
+  const all=detailFilteredIndices();if((R.logits||{}).position_mode!=="captured_replay")return all;
+  const pages=Math.max(1,Math.ceil(all.length/LOGITS_PAGE_SIZE));
+  logitsPage=clamp(logitsPage,0,pages-1);return all.slice(logitsPage*LOGITS_PAGE_SIZE,(logitsPage+1)*LOGITS_PAGE_SIZE);
+}
+function chooseFirstVisible(){const page=logitsPageIndices();if(page.length)curPos=page[0];else curPos=-1;}
+function refreshLogitsViews(selectFirst){if(selectFirst)chooseFirstVisible();renderLogitsFilter();renderTopK(curPos);renderLines();}
+function renderLogitsFilter(){
+  const root=el("logits_filter"),L=R.logits;if(!root||!L)return;
+  if(L.position_mode!=="captured_replay"){root.innerHTML="";return;}
+  const ranks=logitsRanks();if(logitsRankFilter===null||!ranks.includes(logitsRankFilter))logitsRankFilter=ranks.includes(1)?1:ranks[ranks.length-1];
+  const ps=L.token_positions||[];if(logitsRangeStart===null)logitsRangeStart=Number(ps[0]||0);if(logitsRangeEnd===null)logitsRangeEnd=Number(ps[ps.length-1]||0);
+  const exact=rangeMismatchPositions(),details=detailFilteredIndices(),pages=Math.max(1,Math.ceil(details.length/LOGITS_PAGE_SIZE));
+  root.innerHTML='<div class="filter-group"><label>候选集合筛选</label><span id="logits-rank-buttons"></span></div>'
+    +'<div class="filter-group"><label for="logits-range-start">Position 范围</label><input id="logits-range-start" type="number" value="'+logitsRangeStart+'">'
+    +'<span>–</span><input id="logits-range-end" type="number" value="'+logitsRangeEnd+'"><button id="logits-range-apply">应用</button>'
+    +'<button id="logits-left-half">左半区</button><button id="logits-right-half">右半区</button><button id="logits-range-reset">重置</button></div>'
+    +'<div class="filter-group"><button id="logits-prev">上一页</button><button id="logits-next">下一页</button></div>'
+    +'<div class="filter-summary"><b>Top-'+logitsRankFilter+' 候选集合不一致：</b>当前范围全量 '+exact.length+' 个；报告保留可展开明细 '+details.length+' 个；第 '+(logitsPage+1)+' / '+pages+' 页（每页最多 '+LOGITS_PAGE_SIZE+' 个）。'
+    +' Top-1 是实际 argmax 翻转；Top-2/5/10 是备选候选集合发生变化，范围更宽、数量通常更多。范围与二分按钮只筛选已有结果，不会重新运行模型。</div>';
+  const rankRoot=el("logits-rank-buttons");ranks.forEach(k=>{const b=document.createElement("button");b.type="button";b.className=k===logitsRankFilter?"active":"";
+    b.textContent="Top-"+k+" 不一致 ("+mismatchPositions(k).length+")";b.addEventListener("click",()=>{logitsRankFilter=k;logitsPage=0;refreshLogitsViews(true);});rankRoot.appendChild(b);});
+  const applyRange=()=>{let a=Number(el("logits-range-start").value),b=Number(el("logits-range-end").value);if(!Number.isFinite(a)||!Number.isFinite(b))return;if(a>b)[a,b]=[b,a];logitsRangeStart=a;logitsRangeEnd=b;logitsPage=0;refreshLogitsViews(true);};
+  el("logits-range-apply").addEventListener("click",applyRange);
+  ["logits-range-start","logits-range-end"].forEach(id=>el(id).addEventListener("keydown",e=>{if(e.key==="Enter")applyRange();}));
+  const half=right=>{const mid=Math.floor((logitsRangeStart+logitsRangeEnd)/2);if(right)logitsRangeStart=Math.min(logitsRangeEnd,mid+1);else logitsRangeEnd=mid;logitsPage=0;refreshLogitsViews(true);};
+  el("logits-left-half").addEventListener("click",()=>half(false));el("logits-right-half").addEventListener("click",()=>half(true));
+  el("logits-range-reset").addEventListener("click",()=>{logitsRangeStart=Number(ps[0]||0);logitsRangeEnd=Number(ps[ps.length-1]||0);logitsPage=0;refreshLogitsViews(true);});
+  el("logits-prev").disabled=logitsPage<=0;el("logits-next").disabled=logitsPage>=pages-1;
+  el("logits-prev").addEventListener("click",()=>{logitsPage--;refreshLogitsViews(true);});el("logits-next").addEventListener("click",()=>{logitsPage++;refreshLogitsViews(true);});
+}
 function renderLogits(){
   const root=el("logits");const L=R.logits;
   if(!L||!L.token_positions||!L.token_positions.length){
     const reason=(R.overview&&R.overview.logits_error)||"未采集 logits 对比";
     root.innerHTML='<div class="empty"><div class="empty-icon">—</div><div class="empty-text">未采集 logits 对比</div><div class="empty-hint">'+esc(reason)+'</div></div>';return;
   }
+  if(logitsDataRef!==L){logitsDataRef=L;curPos=-1;logitsRankFilter=null;logitsRangeStart=null;logitsRangeEnd=null;logitsPage=0;}
   if(curPos<0||curPos>=L.token_positions.length){
     const cr=(R.overview||{}).captured_replay||{};
     const diagnosticPos=cr.first_mismatch_position==null?cr.first_top1_flip_position:cr.first_mismatch_position;
     const diagnosticIndex=diagnosticPos==null?-1:L.token_positions.indexOf(Number(diagnosticPos));
     curPos=diagnosticIndex>=0?diagnosticIndex:(L.position_mode==="prompt_prefill"?L.token_positions.length-1:0);
   }
+  const ranks=logitsRanks();if(logitsRankFilter===null)logitsRankFilter=L.position_mode==="captured_replay"?(ranks.includes(1)?1:ranks[ranks.length-1]):0;
+  if(logitsRangeStart===null)logitsRangeStart=Number(L.token_positions[0]);
+  if(logitsRangeEnd===null)logitsRangeEnd=Number(L.token_positions[L.token_positions.length-1]);
   let modeNote="采集位置语义未记录；请结合生成方式人工确认 position 含义。";
   if(L.position_mode==="prompt_prefill")modeNote="这里展示 Prompt prefill 各位置的 next-token 预测；只有最后一行对应首个 Decode Token，页面已默认选中最后一行。前面的 position 不是生成序列。";
   else if(L.position_mode==="generation")modeNote="这里展示自回归生成的 Decode step；Position 0 对应首个 Decode Token。";
+  else if(L.position_mode==="captured_replay")modeNote="这里按固定 request 的 input_ids 做 teacher-forced 对齐；Position p 的 logits 预测 input_ids[p+1]。Top-N 比较双方 rank 1…N 的备选集合，固定 request token 会额外以 ★ 展示，但排名低于 N 时不参与 Top-N 集合判定。";
   if(L.display_sampled){
     modeNote += " 后端已比较全部 "+(L.total_positions||L.token_positions.length)+
       " 个 position；为避免浏览器卡死，页面仅展示其中 "+L.token_positions.length+
@@ -1004,9 +1101,9 @@ function renderLogits(){
       L.token_positions[L.token_positions.length-1]+"）；可用 --logits_max_positions 0 采集全部。";
   }
   root.innerHTML='<div class="context-note"><b>Position 口径：</b>'+modeNote+' 散点与直方图为已采集位置的聚合视图。</div>'+
-    '<div class="grid" style="grid-template-columns:1fr"><div id="logits_scatter"></div>'
+    '<div id="logits_filter" class="logits-filter"></div><div class="grid" style="grid-template-columns:1fr"><div id="logits_scatter"></div>'
     +'<div id="logits_topk"></div><div id="logits_lines"></div><div id="logits_hist"></div></div>';
-  renderScatter();renderLines();renderHist();renderTopK(curPos);
+  renderLogitsFilter();chooseFirstVisible();renderScatter();renderLines();renderHist();renderTopK(curPos);
 }
 function renderScatter(){
   const root=el("logits_scatter");if(!root)return;
@@ -1035,9 +1132,11 @@ function renderScatter(){
 }
 function renderLines(){
   const root=el("logits_lines");if(!root)return;
-  const L=R.logits;const ps=L.token_positions||[];
-  const top1Arr=L.token_wise_top1_match||[];
-  const ser=[["cos",L.token_wise_cos,C.ref],["topk_overlap",L.token_wise_topk_overlap,C.topk]];
+  const L=R.logits,indices=logitsPageIndices();
+  if(!indices.length){root.innerHTML='<div class="card"><div class="empty"><div class="empty-text">当前 Top-N / Position 范围没有可展开的明细</div><div class="empty-hint">上方“全量”计数仍是精确结果；可扩大范围或切换 Top-N。</div></div></div>';return;}
+  const ps=indices.map(i=>L.token_positions[i]);
+  const top1Arr=indices.map(i=>(L.token_wise_top1_match||[])[i]);
+  const ser=[["cos",indices.map(i=>(L.token_wise_cos||[])[i]),C.ref],["topk_overlap",indices.map(i=>(L.token_wise_topk_overlap||[])[i]),C.topk]];
   const W=900,H=240,m=36;const yl=[0,1];
   const X=i=>m+(W-2*m)*(ps.length<=1?0.5:i/(ps.length-1||1));
   const Y=v=>(H-m)-(H-2*m)*(v-yl[0])/(yl[1]-yl[0]);
@@ -1050,13 +1149,13 @@ function renderLines(){
     s.appendChild(E("path",{d:d,stroke:col,"stroke-width":1.8,fill:"none"}));
   });
   // clickable position markers
-  ps.forEach((p,i)=>{const overlap=num((L.token_wise_topk_overlap||[])[i]);
+  ps.forEach((p,i)=>{const originalIndex=indices[i];const overlap=num((L.token_wise_topk_overlap||[])[originalIndex]);
     const top1Match=top1Arr[i];
-    const markerColor=top1Match===false?C.bad:(overlap!==null&&overlap<1?C.warn:(overlap!==null?C.good:C.muted));
-    const mk=E("circle",{cx:X(i),cy:Y(0.5),r:curPos===i?6:5,fill:markerColor,opacity:0.72,cursor:"pointer",
-      stroke:curPos===i?C.ink:"none","stroke-width":curPos===i?1.5:0,
+    const markerColor=L.position_mode==="captured_replay"?(logitsRankFilter===1?C.bad:C.topk):(top1Match===false?C.bad:(overlap!==null&&overlap<1?C.warn:(overlap!==null?C.good:C.muted)));
+    const mk=E("circle",{cx:X(i),cy:Y(0.5),r:curPos===originalIndex?6:5,fill:markerColor,opacity:0.72,cursor:"pointer",
+      stroke:curPos===originalIndex?C.ink:"none","stroke-width":curPos===originalIndex?1.5:0,
       role:"button",tabindex:"0","aria-label":"选择 Position "+p});
-    const choose=()=>window.__selPos(i);
+    const choose=()=>window.__selPos(originalIndex);
     mk.addEventListener("click",choose);
     mk.addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();choose();}});
     s.appendChild(mk);
@@ -1069,16 +1168,14 @@ function renderLines(){
   root.innerHTML="";
   const header=document.createElement("div");header.className="card";
   header.innerHTML='<h3>Token-wise 指标折线 '+hIcon("token_wise_cos")+hIcon("topk_overlap")+hIcon("token_wise_kl")+'</h3>';
-  const overlapArr=L.token_wise_topk_overlap||[];
+  const overlapArr=indices.map(i=>(L.token_wise_topk_overlap||[])[i]);
   const top1MismatchCount=ps.reduce((n,p,i)=>n+(top1Arr[i]===false?1:0),0);
-  const topkPartialCount=ps.reduce((n,p,i)=>n+(top1Arr[i]===true&&num(overlapArr[i])!==null&&num(overlapArr[i])<1?1:0),0);
-  const topkExactCount=ps.reduce((n,p,i)=>n+(num(overlapArr[i])!==null&&num(overlapArr[i])>=1?1:0),0);
   const topkTotal=overlapArr.length||ps.length;
   const topkNote=document.createElement("div");topkNote.className="tip";
-  topkNote.innerHTML='<span class="legend-chip" style="background:#A53939"></span>Top-1 不一致 '+top1MismatchCount+'/'+topkTotal
-    +' · <span class="legend-chip" style="background:#B87710"></span>Top-1 一致、Top-K 部分重合 '+topkPartialCount
-    +' · <span style="color:#176B55">Top-K 完全一致 '+topkExactCount+'</span>'
-    +' · Position 选择器已放在上方的 Top-K 概率卡片中';
+  topkNote.innerHTML=L.position_mode==="captured_replay"?('<span class="legend-chip" style="background:#A53939"></span>本页 Top-1 不一致 '+top1MismatchCount+'/'+topkTotal
+    +' · <span class="legend-chip" style="background:#4F46E5"></span>当前筛选 Top-'+logitsRankFilter+' 集合不一致 '+topkTotal
+    +' · Position 选择器已放在上方的 Top-K 概率卡片中'):
+    ('<span class="legend-chip" style="background:#A53939"></span>Top-1 不一致 '+top1MismatchCount+'/'+topkTotal+' · Position 选择器已放在上方的 Top-K 概率卡片中');
   header.appendChild(topkNote);root.appendChild(header);
   appendChart(root,s);
   const lg=document.createElement("div");lg.className="tip";lg.innerHTML=
@@ -1087,14 +1184,14 @@ function renderLines(){
     +'KL(平均)='+avgKL();
   root.appendChild(lg);
   // KL mini chart
-  const Lk=L.token_wise_kl||[];
+  const Lk=indices.map(i=>(L.token_wise_kl||[])[i]);
   if(Lk.length){
     const kw=W,kh=120,m2=30;const x2=i=>m2+(kw-2*m2)*(ps.length<=1?0.5:i/(ps.length-1||1));let maxk=Math.max(...Lk.map(x=>num(x)||0),0.01);
     const Y2=v=>kh-m2-(kh-2*m2)*(v/maxk);const sk=svgBox(kw,kh);
     Lk.forEach((v,i)=>{const n=num(v);if(n===null)return;const x=x2(i);const y=Y2(n);
       const bar=E("rect",{x:x-2,y:y,width:4,height:kh-m2-y,fill:C.quant,opacity:0.7,cursor:"pointer",
         role:"button",tabindex:"0","aria-label":"选择 Position "+ps[i]});
-      const choose=()=>window.__selPos(i);
+      const choose=()=>window.__selPos(indices[i]);
       bar.addEventListener("click",choose);
       bar.addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();choose();}});
       sk.appendChild(bar);});
@@ -1106,16 +1203,25 @@ function renderLines(){
 }
 function avgKL(){const k=R.logits.token_wise_kl||[];const f=k.map(x=>num(x)).filter(x=>x!==null);if(!f.length)return"—";return (f.reduce((a,b)=>a+b,0)/f.length).toFixed(4);}
 function renderTopK(i){
-  const root=el("logits_topk");if(!root)return;const L=R.logits;if(!L.ref_topk||!L.ref_topk[i]){root.innerHTML="";return;}
+  const root=el("logits_topk");if(!root)return;const L=R.logits;if(i<0||!L.ref_topk||!L.ref_topk[i]){root.innerHTML="";return;}
   curPos=i;
   const pos=L.token_positions[i]===undefined?i:L.token_positions[i];
   const isFirstDecode=L.position_mode==="prompt_prefill"&&i===L.token_positions.length-1;
   const role=L.position_mode==="prompt_prefill"?(isFirstDecode?"首个 Decode Token":"Prompt 内 next-token 预测"):(L.position_mode==="generation"?"Decode step":"Token position");
   const inputRows=L.input_ids||[];const inputRow=inputRows[0]||[];
-  const inputToken=(pos>=0&&pos<inputRow.length)?("#"+inputRow[pos]):"—";
+  const targetPosition=L.position_mode==="captured_replay"?Number(pos)+1:Number(pos);
+  const targetTokenId=(targetPosition>=0&&targetPosition<inputRow.length)?Number(inputRow[targetPosition]):null;
+  const inputToken=targetTokenId===null?"—":("#"+targetTokenId);
+  const inputTokenLabel=L.position_mode==="captured_replay"?("固定 request 目标 token "+inputToken+"（★）"):("输入 token "+inputToken);
   const leftName=L.position_mode==="captured_replay"?"vLLM capture":"Ref";
   const rightName=L.position_mode==="captured_replay"?"Transformers replay":"Quant";
-  const rf=L.ref_topk[i]||[];const qf=L.quant_topk[i]||[];
+  const shownK=Number((L.position_mode==="captured_replay"?logitsRankFilter:0)||L.available_top_k||Math.max((L.ref_topk[i]||[]).filter(t=>num(t.ref_prob)!==null).length,1));
+  const rfAll=(L.ref_topk[i]||[]).filter(t=>num(t.ref_prob)!==null),qfAll=(L.quant_topk[i]||[]).filter(t=>num(t.quant_prob)!==null);
+  const rf=rfAll.slice().sort((a,b)=>num(b.ref_prob)-num(a.ref_prob)).slice(0,shownK),qf=qfAll.slice().sort((a,b)=>num(b.quant_prob)-num(a.quant_prob)).slice(0,shownK);
+  if(L.position_mode==="captured_replay"&&targetTokenId!==null){
+    const rt=rfAll.find(t=>Number(t.token_id)===targetTokenId),qt=qfAll.find(t=>Number(t.token_id)===targetTokenId);
+    if(rt&&!rf.some(t=>Number(t.token_id)===targetTokenId))rf.push(rt);if(qt&&!qf.some(t=>Number(t.token_id)===targetTokenId))qf.push(qt);
+  }
   // merge by token_id: 同一 token 取 ref_prob 与 quant_prob 并排
   const map={};const order=[];
   rf.forEach(t=>{if(!map[t.token_id]){map[t.token_id]={token_id:t.token_id,token_str:t.token_str,ref_prob:t.ref_prob,quant_prob:null};order.push(map[t.token_id]);}});
@@ -1128,7 +1234,7 @@ function renderTopK(i){
   rows.forEach((t,r)=>{const y=mT+r*h;
     const rp=num(t.ref_prob),qp=num(t.quant_prob);
     const lblClean=(t.token_str||'').replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\x00-\x1f\x7f]/g,'').trim();
-    const lblText=lblClean?lblClean:("#"+t.token_id);
+    const lblText=(L.position_mode==="captured_replay"&&Number(t.token_id)===targetTokenId?"★ ":"")+(lblClean?lblClean:("#"+t.token_id));
     const lbl=E("text",{x:mL-8,y:y+11,"text-anchor":"end",class:"axis","font-size":"11"});lbl.textContent=lblText.slice(0,14);s.appendChild(lbl);
     // ref 粗 (上) 蓝
     if(rp!==null){const w=Math.max(X(rp)-mL,2);const rr=E("rect",{x:mL,y:y,width:w,height:h/2-1,fill:C.ref,opacity:0.85,rx:2});s.appendChild(rr);}
@@ -1149,29 +1255,49 @@ function renderTopK(i){
   const summaryCls=matchCnt===tot?"pill ok":(matchCnt>tot/2?"pill warn":"pill bad");
   const card=document.createElement("div");
   card.className="card";
-  card.innerHTML='<h3>Top-K 概率并排 '+hIcon("top1_match")+' <span class="'+summaryCls+'">'+summaryBadge+'</span></h3>'
-    +'<div class="tip"><b>Position '+pos+' · '+role+'</b> · 输入 token '+inputToken+' — 当前: '+matchBadge+' · 绿(粗)='+leftName+' 概率 · 橙(细)='+rightName+' 概率'
+  card.innerHTML='<h3>Top-'+shownK+' 概率并排'+(L.position_mode==="captured_replay"?' + 固定 request token':'')+' '+hIcon("top1_match")+' <span class="'+summaryCls+'">'+summaryBadge+'</span></h3>'
+    +'<div class="tip"><b>Position '+pos+' · '+role+'</b> · '+inputTokenLabel+' — 当前: '+matchBadge+' · 绿(粗)='+leftName+' 概率 · 橙(细)='+rightName+' 概率'
     +' · Top-1 margin ('+leftName+'/'+rightName+')='+(refMargin===null?"—":refMargin.toFixed(4))+'/'+(quantMargin===null?"—":quantMargin.toFixed(4))
     +' · 使用下方 Position 选择器或折线节点切换</div>';
   const picker=document.createElement("div");picker.className="position-picker";picker.setAttribute("aria-label","Top-K position selector");
   const overlapArr=L.token_wise_topk_overlap||[];
-  L.token_positions.forEach((p,j)=>{const b=document.createElement("button");b.type="button";
+  const pageIndices=logitsPageIndices();
+  pageIndices.forEach(j=>{const p=L.token_positions[j];const b=document.createElement("button");b.type="button";
     const overlap=num(overlapArr[j]);
     const top1Match=top1Arr[j];
-    const stateClass=overlap===null?"":(top1Match===false?" topk-mismatch":(overlap<1?" topk-partial":" topk-match"));
+    const stateClass=L.position_mode==="captured_replay"?(shownK===1?" topk-mismatch":" topn-filtered"):(overlap===null?"":(top1Match===false?" topk-mismatch":(overlap<1?" topk-partial":" topk-match")));
     b.className="position-btn"+stateClass+(curPos===j?" active":"");
     b.textContent=String(p)+(L.position_mode==="prompt_prefill"&&j===L.token_positions.length-1?" · decode":"");
-    const stateText=overlap===null?"Top-K overlap 未记录":(top1Match===false?"Top-1 不一致":(overlap<1?"Top-1 一致，Top-K 部分重合":"Top-K 完全一致"));
+    const stateText=L.position_mode==="captured_replay"?("Top-"+shownK+" 候选集合不一致"+(top1Match===false?"；Top-1 也不一致":"；Top-1 一致")):(overlap===null?"Top-K overlap 未记录":(top1Match===false?"Top-1 不一致":(overlap<1?"Top-1 一致，Top-K 部分重合":"Top-K 完全一致")));
     b.setAttribute("aria-label","Position "+p+"，"+stateText);
-    b.title=stateText+(overlap!==null?"（overlap="+overlap.toFixed(3)+"）":"");
+    b.title=stateText+(overlap!==null?"（完整 Top-K overlap="+overlap.toFixed(3)+"）":"");
     b.addEventListener("click",()=>window.__selPos(j));picker.appendChild(b);});
   card.appendChild(picker);
   const pickerNote=document.createElement("div");pickerNote.className="tip";
-  pickerNote.innerHTML='<span class="legend-chip" style="background:#A53939"></span>红色=Top-1 不一致 · '
-    +'<span class="legend-chip" style="background:#B87710"></span>黄色=Top-1 一致但 Top-K 未完全重合 · '
-    +'<span style="color:#176B55">绿色=Top-K 完全一致</span>'
-    +(L.display_sampled?' · 当前选择器展示 '+L.token_positions.length+'/'+L.total_positions+' 个诊断 position':'');
+  pickerNote.innerHTML=L.position_mode==="captured_replay"?((shownK===1?'<span class="legend-chip" style="background:#A53939"></span>红色=Top-1 实际选择翻转':'<span class="legend-chip" style="background:#4F46E5"></span>靛蓝=Top-'+shownK+' 备选集合不一致')
+    +' · 当前页 '+pageIndices.length+' 个 position'
+    +(L.display_sampled?' · 全量筛选计数准确；概率明细保留 '+L.token_positions.length+'/'+L.total_positions+' 个诊断 position':'')):
+    ('<span class="legend-chip" style="background:#A53939"></span>红色=Top-1 不一致 · <span class="legend-chip" style="background:#B87710"></span>黄色=Top-1 一致但 Top-K 未完全重合 · <span style="color:#176B55">绿色=Top-K 完全一致</span>');
   card.appendChild(pickerNote);
+  if(L.position_mode==="captured_replay"){
+    const threshold=Number(((R.overview||{}).captured_replay||{}).margin_threshold||0.05);
+    const lowMargin=top1===false&&refMargin!==null&&quantMargin!==null&&Math.max(Math.abs(refMargin),Math.abs(quantMargin))<=threshold;
+    const priority=top1===false?(lowMargin?"低 margin Top-1 翻转：先作为敏感分叉复核，不直接判成严重算子偏差。":"Top-1 明确翻转：这是更优先的并发复现候选。"):
+      ("Top-1 仍一致，仅 Top-"+shownK+" 备选集合变化：适合作为附近窗口探针，优先级低于 Top-1 翻转。");
+    const generationPrefix=inputRow.slice(0,Math.min(inputRow.length,Number(pos)+1));
+    const recapturePrefix=inputRow.slice(0,Math.min(inputRow.length,Number(pos)+2));
+    const recaptureFragment={prompt:recapturePrefix,max_tokens:1,stream:false,prompt_logprobs:Number(L.available_top_k||shownK)};
+    const guide=document.createElement("div");guide.className="replay-next-step";
+    guide.innerHTML='<b>下一步：</b>'+priority+' 若要让 Position '+pos+' 成为“下一个 token”边界，用 <code>input_ids[:'+(Number(pos)+1)+']</code> 生成；'
+      +'若要再次核对原 request token #'+(targetTokenId===null?'—':targetTokenId)+' 的 prompt logprobs，用 <code>input_ids[:'+(Number(pos)+2)+']</code>，查看最后一行。'
+      +' 复制的请求片段需合并回原 request，并保留原 model/采样配置。长 prefill 异常可能依赖原总长度、分块和并发调度，因此截断前缀只是定位探针；仍应同时测试原完整 request、该 position 附近窗口及目标并发数。';
+    const actions=document.createElement("div");actions.className="replay-actions";
+    const genButton=document.createElement("button");genButton.type="button";genButton.textContent="复制生成前缀 token IDs";
+    genButton.addEventListener("click",()=>copyReportText(JSON.stringify(generationPrefix),genButton));actions.appendChild(genButton);
+    const captureButton=document.createElement("button");captureButton.type="button";captureButton.textContent="复制 prompt_logprobs 请求片段";
+    captureButton.addEventListener("click",()=>copyReportText(JSON.stringify(recaptureFragment,null,2),captureButton));actions.appendChild(captureButton);
+    guide.appendChild(actions);card.appendChild(guide);
+  }
   root.innerHTML="";
   root.appendChild(card);
   appendChart(card,s);
@@ -1306,6 +1432,7 @@ def _embed_json_safe(d: Dict[str, Any]) -> str:
 
 
 _HTML_LOGITS_POSITION_LIMIT = 256
+_HTML_LOGITS_TOP1_DETAIL_LIMIT = 4096
 _LOGITS_POSITION_FIELDS = (
     "token_positions", "ref_topk", "quant_topk", "ref_logits", "quant_logits",
     "token_wise_cos", "token_wise_kl", "token_wise_topk_overlap",
@@ -1328,7 +1455,12 @@ def _evenly_sample_indices(indices: List[int], count: int) -> List[int]:
 
 
 def _html_logits_indices(logits: Dict[str, Any], limit: int) -> List[int]:
-    """Prefer anomaly positions, then fill with uniform sequence coverage."""
+    """Keep Top-1 flips inspectable, then add anomaly/sequence coverage.
+
+    The front end paginates these details, so retaining a few thousand Top-1
+    flips does not create thousands of DOM nodes.  The lightweight full-run
+    Top-N mismatch catalog remains available for exact counts/range filtering.
+    """
     positions = list(logits.get("token_positions") or [])
     n = len(positions)
     if n <= limit:
@@ -1337,6 +1469,23 @@ def _html_logits_indices(logits: Dict[str, Any], limit: int) -> List[int]:
     overlaps = list(logits.get("token_wise_topk_overlap") or [])
     cosines = list(logits.get("token_wise_cos") or [])
     kls = list(logits.get("token_wise_kl") or [])
+    position_to_index = {int(position): index for index, position in enumerate(positions)}
+    catalog = logits.get("topn_mismatch_positions") or {}
+    top1_positions = list(catalog.get("1") or [])
+    if top1_positions:
+        top1_indices = [
+            position_to_index[int(position)] for position in top1_positions
+            if int(position) in position_to_index
+        ]
+    else:
+        top1_indices = [
+            index for index in range(n)
+            if index < len(top1) and top1[index] is False
+        ]
+    top1_indices = _evenly_sample_indices(
+        top1_indices, min(len(top1_indices), _HTML_LOGITS_TOP1_DETAIL_LIMIT)
+    )
+
     anomalies = []
     for index in range(n):
         overlap = overlaps[index] if index < len(overlaps) else None
@@ -1350,16 +1499,18 @@ def _html_logits_indices(logits: Dict[str, Any], limit: int) -> List[int]:
         ):
             anomalies.append(index)
 
-    selected = {0, n - 1}
-    anomaly_budget = min(len(anomalies), max(16, limit * 2 // 3))
+    selected = {0, n - 1, *top1_indices}
+    target = min(n, max(limit, len(selected)))
+    remaining = target - len(selected)
+    anomaly_budget = min(len(anomalies), max(0, remaining * 2 // 3))
     selected.update(_evenly_sample_indices(anomalies, anomaly_budget))
-    remaining = limit - len(selected)
+    remaining = target - len(selected)
     if remaining > 0:
         selected.update(_evenly_sample_indices(list(range(n)), remaining))
-    if len(selected) < limit:
+    if len(selected) < target:
         unselected = [index for index in range(n) if index not in selected]
-        selected.update(_evenly_sample_indices(unselected, limit - len(selected)))
-    return sorted(selected)[:limit]
+        selected.update(_evenly_sample_indices(unselected, target - len(selected)))
+    return sorted(selected)
 
 
 def _compact_report_for_html(
@@ -1387,10 +1538,14 @@ def _compact_report_for_html(
                 if isinstance(values, list) and len(values) == n:
                     bounded[key] = [values[index] for index in indices]
             top1 = list(logits.get("token_wise_top1_match") or [])
-            bounded["total_positions"] = n
+            bounded["total_positions"] = int(logits.get("total_positions") or n)
             bounded["display_sampled"] = True
-            bounded["full_top1_total"] = len(top1)
-            bounded["full_top1_match_count"] = sum(value is True for value in top1)
+            bounded["full_top1_total"] = int(logits.get("full_top1_total") or len(top1))
+            bounded["full_top1_match_count"] = int(
+                logits.get("full_top1_match_count")
+                if logits.get("full_top1_total")
+                else sum(value is True for value in top1)
+            )
             compact["logits"] = bounded
 
     overview = raw.get("overview")

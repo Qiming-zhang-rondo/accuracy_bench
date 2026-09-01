@@ -176,6 +176,30 @@ class TestHtmlReportV2:
         assert replay["compared_position_count"] == n
         assert len(replay["compared_positions"]) == 64
 
+    def test_large_logits_keeps_top1_details_and_full_topn_catalog(self):
+        from accuracy_checker.html_report import _compact_report_for_html
+
+        n = 1000
+        flips = list(range(100, 180))
+        raw = {
+            "logits": {
+                "token_positions": list(range(n)),
+                "ref_topk": [[{"token_id": i, "ref_prob": 1.0}] for i in range(n)],
+                "quant_topk": [[{"token_id": i, "quant_prob": 1.0}] for i in range(n)],
+                "token_wise_top1_match": [i not in flips for i in range(n)],
+                "token_wise_topk_overlap": [0.0 if i in flips else 1.0 for i in range(n)],
+                "topn_mismatch_positions": {"10": list(range(90, 200)), "1": flips},
+            },
+        }
+
+        compact = _compact_report_for_html(raw, limit=32)
+        logits = compact["logits"]
+
+        assert set(flips).issubset(logits["token_positions"])
+        assert logits["topn_mismatch_positions"]["10"] == list(range(90, 200))
+        assert logits["topn_mismatch_positions"]["1"] == flips
+        assert len(logits["token_positions"]) < n
+
     def test_generate_product_html_report(self, tmp_path):
         from accuracy_checker.html_report import generate_product_html_report
         from accuracy_checker.report_schema import (

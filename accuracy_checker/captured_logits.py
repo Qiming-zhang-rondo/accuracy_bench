@@ -365,6 +365,15 @@ def load_captured_logits(
         if key in payload
     }
     if native_prompt_logprobs:
+        paired_request = {}
+        if paired_request_path:
+            try:
+                with open(paired_request_path, encoding="utf-8") as handle:
+                    candidate_request = json.load(handle)
+                if isinstance(candidate_request, dict):
+                    paired_request = candidate_request
+            except (OSError, ValueError, TypeError):
+                paired_request = {}
         metadata.update({
             "capture_format": "vllm_text_completion_prompt_logprobs",
             "response_id": payload.get("id"),
@@ -376,6 +385,9 @@ def load_captured_logits(
             ),
             "paired_request_json": paired_request_path,
         })
+        prompt_logprobs_k = paired_request.get("prompt_logprobs")
+        if isinstance(prompt_logprobs_k, int) and not isinstance(prompt_logprobs_k, bool):
+            metadata["prompt_logprobs_top_k"] = max(1, prompt_logprobs_k)
     attention_mask = _first(payload, _MASK_KEYS)
     if attention_mask is not None:
         attention_mask = torch.as_tensor(attention_mask, dtype=torch.long)

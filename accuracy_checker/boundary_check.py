@@ -902,6 +902,12 @@ def _captured_display_tokenizer(model_path: str):
 
 
 def _captured_top_k(captured, framework_gen_config: Optional[Dict]) -> int:
+    capture_k = captured.metadata.get("prompt_logprobs_top_k")
+    try:
+        if capture_k is not None:
+            return max(1, int(capture_k))
+    except (TypeError, ValueError):
+        pass
     cfg = framework_gen_config or {}
     value = cfg.get("top_k")
     if value is None:
@@ -929,7 +935,7 @@ def _compare_captured_replay(
     if captured.has_full_logits:
         cap_collection = LogitsCollection(
             token_positions=list(captured.token_positions), logits=captured.logits,
-            input_ids=captured.input_ids, position_mode="captured_vllm",
+            input_ids=captured.input_ids, position_mode="captured_replay",
         )
         comparison = compare_logits(
             cap_collection, replay, tokenizer, top_k=top_k,
@@ -1000,6 +1006,10 @@ def _compare_captured_replay(
         "top1_total": len(top1),
         "top1_flip_positions": top1_flips,
         "top1_flip_count": len(top1_flips),
+        "topn_mismatch_counts": {
+            str(rank): len(positions)
+            for rank, positions in logits_data.topn_mismatch_positions.items()
+        },
         "low_margin_flip_positions": low_margin_flips,
         "low_margin_flip_count": len(low_margin_flips),
         "first_mismatch_position": mismatches[0] if mismatches else None,
