@@ -1034,7 +1034,18 @@ function logitsRanks(){
   if(ranks.length)return ranks;
   const maxK=Number(L.available_top_k||0);return [10,5,2,1].filter(k=>k<=Math.max(1,maxK));
 }
-function allLogitsPositions(){const L=R.logits||{};return (L.all_token_positions&&L.all_token_positions.length?L.all_token_positions:L.token_positions||[]).map(Number);}
+function allLogitsPositions(){
+  const L=R.logits||{},full=L.all_token_positions&&L.all_token_positions.length?L.all_token_positions:null;
+  if(full)return full.map(Number);
+  const detail=(L.token_positions||[]).map(Number),total=Number(L.total_positions||L.full_top1_total||0);
+  // Reports generated before all_token_positions was introduced still keep
+  // total_positions plus the full Top-N mismatch catalog.  Reconstruct the
+  // continuous captured sequence so their virtual list remains 0,1,2…;
+  // detailed probability rows stay compact and are not duplicated in DOM.
+  if(total>detail.length&&detail.length&&detail[0]===0&&detail[detail.length-1]<total)
+    return Array.from({length:total},(_,i)=>i);
+  return detail;
+}
 function lowerBound(a,x){let lo=0,hi=a.length;while(lo<hi){const mid=(lo+hi)>>1;if(a[mid]<x)lo=mid+1;else hi=mid;}return lo;}
 function ensureLogitsMaps(){
   const L=R.logits||{};if(logitsFullIndex&&logitsDetailIndex)return;

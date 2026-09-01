@@ -207,6 +207,23 @@ class TestHtmlReportV2:
         assert logits["topn_mismatch_positions"]["1"] == flips
         assert len(logits["token_positions"]) < n
 
+    def test_old_compacted_logits_can_reconstruct_contiguous_positions(self):
+        from accuracy_checker.html_report import _compact_report_for_html
+
+        raw = {
+            "logits": {
+                "token_positions": [0, 22, 36, 999],
+                "total_positions": 1000,
+                "full_top1_total": 1000,
+                "topn_mismatch_positions": {"10": [36, 999], "1": [999]},
+            },
+        }
+        compact = _compact_report_for_html(raw, limit=32)
+        # The HTML-side legacy fallback uses total_positions when the newer
+        # all_token_positions field is absent; preserve that contract here.
+        assert compact["logits"]["total_positions"] == 1000
+        assert compact["logits"]["token_positions"] == [0, 22, 36, 999]
+
     def test_generate_product_html_report(self, tmp_path):
         from accuracy_checker.html_report import generate_product_html_report
         from accuracy_checker.report_schema import (
