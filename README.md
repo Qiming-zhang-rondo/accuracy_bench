@@ -153,13 +153,13 @@ python3 run_accuracy_check.py --mode boundary \\
 reports/<模型名>_<模式>_<时间戳>/
 ```
 
-仓库根目录的 `latest.html` 指向 `reports/index.html`。直接用 `file://` 打开时浏览器只能读取报告，不能删除本地文件；需要同步释放磁盘时启动本地报告服务：
+仓库根目录的 `latest.html` 指向 `reports/index.html`。查看报告请统一启动专用报告服务；它会在启动时用当前代码重建 `latest.html`/历史索引，并提供历史删除和长序列 logits position 的按需 Top-K 明细加载。直接用 `file://` 或 `python3 -m http.server` 只能读取静态文件，不能使用这些动态功能（删除请求会返回 HTTP 501，未预加载 position 也无法加载概率图）：
 
 ```bash
-python3 serve_reports.py
+python3 serve_reports.py --host 0.0.0.0 --port 8765
 ```
 
-然后打开 `http://127.0.0.1:8765/latest.html`，在左侧历史记录上点击右键，选择“删除并释放本地文件”。服务只允许删除 `reports/` 内含 `report_data.json` 的独立运行目录，删除后会自动重建历史索引。远程机器需要端口转发时可改用 `--host 0.0.0.0 --port 8765`。
+然后打开 `http://127.0.0.1:8765/latest.html`，在左侧历史记录上点击右键，选择“删除并释放本地文件”。远程机器可把端口改为实际开放端口，例如 `--port 8766`，并使用 `http://<server_ip>:8766/latest.html`。服务只允许删除 `reports/` 内含 `report_data.json` 的独立运行目录，删除后会自动重建历史索引。
 
 ## 对比
 
