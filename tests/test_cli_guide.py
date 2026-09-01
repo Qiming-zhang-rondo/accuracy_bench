@@ -156,6 +156,11 @@ class TestCliGuide(unittest.TestCase):
         self.assertIn('id="numRuns" type="number" min="1" value="1"', self.html)
         self.assertIn('id="concurrency" type="number" min="1" value="1"', self.html)
         self.assertIn('line("--captured_request_json"', self.html)
+        self.assertIn(
+            'var boundaryPromptStdin = mode === "boundary"\n'
+            '          && el.boundaryIssueMode.value !== "intermittent"',
+            self.html,
+        )
 
     def test_report_runs_are_archived_and_latest_opens_history(self):
         run_source = RUN_SCRIPT.read_text(encoding="utf-8")

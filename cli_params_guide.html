@@ -1613,6 +1613,7 @@
         var visible = el.visibleDevices.value.trim() || "0,1";
         var recommendation = recommendedConfig(type, mode);
         var boundaryPromptStdin = mode === "boundary"
+          && el.boundaryIssueMode.value !== "intermittent"
           && !el.requestJson.value.trim()
           && !el.promptFile.value.trim()
           && el.prompt.value.trim();
