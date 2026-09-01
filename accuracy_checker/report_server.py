@@ -16,12 +16,13 @@ import shutil
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 
 logger = logging.getLogger(__name__)
 DELETE_ENDPOINT = "/__accuracy_bench__/delete-report"
 HEALTH_ENDPOINT = "/__accuracy_bench__/health"
+LOGITS_DETAIL_ENDPOINT = "/__accuracy_bench__/logits-detail"
 
 
 def _repo_root() -> str:
@@ -78,12 +79,47 @@ class ReportRequestHandler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
-        if urlparse(self.path).path == HEALTH_ENDPOINT:
+        parsed = urlparse(self.path)
+        if parsed.path == HEALTH_ENDPOINT:
             self._json_response(200, {
                 "ok": True,
                 "service": "accuracy_bench_report_server",
                 "delete_endpoint": DELETE_ENDPOINT,
             })
+            return
+        if parsed.path == LOGITS_DETAIL_ENDPOINT:
+            try:
+                query = parse_qs(parsed.query)
+                relative = unquote((query.get("report") or [""])[0]).replace("\\", "/")
+                position = int((query.get("position") or [""])[0])
+                if not relative or os.path.isabs(relative) or ".." in relative.split("/"):
+                    raise ValueError("invalid report path")
+                target = os.path.realpath(os.path.join(self.reports_root, relative))
+                reports_root = os.path.realpath(self.reports_root)
+                if os.path.commonpath([reports_root, target]) != reports_root:
+                    raise ValueError("report path is outside reports/")
+                if os.path.basename(target) != "boundary_result.json":
+                    raise ValueError("detail source must be boundary_result.json")
+                with open(target, encoding="utf-8") as f:
+                    raw = json.load(f)
+                data = ((raw.get("evidence") or {}).get("captured_logits_replay") or {}).get("logits_data")
+                if not isinstance(data, dict):
+                    raise ValueError("captured logits detail is unavailable")
+                positions = [int(x) for x in (data.get("token_positions") or [])]
+                try:
+                    index = positions.index(position)
+                except ValueError as exc:
+                    raise ValueError(f"position {position} is not in captured logits") from exc
+                row = {"position": position}
+                for key in ("ref_topk", "quant_topk", "ref_logits", "quant_logits",
+                            "token_wise_cos", "token_wise_kl", "token_wise_topk_overlap",
+                            "token_wise_top1_match", "ref_top1_margin", "quant_top1_margin"):
+                    values = data.get(key)
+                    if isinstance(values, list) and index < len(values):
+                        row[key] = values[index]
+                self._json_response(200, {"ok": True, "detail": row})
+            except (ValueError, json.JSONDecodeError, OSError) as exc:
+                self._json_response(404, {"error": str(exc)})
             return
         super().do_GET()
 
@@ -163,6 +199,6 @@ def main() -> None:
 
 
 __all__ = [
-    "DELETE_ENDPOINT", "HEALTH_ENDPOINT", "ReportRequestHandler",
+    "DELETE_ENDPOINT", "HEALTH_ENDPOINT", "LOGITS_DETAIL_ENDPOINT", "ReportRequestHandler",
     "delete_report_directory", "serve_reports",
 ]

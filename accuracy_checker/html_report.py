@@ -558,6 +558,7 @@ table.grid-tbl tr:hover td { background:var(--accent-soft); }
 .position-btn.topk-match { color:#176B55; border-color:#B8DCCB; background:#F1FAF5; }
 .position-btn.topk-partial { color:#8A5A08; border-color:#E7C783; background:#FFF7E3; }
 .position-btn.topk-mismatch { color:#fff; border-color:var(--bad); background:var(--bad); }
+.position-btn.topk-unknown { color:#66717F; border-color:#CBD5E1; background:#F8FAFC; }
 .position-btn.topn-filtered { color:#3730A3; border-color:#A5B4FC; background:#EEF2FF; }
 .position-btn.topk-match.active { color:#fff; background:var(--accent); border-color:var(--accent); }
 .position-btn.topk-partial.active { color:#fff; background:var(--warn); border-color:var(--warn); box-shadow:0 0 0 2px rgba(184,119,16,.20); }
@@ -592,7 +593,7 @@ table.grid-tbl tr:hover td { background:var(--accent-soft); }
   border-radius:8px; background:#fff; cursor:crosshair; }
 .logits-overview-legend { display:flex; gap:12px; flex-wrap:wrap; color:var(--muted); font-size:10px; margin-top:7px; }
 .virtual-position-card { padding:12px 14px; }
-.virtual-position-scroll { position:relative; height:238px; overflow:auto; margin-top:8px; border:1px solid var(--border);
+.virtual-position-scroll { position:relative; height:420px; overflow:auto; margin-top:8px; border:1px solid var(--border);
   border-radius:8px; background:#FAFBFC; contain:strict; }
 .virtual-position-spacer { position:relative; width:100%; }
 .virtual-position-layer { position:absolute; left:6px; right:6px; display:grid; gap:5px; align-items:center; }
@@ -1026,7 +1027,7 @@ function appendChart(root,s){const w=document.createElement("div");w.className="
 // LOGITS 可视化
 // ====================================================================
 let curPos=-1,logitsRankFilter=null,logitsRangeStart=null,logitsRangeEnd=null,logitsDataRef=null;
-let logitsSelectedPosition=null,logitsFullIndex=null,logitsDetailIndex=null,logitsMismatchSets=null,logitsVirtualPositions=[],logitsVirtualRaf=0;
+let logitsSelectedPosition=null,logitsFullIndex=null,logitsDetailIndex=null,logitsMismatchSets=null,logitsVirtualPositions=[],logitsVirtualRaf=0,logitsDetailLoads=new Map();
 const LOGITS_DETAIL_LINE_LIMIT=200,LOGITS_VIRTUAL_ROW_HEIGHT=32;
 function logitsRanks(){
   const L=R.logits||{},cat=L.topn_mismatch_positions||{};
@@ -1054,13 +1055,24 @@ function ensureLogitsMaps(){
   logitsMismatchSets={};logitsRanks().forEach(k=>logitsMismatchSets[String(k)]=new Set(mismatchPositions(k)));
 }
 function fullOverlapCount(position,k){
-  ensureLogitsMaps();const L=R.logits||{},i=logitsFullIndex.get(Number(position)),arr=(L.topn_overlap_counts||{})[String(k)];
-  if(i!==undefined&&Array.isArray(arr)&&i<arr.length)return Number(arr[i]);
-  const bad=(logitsMismatchSets||{})[String(k)]||new Set();return bad.has(Number(position))?Math.max(0,k-1):k;
+  ensureLogitsMaps();const L=R.logits||{},arr=(L.topn_overlap_counts||{})[String(k)];
+  const fi=logitsFullIndex.get(Number(position)),di=logitsDetailIndex.get(Number(position));
+  // New reports store overlap counts against all_token_positions.  Compact
+  // and legacy reports may instead retain counts only for token_positions;
+  // resolve both layouts by position instead of assuming the array index.
+  if(Array.isArray(arr)){
+    const all=allLogitsPositions(),detail=L.token_positions||[];
+    if(fi!==undefined&&arr.length===all.length&&fi<arr.length)return Number(arr[fi]);
+    if(di!==undefined&&arr.length===detail.length&&di<arr.length)return Number(arr[di]);
+    if(fi!==undefined&&fi<arr.length)return Number(arr[fi]);
+  }
+  const bad=(logitsMismatchSets||{})[String(k)];
+  if(bad instanceof Set && bad.size)return bad.has(Number(position))?Math.max(0,k-1):k;
+  return null;
 }
 function positionState(position,rankOverride){
-  const ranks=logitsRanks(),k=Number(rankOverride)>0?Number(rankOverride):(ranks[0]||1),top1=fullOverlapCount(position,1)>=1,overlap=fullOverlapCount(position,k);
-  return {kind:top1?(overlap>=k?"match":"partial"):"mismatch",top1:top1,overlap:overlap,k:k};
+  const ranks=logitsRanks(),k=Number(rankOverride)>0?Number(rankOverride):(ranks[0]||1),top1Count=fullOverlapCount(position,1),overlap=fullOverlapCount(position,k),top1=top1Count===null?null:top1Count>=1;
+  return {kind:top1===null?"unknown":(top1?(overlap===null?"unknown":(overlap>=k?"match":"partial")):"mismatch"),top1:top1,overlap:overlap,k:k};
 }
 function rankedIds(rows,side,k){
   const key=side==="ref"?"ref_prob":"quant_prob";
@@ -1101,9 +1113,27 @@ function chooseFirstVisible(){
   }
   curPos=logitsDetailIndex.has(Number(logitsSelectedPosition))?logitsDetailIndex.get(Number(logitsSelectedPosition)):-1;
 }
-function selectLogicalPosition(position){
+function insertCapturedDetail(row){
+  const L=R.logits||{},position=Number(row.position),positions=(L.token_positions||[]).map(Number);
+  if(!Number.isFinite(position))return -1;
+  const existing=positions.indexOf(position);if(existing>=0)return existing;
+  const at=lowerBound(positions,position),fields=["ref_topk","quant_topk","ref_logits","quant_logits","token_wise_cos","token_wise_kl","token_wise_topk_overlap","token_wise_top1_match","ref_top1_margin","quant_top1_margin"];
+  L.token_positions=L.token_positions||[];L.token_positions.splice(at,0,position);
+  fields.forEach(key=>{const values=L[key]||[];values.splice(at,0,Object.prototype.hasOwnProperty.call(row,key)?row[key]:(key.endsWith("_match")?null:null));L[key]=values;});
+  logitsFullIndex=null;logitsDetailIndex=null;logitsMismatchSets=null;ensureLogitsMaps();return at;
+}
+async function loadCapturedPositionDetails(position){
+  const L=R.logits||{},path=R._logits_detail_path;if(L.position_mode!=="captured_replay"||!path)return -1;
+  const p=Number(position);if(logitsDetailIndex&&logitsDetailIndex.has(p))return logitsDetailIndex.get(p);
+  if(logitsDetailLoads.has(p))return logitsDetailLoads.get(p);
+  const promise=fetch("/__accuracy_bench__/logits-detail?report="+encodeURIComponent(path)+"&position="+encodeURIComponent(p),{cache:"no-store"})
+    .then(resp=>resp.ok?resp.json():null).then(payload=>{const row=payload&&payload.detail;return row?insertCapturedDetail(row):-1;}).catch(()=>-1);
+  logitsDetailLoads.set(p,promise);return promise;
+}
+function selectLogicalPosition(position,loadMissing=true){
   ensureLogitsMaps();logitsSelectedPosition=Number(position);curPos=logitsDetailIndex.has(logitsSelectedPosition)?logitsDetailIndex.get(logitsSelectedPosition):-1;
   renderLogitsFilter();renderLogitsOverview();renderVirtualWindow();renderTopK(curPos);renderLines();
+  if(loadMissing&&curPos<0){loadCapturedPositionDetails(logitsSelectedPosition).then(index=>{if(index>=0&&Number(logitsSelectedPosition)===Number(position)){curPos=index;renderLogitsFilter();renderVirtualWindow();renderTopK(index);renderLines();}});}
 }
 function refreshLogitsViews(selectFirst){if(selectFirst)chooseFirstVisible();renderLogitsFilter();renderLogitsOverview();renderVirtualPositions(true);renderBranchCandidate();renderTopK(curPos);renderLines();}
 function renderLogitsFilter(){
@@ -1141,8 +1171,8 @@ function renderLogitsOverview(){
   canvas.style.width=cssW+"px";canvas.width=cssW*dpr;canvas.height=cssH*dpr;const ctx=canvas.getContext("2d");ctx.scale(dpr,dpr);ctx.clearRect(0,0,cssW,cssH);
   const top=8,graphBottom=45,stripTop=57,stripBottom=80,step=Math.max(1,scale);ctx.font="10px sans-serif";ctx.fillStyle=C.muted;ctx.fillText("1.0",4,top+4);ctx.fillText("0.5",4,(top+graphBottom)/2+3);ctx.fillText("0.0",4,graphBottom+3);
   ctx.strokeStyle=C.border;ctx.lineWidth=1;[top,(top+graphBottom)/2,graphBottom].forEach(y=>{ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(cssW,y);ctx.stroke();});
-  let previousY=null;for(let j=begin;j<end;j++){const st=positionState(positions[j],rank),x=(j-begin)*step,yy=graphBottom-(graphBottom-top)*(st.overlap/st.k);
-    ctx.fillStyle=st.top1?(st.overlap>=st.k?"#B8DCCB":"#E7C783"):"#A53939";ctx.fillRect(x,stripTop,step,stripBottom-stripTop);
+  let previousY=null;for(let j=begin;j<end;j++){const st=positionState(positions[j],rank),x=(j-begin)*step,ratio=st.overlap===null?null:st.overlap/st.k,yy=ratio===null?graphBottom:graphBottom-(graphBottom-top)*ratio;
+    ctx.fillStyle=st.kind==="match"?"#B8DCCB":(st.kind==="partial"?"#E7C783":(st.kind==="mismatch"?"#A53939":"#CBD5E1"));ctx.fillRect(x,stripTop,step,stripBottom-stripTop);
     ctx.strokeStyle=C.topk;ctx.lineWidth=1;if(previousY===null)ctx.beginPath(),ctx.moveTo(x,yy);else ctx.lineTo(x,yy);previousY=yy;}
   if(count){ctx.stroke();ctx.fillStyle=C.muted;ctx.fillText(String(positions[begin]),4,98);const endText=String(positions[end-1]),tw=ctx.measureText(endText).width;ctx.fillText(endText,cssW-tw-4,98);}
   const branch=(((R.overview||{}).captured_replay||{}).branch_candidate||{}).position;
@@ -1166,7 +1196,7 @@ function renderVirtualWindow(){
   const startRow=Math.max(0,Math.floor(scroller.scrollTop/LOGITS_VIRTUAL_ROW_HEIGHT)-2),visibleRows=Math.ceil(scroller.clientHeight/LOGITS_VIRTUAL_ROW_HEIGHT)+4,end=Math.min(logitsVirtualPositions.length,(startRow+visibleRows)*cols),start=startRow*cols;
   layer.style.top=(startRow*LOGITS_VIRTUAL_ROW_HEIGHT+6)+"px";layer.style.gridTemplateColumns="repeat("+cols+",minmax(0,1fr))";layer.innerHTML="";
   for(let index=start;index<end;index++){const position=logitsVirtualPositions[index],state=positionState(position,logitsRankFilter),button=document.createElement("button");button.type="button";
-    button.className="position-btn topk-"+state.kind+(Number(position)===Number(logitsSelectedPosition)?" active":"");button.textContent=String(position);button.title="Position "+position+" · Top-1 "+(state.top1?"一致":"翻转")+" · Top-"+state.k+" overlap="+state.overlap+"/"+state.k;
+    button.className="position-btn topk-"+state.kind+(Number(position)===Number(logitsSelectedPosition)?" active":"");button.textContent=String(position);button.title="Position "+position+" · "+(state.top1===null?"状态未记录":(state.top1?"Top-1 一致":"Top-1 翻转"))+" · Top-"+state.k+" overlap="+(state.overlap===null?"未记录":state.overlap+"/"+state.k);
     button.addEventListener("click",()=>selectLogicalPosition(position));layer.appendChild(button);}
 }
 function scrollVirtualToPosition(position){
@@ -1197,7 +1227,7 @@ function renderLogits(){
     const reason=(R.overview&&R.overview.logits_error)||"未采集 logits 对比";
     root.innerHTML='<div class="empty"><div class="empty-icon">—</div><div class="empty-text">未采集 logits 对比</div><div class="empty-hint">'+esc(reason)+'</div></div>';return;
   }
-  if(logitsDataRef!==L){logitsDataRef=L;curPos=-1;logitsRankFilter=null;logitsRangeStart=null;logitsRangeEnd=null;logitsSelectedPosition=null;logitsFullIndex=null;logitsDetailIndex=null;logitsMismatchSets=null;}
+  if(logitsDataRef!==L){logitsDataRef=L;curPos=-1;logitsRankFilter=null;logitsRangeStart=null;logitsRangeEnd=null;logitsSelectedPosition=null;logitsFullIndex=null;logitsDetailIndex=null;logitsMismatchSets=null;logitsDetailLoads=new Map();}
   if(curPos<0||curPos>=L.token_positions.length){
     const cr=(R.overview||{}).captured_replay||{};
     const diagnosticPos=cr.first_mismatch_position==null?cr.first_top1_flip_position:cr.first_mismatch_position;
@@ -1325,9 +1355,9 @@ function avgKL(){const k=R.logits.token_wise_kl||[];const f=k.map(x=>num(x)).fil
 function renderCapturedPositionWithoutDetails(root,position){
   const L=R.logits,state=positionState(position,logitsRankFilter),inputRow=(L.input_ids||[])[0]||[],targetIndex=Number(position)+1,targetId=targetIndex<inputRow.length?Number(inputRow[targetIndex]):null;
   const gen=inputRow.slice(0,Math.min(inputRow.length,Number(position)+1)),recap=inputRow.slice(0,Math.min(inputRow.length,Number(position)+2)),card=document.createElement("div");card.className="card";
-  const badge=state.top1?'<span class="pill '+(state.overlap>=state.k?'ok':'warn')+'">Top-1 一致</span>':'<span class="pill bad">Top-1 翻转</span>';
-  card.innerHTML='<h3>Position '+position+' · 全量状态 '+badge+'</h3><div class="tip">Top-'+state.k+' overlap='+state.overlap+'/'+state.k+' · 固定 request 目标 token #'+(targetId===null?'—':targetId)
-    +'。该 position 的完整概率对象未嵌入轻量 HTML；状态与复现前缀仍来自全量比较结果。</div><div class="replay-next-step"><b>下一步：</b>生成边界使用 <code>input_ids[:'+(Number(position)+1)+']</code>；重新采集固定目标 token 使用 <code>input_ids[:'+(Number(position)+2)+']</code>。'
+  const badge=state.top1===null?'<span class="pill">状态未记录</span>':(state.top1?'<span class="pill '+(state.overlap!==null&&state.overlap>=state.k?'ok':'warn')+'">Top-1 一致</span>':'<span class="pill bad">Top-1 翻转</span>');
+  card.innerHTML='<h3>Position '+position+' · 全量状态 '+badge+'</h3><div class="tip">Top-'+state.k+' overlap='+(state.overlap===null?'未记录':state.overlap+'/'+state.k)+' · 固定 request 目标 token #'+(targetId===null?'—':targetId)
+    +'。'+(R._logits_detail_path?'正在从原始 boundary_result.json 加载该 position 的概率明细…':'该 position 的完整概率对象未嵌入轻量 HTML；状态与复现前缀仍来自全量比较结果。')+'</div><div class="replay-next-step"><b>下一步：</b>生成边界使用 <code>input_ids[:'+(Number(position)+1)+']</code>；重新采集固定目标 token 使用 <code>input_ids[:'+(Number(position)+2)+']</code>。'
     +'<div class="replay-actions"><button id="logical-copy-gen">复制生成前缀 token IDs</button><button id="logical-copy-recap">复制 prompt_logprobs 请求片段</button></div></div>';
   root.innerHTML="";root.appendChild(card);el("logical-copy-gen").addEventListener("click",event=>copyReportText(JSON.stringify(gen),event.currentTarget));
   el("logical-copy-recap").addEventListener("click",event=>copyReportText(JSON.stringify({prompt:recap,max_tokens:1,stream:false,prompt_logprobs:Number(L.available_top_k||state.k)},null,2),event.currentTarget));
@@ -1395,16 +1425,17 @@ function renderTopK(i){
   pageIndices.forEach(j=>{const p=L.token_positions[j];const b=document.createElement("button");b.type="button";
     const overlap=num(overlapArr[j]);
     const top1Match=top1Arr[j];
-    const stateClass=L.position_mode==="captured_replay"?(shownK===1?" topk-mismatch":" topn-filtered"):(overlap===null?"":(top1Match===false?" topk-mismatch":(overlap<1?" topk-partial":" topk-match")));
+    const capturedState=L.position_mode==="captured_replay"?positionState(p,shownK):null;
+    const stateClass=L.position_mode==="captured_replay"?(capturedState?" topk-"+capturedState.kind:" topk-unknown"):(overlap===null?"":(top1Match===false?" topk-mismatch":(overlap<1?" topk-partial":" topk-match")));
     b.className="position-btn"+stateClass+(curPos===j?" active":"");
     b.textContent=String(p)+(L.position_mode==="prompt_prefill"&&j===L.token_positions.length-1?" · decode":"");
-    const stateText=L.position_mode==="captured_replay"?("Top-"+shownK+" 候选集合不一致"+(top1Match===false?"；Top-1 也不一致":"；Top-1 一致")):(overlap===null?"Top-K overlap 未记录":(top1Match===false?"Top-1 不一致":(overlap<1?"Top-1 一致，Top-K 部分重合":"Top-K 完全一致")));
+    const stateText=L.position_mode==="captured_replay"?(capturedState&&capturedState.kind==="unknown"?"Top-K 状态未记录":(capturedState.top1===false?"Top-1 不一致":(capturedState.overlap<shownK?"Top-1 一致，Top-K 部分重合":"Top-K 完全一致"))):(overlap===null?"Top-K overlap 未记录":(top1Match===false?"Top-1 不一致":(overlap<1?"Top-1 一致，Top-K 部分重合":"Top-K 完全一致")));
     b.setAttribute("aria-label","Position "+p+"，"+stateText);
     b.title=stateText+(overlap!==null?"（完整 Top-K overlap="+overlap.toFixed(3)+"）":"");
     b.addEventListener("click",()=>window.__selPos(j));picker.appendChild(b);});
   if(pageIndices.length)card.appendChild(picker);
   const pickerNote=document.createElement("div");pickerNote.className="tip";
-  pickerNote.innerHTML=L.position_mode==="captured_replay"?((shownK===1?'<span class="legend-chip" style="background:#A53939"></span>红色=Top-1 实际选择翻转':'<span class="legend-chip" style="background:#4F46E5"></span>靛蓝=Top-'+shownK+' 备选集合不一致')
+  pickerNote.innerHTML=L.position_mode==="captured_replay"?('<span class="legend-chip" style="background:#A53939"></span>红色=Top-1 翻转 · <span class="legend-chip" style="background:#E7C783"></span>黄色=Top-1 一致但 Top-'+shownK+' 不完全重合 · <span style="color:#176B55">绿色=Top-'+shownK+' 完全一致</span>'
     +' · 使用上方全量虚拟列表切换 position'
     +(L.display_sampled?' · 全量筛选计数准确；概率明细保留 '+L.token_positions.length+'/'+L.total_positions+' 个诊断 position':'')):
     ('<span class="legend-chip" style="background:#A53939"></span>红色=Top-1 不一致 · <span class="legend-chip" style="background:#B87710"></span>黄色=Top-1 一致但 Top-K 未完全重合 · <span style="color:#176B55">绿色=Top-K 完全一致</span>');
@@ -1883,6 +1914,11 @@ def _scan_sibling_reports(output_path: str, current_data: ReportData):
     runs = []
     # 当前报告先放进去 (内存数据, 可能 JSON 还没写)
     current_raw = _compact_report_for_html(current_data.to_dict())
+    current_boundary = os.path.join(out_dir, "boundary_result.json")
+    if os.path.isfile(current_boundary):
+        current_raw["_logits_detail_path"] = os.path.relpath(
+            current_boundary, reports_root
+        ).replace(os.sep, "/")
     current_meta = _extract_report_meta(current_data, current_raw, current_dir_name)
     current_meta.update({
         "dir": current_dir_name,
@@ -1901,6 +1937,11 @@ def _scan_sibling_reports(output_path: str, current_data: ReportData):
                 raw = json.load(f)
             from .report_schema import ReportData as _RD
             html_raw = _compact_report_for_html(raw)
+            boundary_path = os.path.join(os.path.dirname(jf), "boundary_result.json")
+            if os.path.isfile(boundary_path):
+                html_raw["_logits_detail_path"] = os.path.relpath(
+                    boundary_path, reports_root
+                ).replace(os.sep, "/")
             rd = _RD.from_dict(html_raw)
             mtime = os.path.getmtime(jf)
             meta = _extract_report_meta(rd, html_raw, jf_dir)
@@ -1977,7 +2018,15 @@ def generate_product_html_report(
         os.makedirs(reports_dir, exist_ok=True)
         output_path = os.path.join(reports_dir, f"product_report_{safe_model}_{ts}.html")
 
-    json_blob = _embed_json_safe(_compact_report_for_html(report_data.to_dict()))
+    compact_data = _compact_report_for_html(report_data.to_dict())
+    report_dir = os.path.dirname(os.path.abspath(output_path))
+    reports_root = os.path.dirname(report_dir)
+    boundary_path = os.path.join(report_dir, "boundary_result.json")
+    if os.path.isfile(boundary_path) and os.path.basename(reports_root) == "reports":
+        compact_data["_logits_detail_path"] = os.path.relpath(
+            boundary_path, reports_root
+        ).replace(os.sep, "/")
+    json_blob = _embed_json_safe(compact_data)
     title = f"acc_bench 精度对齐报告 - {ov.model_name or '—'}"
 
     # --- 侧边栏: 扫描兄弟报告 ---
@@ -2147,6 +2196,11 @@ def generate_index_html(reports_dir: str, output_path: Optional[str] = None) -> 
             with open(jf, encoding="utf-8") as f:
                 raw = json.load(f)
             html_raw = _compact_report_for_html(raw)
+            boundary_path = os.path.join(os.path.dirname(jf), "boundary_result.json")
+            if os.path.isfile(boundary_path):
+                html_raw["_logits_detail_path"] = os.path.relpath(
+                    boundary_path, reports_dir
+                ).replace(os.sep, "/")
             rd = ReportData.from_dict(html_raw)
             mtime = os.path.getmtime(jf)
             ts_str = time.strftime("%m-%d %H:%M", time.localtime(mtime))
