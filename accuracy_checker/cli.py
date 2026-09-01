@@ -61,8 +61,10 @@ def main():
                         help="[boundary] reproducible（默认）或 intermittent captured logits replay")
     parser.add_argument("--captured_logits_json", default=None,
                         help=("[boundary/intermittent] vLLM 现场 captured logits JSON；"
-                              "原生 text_completion prompt_logprobs 响应需包含 "
-                              "prompt_token_ids (return_token_ids=true)"))
+                              "支持原生 text_completion prompt_logprobs 响应"))
+    parser.add_argument("--captured_request_json", default=None,
+                        help=("[boundary/intermittent] 配对的 vLLM 请求 JSON；"
+                              "prompt 必须是 token-ID 数组"))
     parser.add_argument("--boundary_logits_cos_threshold", type=float, default=0.99)
     parser.add_argument("--boundary_logits_kl_threshold", type=float, default=0.05)
     parser.add_argument("--boundary_logits_margin_threshold", type=float, default=0.05)

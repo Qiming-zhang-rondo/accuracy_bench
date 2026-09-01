@@ -517,6 +517,7 @@ def run_boundary(
     print_full_output: bool = False,
     boundary_issue_mode: str = "reproducible",
     captured_logits_json: Optional[str] = None,
+    captured_request_json: Optional[str] = None,
     boundary_logits_cos_threshold: float = 0.99,
     boundary_logits_kl_threshold: float = 0.05,
     boundary_logits_margin_threshold: float = 0.05,
@@ -536,8 +537,9 @@ def run_boundary(
     vs"base-model 本征"(→ BOTH); 不给则只比 framework vs transformers(quant)。
 
     ``boundary_issue_mode="intermittent"`` 不启动部署框架，也不重新生成文本；
-    它读取 ``captured_logits_json`` 中的 input_ids/positions 和现场 logits，
-    让 Transformers quant checkpoint 在完全相同 token 序列上 replay 一次。
+    它读取 ``captured_logits_json`` 中的 positions 和现场 logits；input_ids
+    可来自响应的 prompt_token_ids，或 ``captured_request_json`` 中已经是
+    token-ID 数组的 prompt。Transformers 在完全相同 token 序列上 replay。
 
     生效条件:
       - 量化模型 → hf_inference_check 内 NPU 加速反量化路径 (CPU fallback 未回迁)
@@ -566,7 +568,9 @@ def run_boundary(
             )
         try:
             from .captured_logits import load_captured_logits
-            captured = load_captured_logits(captured_logits_json)
+            captured = load_captured_logits(
+                captured_logits_json, request_path=captured_request_json,
+            )
         except Exception as exc:
             return _invalid(
                 f"captured logits JSON 加载失败: {exc}", framework_name,
@@ -648,6 +652,7 @@ def run_boundary(
         "chat_template_mode": chat_template_mode,
         "boundary_issue_mode": boundary_issue_mode,
         "captured_logits_json": captured_logits_json,
+        "captured_request_json": captured_request_json,
         "resident_experts": os.getenv("ACC_BOUNDARY_RESIDENT_EXPERTS", "1") != "0",
         "expert_cache_per_layer": int(
             os.getenv("ACC_BOUNDARY_EXPERT_CACHE_PER_LAYER", "16")),
@@ -672,7 +677,10 @@ def run_boundary(
             "has_full_logits": captured.has_full_logits,
             "metadata": captured.metadata,
         }
-        evidence["replay_input_ids_source"] = "captured JSON (no tokenize/chat_template)"
+        evidence["replay_input_ids_source"] = (
+            captured.metadata.get("input_ids_source")
+            or "captured JSON (no tokenize/chat_template)"
+        )
 
         fw_reproduced = _boundary_detect_framework(
             framework_bad_reproduced, framework_bad_output, bad_pattern,
@@ -1180,6 +1188,7 @@ def run_boundary_cli(args):
         chat_template_mode=getattr(args, "chat_template_mode", "auto"),
         boundary_issue_mode=getattr(args, "boundary_issue_mode", "reproducible"),
         captured_logits_json=getattr(args, "captured_logits_json", None),
+        captured_request_json=getattr(args, "captured_request_json", None),
         boundary_logits_cos_threshold=getattr(args, "boundary_logits_cos_threshold", 0.99),
         boundary_logits_kl_threshold=getattr(args, "boundary_logits_kl_threshold", 0.05),
         boundary_logits_margin_threshold=getattr(args, "boundary_logits_margin_threshold", 0.05),

@@ -255,8 +255,13 @@ def parse_args():
     parser.add_argument(
         "--captured_logits_json", type=str, default=None,
         help=("[boundary/intermittent] vLLM 现场 logits JSON；支持原生 "
-              "text_completion prompt_logprobs 响应（需 return_token_ids=true），"
+              "text_completion prompt_logprobs 响应，"
               "或含 input_ids/positions/full logits/Top-K 的通用格式"),
+    )
+    parser.add_argument(
+        "--captured_request_json", type=str, default=None,
+        help=("[boundary/intermittent] 与 captured logits 配对的 vLLM 请求 JSON；"
+              "当响应不含 prompt_token_ids 时，从 token-ID 数组 prompt 读取精确输入"),
     )
     parser.add_argument("--boundary_logits_cos_threshold", type=float, default=0.99,
                         help="[boundary/intermittent] cosine 明显偏差阈值")
@@ -871,6 +876,7 @@ def _mode_boundary(args):
         print_full_output=getattr(args, "print_full_output", False),
         boundary_issue_mode=getattr(args, "boundary_issue_mode", "reproducible"),
         captured_logits_json=getattr(args, "captured_logits_json", None),
+        captured_request_json=getattr(args, "captured_request_json", None),
         boundary_logits_cos_threshold=getattr(args, "boundary_logits_cos_threshold", 0.99),
         boundary_logits_kl_threshold=getattr(args, "boundary_logits_kl_threshold", 0.05),
         boundary_logits_margin_threshold=getattr(args, "boundary_logits_margin_threshold", 0.05),

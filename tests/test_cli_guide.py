@@ -60,6 +60,7 @@ class TestCliGuide(unittest.TestCase):
             "stopOnFirstBadcase", "repeat4gramMax", "nonprintableMax",
             "chatTemplateMode", "deepseekV4QueryBlock", "deepseekV4KeyBlock",
             "boundaryIssueMode", "capturedLogitsJson", "capturedLogitsField",
+            "capturedRequestJson", "capturedRequestField",
         }
         self.assertTrue(required.issubset(self.parser.ids))
 
@@ -154,6 +155,7 @@ class TestCliGuide(unittest.TestCase):
         self.assertIn('line("--deepseek_v4_key_block"', boundary_build)
         self.assertIn('id="numRuns" type="number" min="1" value="1"', self.html)
         self.assertIn('id="concurrency" type="number" min="1" value="1"', self.html)
+        self.assertIn('line("--captured_request_json"', self.html)
 
     def test_report_runs_are_archived_and_latest_opens_history(self):
         run_source = RUN_SCRIPT.read_text(encoding="utf-8")

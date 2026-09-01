@@ -3,8 +3,9 @@
 The capture format is intentionally permissive: existing tools use slightly
 different names (``positions``/``token_positions`` and ``logits``/
 ``captured_logits``).  Native vLLM ``text_completion`` responses containing
-``choices[0].prompt_logprobs`` are accepted directly when the response also
-contains ``prompt_token_ids`` (produced by ``return_token_ids=true``).  The
+``choices[0].prompt_logprobs`` are accepted directly.  Exact input IDs may
+come from response ``prompt_token_ids`` (produced by ``return_token_ids=true``)
+or a paired vLLM request whose ``prompt`` is already a token-ID array.  The
 normalized object always has the recorded input ids and positions; full
 vocabulary logits are optional.
 """
@@ -12,6 +13,7 @@ vocabulary logits are optional.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -99,16 +101,44 @@ def _as_input_ids(value: Any) -> torch.Tensor:
     return ids.cpu()
 
 
-def _vllm_prompt_input_ids(payload: Dict[str, Any]) -> torch.Tensor:
-    value = _first(payload, _ID_KEYS)
-    if value is None:
+def _request_prompt_input_ids(path: str) -> torch.Tensor:
+    with open(path, encoding="utf-8") as handle:
+        request = json.load(handle)
+    if not isinstance(request, dict):
+        raise ValueError("paired vLLM request JSON must be an object")
+    prompt = request.get("prompt")
+    if (
+        isinstance(prompt, list)
+        and len(prompt) == 1
+        and isinstance(prompt[0], list)
+    ):
+        prompt = prompt[0]
+    if not isinstance(prompt, list) or not prompt or not all(
+        isinstance(token_id, int) and not isinstance(token_id, bool)
+        for token_id in prompt
+    ):
         raise ValueError(
-            "vLLM prompt_logprobs response missing prompt_token_ids; "
-            "prompt_logprobs[0] is null, so the first prompt token cannot be "
-            "reconstructed exactly. Re-run the vLLM request with "
-            "return_token_ids=true, or add the exact prompt_token_ids to this JSON"
+            "paired vLLM request must contain prompt as a non-empty token-ID "
+            "array; text prompts are not re-tokenized in exact replay mode"
         )
-    return _as_input_ids(value)
+    return _as_input_ids(prompt)
+
+
+def _vllm_prompt_input_ids(
+    payload: Dict[str, Any], request_path: Optional[str] = None,
+) -> torch.Tensor:
+    value = _first(payload, _ID_KEYS)
+    if value is not None:
+        return _as_input_ids(value)
+    if request_path:
+        return _request_prompt_input_ids(request_path)
+    raise ValueError(
+        "vLLM prompt_logprobs response missing prompt_token_ids; "
+        "prompt_logprobs[0] is null, so the first prompt token cannot be "
+        "reconstructed exactly. Provide --captured_request_json whose prompt "
+        "is a token-ID array, place logprob_request.json beside the response, "
+        "or re-run vLLM with return_token_ids=true"
+    )
 
 
 def _records_payload(records: Any):
@@ -241,7 +271,9 @@ def _normalize_topk(raw: Any) -> Optional[List[List[CapturedToken]]]:
     return out
 
 
-def load_captured_logits(path: str) -> CapturedLogits:
+def load_captured_logits(
+    path: str, request_path: Optional[str] = None,
+) -> CapturedLogits:
     with open(path, encoding="utf-8") as handle:
         raw = json.load(handle)
     payload = _unwrap(raw)
@@ -249,6 +281,16 @@ def load_captured_logits(path: str) -> CapturedLogits:
         payload.get("_capture_format")
         == "vllm_text_completion_prompt_logprobs"
     )
+    paired_request_path = None
+    if native_prompt_logprobs and _first(payload, _ID_KEYS) is None:
+        paired_request_path = request_path
+        if paired_request_path is None:
+            candidate = os.path.join(os.path.dirname(os.path.abspath(path)),
+                                     "logprob_request.json")
+            if os.path.isfile(candidate):
+                paired_request_path = candidate
+        if paired_request_path is not None:
+            paired_request_path = os.path.abspath(paired_request_path)
     record_data = _records_payload(payload.get("records"))
 
     if record_data is not None:
@@ -260,7 +302,7 @@ def load_captured_logits(path: str) -> CapturedLogits:
         topk_raw = record_topk
     else:
         input_ids = (
-            _vllm_prompt_input_ids(payload)
+            _vllm_prompt_input_ids(payload, paired_request_path)
             if native_prompt_logprobs
             else _as_input_ids(_first(payload, _ID_KEYS))
         )
@@ -328,6 +370,11 @@ def load_captured_logits(path: str) -> CapturedLogits:
             "response_id": payload.get("id"),
             "response_text": payload.get("text"),
             "finish_reason": payload.get("finish_reason"),
+            "input_ids_source": (
+                "paired_request_prompt_ids"
+                if paired_request_path else "response_prompt_token_ids"
+            ),
+            "paired_request_json": paired_request_path,
         })
     attention_mask = _first(payload, _MASK_KEYS)
     if attention_mask is not None:
