@@ -899,7 +899,10 @@ def _mode_boundary(args):
         logger.info(
             "    captured replay positions=%d top1=%s/%s cosine=%s KL=%s overlap=%s"
             % (
-                len(replay_summary.get("compared_positions", [])),
+                replay_summary.get(
+                    "compared_position_count",
+                    len(replay_summary.get("compared_positions", [])),
+                ),
                 replay_summary.get("top1_match_count", 0),
                 replay_summary.get("top1_total", 0),
                 replay_summary.get("mean_cosine", "n/a"),
@@ -932,6 +935,7 @@ def _mode_boundary(args):
     # actual Quant-only (or Ref/Quant) generation in latest.html.
     try:
         from accuracy_checker import assemble_report, generate_index_html, generate_product_html_report
+        from accuracy_checker.html_report import compact_report_for_html
         quant_runs = transformers_runs.get("quant", {}).get("runs", [])
         ref_runs = transformers_runs.get("ref", {}).get("runs", [])
         boundary_runs = list(quant_runs) + list(ref_runs)
@@ -945,11 +949,20 @@ def _mode_boundary(args):
         inference_compare = _build_inference_compare_from_boundary(
             d, quant, prompt=prompt_text, ref_model_path=args.ref_model
         )
+        captured_summary = d.get("evidence", {}).get("captured_logits_replay")
+        compact_payload = compact_report_for_html({
+            "overview": {"captured_replay": captured_summary or {}},
+            "logits": (
+                (captured_summary or {}).get("logits_data")
+                if getattr(args, "boundary_issue_mode", "reproducible") == "intermittent"
+                else None
+            ),
+        })
         report_data = assemble_report(
             boundary_result=boundary_runs,
             inference_compare_data=inference_compare,
             logits_comparison=(
-                d.get("evidence", {}).get("captured_logits_replay", {}).get("logits_data")
+                compact_payload.get("logits")
                 if getattr(args, "boundary_issue_mode", "reproducible") == "intermittent"
                 else None
             ),
@@ -968,9 +981,10 @@ def _mode_boundary(args):
         # assemble_report has no per-run entry for intermittent replay, so
         # preserve the authoritative Boundary verdict explicitly in overview.
         report_data.overview.boundary_result = d.get("boundary_result")
-        captured_summary = d.get("evidence", {}).get("captured_logits_replay")
         if captured_summary:
-            report_data.overview.captured_replay = dict(captured_summary)
+            report_data.overview.captured_replay = dict(
+                compact_payload.get("overview", {}).get("captured_replay") or {}
+            )
             report_data.overview.captured_replay.pop("logits_data", None)
         report_json_path = os.path.join(out_dir, "report_data.json")
         with open(report_json_path, "w", encoding="utf-8") as f:

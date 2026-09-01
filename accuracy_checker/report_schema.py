@@ -146,6 +146,10 @@ class LogitsData:
     # generation: autoregressive decode steps; prompt_prefill: prompt token
     # positions whose final row predicts the first generated token.
     position_mode: str = "unknown"
+    total_positions: int = 0                  # 后端实际比较位置总数
+    display_sampled: bool = False             # HTML 是否仅展示诊断采样位置
+    full_top1_total: int = 0                  # 全量 Top-1 统计分母
+    full_top1_match_count: int = 0            # 全量 Top-1 一致数
     ref_topk: List[List[TokenProb]] = field(default_factory=list)   # 每 position top-k (并排柱状图原料)
     quant_topk: List[List[TokenProb]] = field(default_factory=list)
     ref_logits: List[float] = field(default_factory=list)            # 每 position ref argmax logit (折线)
@@ -331,6 +335,10 @@ def _build_logits(d: Optional[Dict[str, Any]]) -> Optional[LogitsData]:
         input_ids=[list(row) if isinstance(row, (list, tuple)) else []
                    for row in (d.get("input_ids") or [])],
         position_mode=str(d.get("position_mode") or "unknown"),
+        total_positions=int(d.get("total_positions") or 0),
+        display_sampled=bool(d.get("display_sampled", False)),
+        full_top1_total=int(d.get("full_top1_total") or 0),
+        full_top1_match_count=int(d.get("full_top1_match_count") or 0),
         ref_topk=[[_build_token_prob(x) for x in pos] for pos in d.get("ref_topk") or []],
         quant_topk=[[_build_token_prob(x) for x in pos] for pos in d.get("quant_topk") or []],
         ref_logits=list(d.get("ref_logits") or []),

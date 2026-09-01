@@ -744,7 +744,7 @@ function renderOverview(){
     capturedPanel='<div class="card" style="margin-top:12px;border-left:3px solid '+(verdictCls==="ok"?C.good:(verdictCls==="warn"?C.warn:C.bad))+'">'
       +'<h3>Captured vLLM vs Transformers Replay</h3>'
       +'<div class="scope-meta"><span class="pill muted">'+esc(cr.input_token_count||0)+' input tokens</span>'
-      +'<span class="pill muted">'+esc((cr.compared_positions||[]).length)+' positions</span>'
+      +'<span class="pill muted">'+esc(cr.compared_position_count==null?(cr.compared_positions||[]).length:cr.compared_position_count)+' positions</span>'
       +'<span class="pill '+verdictCls+'">'+esc(verdict)+'</span></div>'
       +'<div class="kv" style="margin-top:8px"><span class="k">Top-1 match</span><span class="v">'+esc(cr.top1_match_count||0)+' / '+esc(cr.top1_total||0)+'</span>'
       +'<span class="k">Mean cosine</span><span class="v">'+cosVal+'</span>'
@@ -986,12 +986,19 @@ function renderLogits(){
     root.innerHTML='<div class="empty"><div class="empty-icon">—</div><div class="empty-text">未采集 logits 对比</div><div class="empty-hint">'+esc(reason)+'</div></div>';return;
   }
   if(curPos<0||curPos>=L.token_positions.length){
-    curPos=L.position_mode==="prompt_prefill"?L.token_positions.length-1:0;
+    const cr=(R.overview||{}).captured_replay||{};
+    const diagnosticPos=cr.first_mismatch_position==null?cr.first_top1_flip_position:cr.first_mismatch_position;
+    const diagnosticIndex=diagnosticPos==null?-1:L.token_positions.indexOf(Number(diagnosticPos));
+    curPos=diagnosticIndex>=0?diagnosticIndex:(L.position_mode==="prompt_prefill"?L.token_positions.length-1:0);
   }
   let modeNote="采集位置语义未记录；请结合生成方式人工确认 position 含义。";
   if(L.position_mode==="prompt_prefill")modeNote="这里展示 Prompt prefill 各位置的 next-token 预测；只有最后一行对应首个 Decode Token，页面已默认选中最后一行。前面的 position 不是生成序列。";
   else if(L.position_mode==="generation")modeNote="这里展示自回归生成的 Decode step；Position 0 对应首个 Decode Token。";
-  if(L.token_positions.length>1 && Number(L.token_positions[0])>0){
+  if(L.display_sampled){
+    modeNote += " 后端已比较全部 "+(L.total_positions||L.token_positions.length)+
+      " 个 position；为避免浏览器卡死，页面仅展示其中 "+L.token_positions.length+
+      " 个诊断位置（优先异常并均匀覆盖全序列），完整定界结果保留在 boundary_result.json。";
+  } else if(L.token_positions.length>1 && Number(L.token_positions[0])>0){
     modeNote += " 当前报告为长序列安全采样，仅采集最后 "+L.token_positions.length+
       " 个 position（"+L.token_positions[0]+"–"+
       L.token_positions[L.token_positions.length-1]+"）；可用 --logits_max_positions 0 采集全部。";
@@ -1053,7 +1060,10 @@ function renderLines(){
     mk.addEventListener("click",choose);
     mk.addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();choose();}});
     s.appendChild(mk);
-    const tx=E("text",{x:X(i),y:H-m+14,"text-anchor":"middle",class:"axis","font-size":"8"});tx.textContent=p;s.appendChild(tx);});
+    const tickEvery=Math.max(1,Math.ceil(ps.length/10));
+    if(i===0||i===ps.length-1||i%tickEvery===0){
+      const tx=E("text",{x:X(i),y:H-m+14,"text-anchor":"middle",class:"axis","font-size":"8"});tx.textContent=p;s.appendChild(tx);
+    }});
   s.appendChild(E("line",{x1:m,y1:H-m,x2:W-m,y2:H-m,stroke:C.border}));s.appendChild(E("line",{x1:m,y1:m,x2:m,y2:H-m,stroke:C.border}));
   const tt=E("text",{x:W/2,y:H-2,"text-anchor":"middle",class:"axis"});tt.textContent=L.position_mode==="prompt_prefill"?"Prompt token position":"Decode step";s.appendChild(tt);
   root.innerHTML="";
@@ -1128,8 +1138,9 @@ function renderTopK(i){
   // legend
   const lg=E("text",{x:W-mR,y:H-4,"text-anchor":"end",class:"axis","font-size":"9"});lg.textContent="绿(粗)="+leftName+" 概率 · 橙(细)="+rightName+" 概率";s.appendChild(lg);
   const top1Arr=R.logits.token_wise_top1_match||[];
-  const matchCnt=top1Arr.filter(x=>x===true).length;
-  const tot=top1Arr.length;
+  const recordedTotal=Number(L.full_top1_total||0);
+  const matchCnt=recordedTotal>0?Number(L.full_top1_match_count||0):top1Arr.filter(x=>x===true).length;
+  const tot=recordedTotal>0?recordedTotal:top1Arr.length;
   const top1=R.logits.token_wise_top1_match&&R.logits.token_wise_top1_match[i];
   const refMargin=num((R.logits.ref_top1_margin||[])[i]);
   const quantMargin=num((R.logits.quant_top1_margin||[])[i]);
@@ -1158,7 +1169,8 @@ function renderTopK(i){
   const pickerNote=document.createElement("div");pickerNote.className="tip";
   pickerNote.innerHTML='<span class="legend-chip" style="background:#A53939"></span>红色=Top-1 不一致 · '
     +'<span class="legend-chip" style="background:#B87710"></span>黄色=Top-1 一致但 Top-K 未完全重合 · '
-    +'<span style="color:#176B55">绿色=Top-K 完全一致</span>';
+    +'<span style="color:#176B55">绿色=Top-K 完全一致</span>'
+    +(L.display_sampled?' · 当前选择器展示 '+L.token_positions.length+'/'+L.total_positions+' 个诊断 position':'');
   card.appendChild(pickerNote);
   root.innerHTML="";
   root.appendChild(card);
@@ -1291,6 +1303,120 @@ if(document.readyState!=="loading")boot();else document.addEventListener("DOMCon
 def _embed_json_safe(d: Dict[str, Any]) -> str:
     """把 dict 嵌入 <script> 安全: 转义 < 防止 </script> 注入。"""
     return json.dumps(d, ensure_ascii=False).replace("<", "\\u003c")
+
+
+_HTML_LOGITS_POSITION_LIMIT = 256
+_LOGITS_POSITION_FIELDS = (
+    "token_positions", "ref_topk", "quant_topk", "ref_logits", "quant_logits",
+    "token_wise_cos", "token_wise_kl", "token_wise_topk_overlap",
+    "token_wise_top1_match", "ref_top1_margin", "quant_top1_margin",
+)
+
+
+def _evenly_sample_indices(indices: List[int], count: int) -> List[int]:
+    """Return deterministic, order-preserving samples including both ends."""
+    if count <= 0 or not indices:
+        return []
+    if len(indices) <= count:
+        return list(indices)
+    if count == 1:
+        return [indices[0]]
+    return list(dict.fromkeys(
+        indices[round(i * (len(indices) - 1) / (count - 1))]
+        for i in range(count)
+    ))
+
+
+def _html_logits_indices(logits: Dict[str, Any], limit: int) -> List[int]:
+    """Prefer anomaly positions, then fill with uniform sequence coverage."""
+    positions = list(logits.get("token_positions") or [])
+    n = len(positions)
+    if n <= limit:
+        return list(range(n))
+    top1 = list(logits.get("token_wise_top1_match") or [])
+    overlaps = list(logits.get("token_wise_topk_overlap") or [])
+    cosines = list(logits.get("token_wise_cos") or [])
+    kls = list(logits.get("token_wise_kl") or [])
+    anomalies = []
+    for index in range(n):
+        overlap = overlaps[index] if index < len(overlaps) else None
+        cosine = cosines[index] if index < len(cosines) else None
+        kl = kls[index] if index < len(kls) else None
+        if (
+            (index < len(top1) and top1[index] is False)
+            or (overlap is not None and overlap < 1.0)
+            or (cosine is not None and cosine < 0.99)
+            or (kl is not None and kl > 0.05)
+        ):
+            anomalies.append(index)
+
+    selected = {0, n - 1}
+    anomaly_budget = min(len(anomalies), max(16, limit * 2 // 3))
+    selected.update(_evenly_sample_indices(anomalies, anomaly_budget))
+    remaining = limit - len(selected)
+    if remaining > 0:
+        selected.update(_evenly_sample_indices(list(range(n)), remaining))
+    if len(selected) < limit:
+        unselected = [index for index in range(n) if index not in selected]
+        selected.update(_evenly_sample_indices(unselected, limit - len(selected)))
+    return sorted(selected)[:limit]
+
+
+def _compact_report_for_html(
+    raw: Dict[str, Any], limit: int = _HTML_LOGITS_POSITION_LIMIT,
+) -> Dict[str, Any]:
+    """Bound browser payload/DOM cost while preserving full-run aggregates.
+
+    Boundary's raw JSON remains untouched. Product-report payloads may use
+    this compact representation, so all positions are still compared and
+    archived in ``boundary_result.json`` while the browser renders a
+    diagnostic subset.
+    """
+    if not isinstance(raw, dict):
+        return raw
+    compact = dict(raw)
+    logits = raw.get("logits")
+    if isinstance(logits, dict):
+        positions = list(logits.get("token_positions") or [])
+        n = len(positions)
+        if limit > 0 and n > limit:
+            indices = _html_logits_indices(logits, limit)
+            bounded = dict(logits)
+            for key in _LOGITS_POSITION_FIELDS:
+                values = logits.get(key)
+                if isinstance(values, list) and len(values) == n:
+                    bounded[key] = [values[index] for index in indices]
+            top1 = list(logits.get("token_wise_top1_match") or [])
+            bounded["total_positions"] = n
+            bounded["display_sampled"] = True
+            bounded["full_top1_total"] = len(top1)
+            bounded["full_top1_match_count"] = sum(value is True for value in top1)
+            compact["logits"] = bounded
+
+    overview = raw.get("overview")
+    if isinstance(overview, dict) and isinstance(overview.get("captured_replay"), dict):
+        overview_copy = dict(overview)
+        captured = dict(overview["captured_replay"])
+        compared = list(captured.get("compared_positions") or [])
+        captured["compared_position_count"] = int(
+            captured.get("compared_position_count") or len(compared)
+        )
+        if compared:
+            captured["compared_position_range"] = [compared[0], compared[-1]]
+            captured["compared_positions"] = _evenly_sample_indices(compared, 64)
+        for key in ("top1_flip_positions", "low_margin_flip_positions", "nonfinite_positions"):
+            values = list(captured.get(key) or [])
+            captured[key.replace("_positions", "_count")] = len(values)
+            if len(values) > 128:
+                captured[key] = _evenly_sample_indices(values, 128)
+        overview_copy["captured_replay"] = captured
+        compact["overview"] = overview_copy
+    return compact
+
+
+def compact_report_for_html(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Public wrapper used by report writers before persisting UI payloads."""
+    return _compact_report_for_html(raw)
 
 
 # 侧边栏 CSS (复用于 product_report.html 的左侧历史栏)
@@ -1427,7 +1553,10 @@ def _extract_report_meta(rd, raw: dict, dir_hint: str = "") -> dict:
         "scope": rd.overview.comparison_scope or "unknown",
         "token_rate": ic.token_match_rate if ic else None,
         "exact": ic.exact_match if ic else None,
-        "logits_positions": len(lg.token_positions) if lg else 0,
+        "logits_positions": int(
+            ((raw.get("logits") or {}).get("total_positions") or len(lg.token_positions))
+            if lg else 0
+        ),
         "full_data": raw,
     }
 
@@ -1466,7 +1595,7 @@ def _scan_sibling_reports(output_path: str, current_data: ReportData):
 
     runs = []
     # 当前报告先放进去 (内存数据, 可能 JSON 还没写)
-    current_raw = current_data.to_dict()
+    current_raw = _compact_report_for_html(current_data.to_dict())
     current_meta = _extract_report_meta(current_data, current_raw, current_dir_name)
     current_meta.update({
         "dir": current_dir_name,
@@ -1484,9 +1613,10 @@ def _scan_sibling_reports(output_path: str, current_data: ReportData):
             with open(jf, encoding="utf-8") as f:
                 raw = json.load(f)
             from .report_schema import ReportData as _RD
-            rd = _RD.from_dict(raw)
+            html_raw = _compact_report_for_html(raw)
+            rd = _RD.from_dict(html_raw)
             mtime = os.path.getmtime(jf)
-            meta = _extract_report_meta(rd, raw, jf_dir)
+            meta = _extract_report_meta(rd, html_raw, jf_dir)
             meta.update({
                 "dir": jf_dir,
                 "report_relpath": os.path.relpath(
@@ -1560,7 +1690,7 @@ def generate_product_html_report(
         os.makedirs(reports_dir, exist_ok=True)
         output_path = os.path.join(reports_dir, f"product_report_{safe_model}_{ts}.html")
 
-    json_blob = _embed_json_safe(report_data.to_dict())
+    json_blob = _embed_json_safe(_compact_report_for_html(report_data.to_dict()))
     title = f"acc_bench 精度对齐报告 - {ov.model_name or '—'}"
 
     # --- 侧边栏: 扫描兄弟报告 ---
@@ -1729,11 +1859,12 @@ def generate_index_html(reports_dir: str, output_path: Optional[str] = None) -> 
         try:
             with open(jf, encoding="utf-8") as f:
                 raw = json.load(f)
-            rd = ReportData.from_dict(raw)
+            html_raw = _compact_report_for_html(raw)
+            rd = ReportData.from_dict(html_raw)
             mtime = os.path.getmtime(jf)
             ts_str = time.strftime("%m-%d %H:%M", time.localtime(mtime))
             run_dir = os.path.basename(os.path.dirname(jf)) or "root"
-            meta = _extract_report_meta(rd, raw, run_dir)
+            meta = _extract_report_meta(rd, html_raw, run_dir)
             meta.update({
                 "dir": run_dir,
                 "report_relpath": os.path.relpath(

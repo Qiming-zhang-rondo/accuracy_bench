@@ -175,6 +175,11 @@ class LogitsComparison:
             token_positions=list(self.token_positions),
             input_ids=list(self.input_ids or []),
             position_mode=self.position_mode,
+            total_positions=len(self.token_positions),
+            full_top1_total=len(self.token_wise_top1_match),
+            full_top1_match_count=sum(
+                value is True for value in self.token_wise_top1_match
+            ),
             ref_topk=[list(pos) for pos in self.ref_topk],
             quant_topk=[list(pos) for pos in self.quant_topk],
             ref_logits=list(self.ref_argmax_logits),

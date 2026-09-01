@@ -138,6 +138,44 @@ class TestBadCaseWorkflow:
 # html_report (v2)
 # ---------------------------------------------------------------------------
 class TestHtmlReportV2:
+    def test_large_logits_payload_is_compacted_for_html(self):
+        from accuracy_checker.html_report import _compact_report_for_html
+
+        n = 1000
+        raw = {
+            "overview": {
+                "captured_replay": {
+                    "compared_positions": list(range(n)),
+                    "top1_flip_positions": [777],
+                },
+            },
+            "logits": {
+                "token_positions": list(range(n)),
+                "input_ids": [list(range(n))],
+                "ref_topk": [[{"token_id": i}] for i in range(n)],
+                "quant_topk": [[{"token_id": i}] for i in range(n)],
+                "token_wise_top1_match": [i != 777 for i in range(n)],
+                "token_wise_topk_overlap": [1.0 if i != 777 else 0.5 for i in range(n)],
+                "token_wise_cos": [None] * n,
+                "token_wise_kl": [None] * n,
+            },
+        }
+
+        compact = _compact_report_for_html(raw, limit=32)
+        logits = compact["logits"]
+
+        assert logits["display_sampled"] is True
+        assert logits["total_positions"] == n
+        assert len(logits["token_positions"]) == 32
+        assert 777 in logits["token_positions"]
+        assert len(logits["ref_topk"]) == 32
+        assert len(logits["input_ids"][0]) == n
+        assert logits["full_top1_total"] == n
+        assert logits["full_top1_match_count"] == n - 1
+        replay = compact["overview"]["captured_replay"]
+        assert replay["compared_position_count"] == n
+        assert len(replay["compared_positions"]) == 64
+
     def test_generate_product_html_report(self, tmp_path):
         from accuracy_checker.html_report import generate_product_html_report
         from accuracy_checker.report_schema import (
