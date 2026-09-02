@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 _INFERRED_QUANT_WARNINGS = set()
 _DEEPSEEK_V4_FP4_MARKER = "__acc_deepseek_v4_fp4__"
 _NATIVE_FP8_MARKER = "__acc_native_fp8__"
+_NATIVE_FP8_DECODE_LOGGED = False
 
 # ============================================================================
 # 运行时注册 glm_moe_dsa (transformers < 5.5 可能没有)
@@ -648,14 +649,30 @@ def dequantize_native_fp8_weight(
     """
     if weight.dim() < 2:
         raise ValueError(f"native FP8 weight must be at least 2-D, got {tuple(weight.shape)}")
-    raw = weight if weight.dtype == torch.uint8 else weight.view(torch.uint8)
-    lut = _FP8_E4M3FN_LUT_BY_DEVICE.get(str(weight.device))
-    if lut is None:
-        lut = torch.tensor(_FP8_E4M3FN_LUT, dtype=torch.float32, device=weight.device)
-        _FP8_E4M3FN_LUT_BY_DEVICE[str(weight.device)] = lut
-    decoded = lut[raw.to(torch.long)]
     if scale is None:
-        return decoded.to(dtype)
+        raise ValueError(
+            "native FP8 weight is missing weight_scale_inv/weight_scale; "
+            "refusing to run with unscaled FP8 values"
+        )
+
+    # Match Transformers Fp8Dequantize exactly.  On CPU, native float8 ->
+    # float32 is the canonical conversion.  A few torch_npu builds reject the
+    # cast when a tensor is already on NPU, so retain the byte-LUT fallback.
+    decode_backend = "torch-float32-cast"
+    try:
+        if weight.dtype == torch.uint8:
+            raise TypeError("uint8 contains raw E4M3 payload")
+        decoded = weight.to(torch.float32)
+    except (RuntimeError, TypeError, NotImplementedError):
+        decode_backend = "e4m3-byte-lut"
+        raw = weight if weight.dtype == torch.uint8 else weight.view(torch.uint8)
+        lut = _FP8_E4M3FN_LUT_BY_DEVICE.get(str(weight.device))
+        if lut is None:
+            lut = torch.tensor(
+                _FP8_E4M3FN_LUT, dtype=torch.float32, device=weight.device
+            )
+            _FP8_E4M3FN_LUT_BY_DEVICE[str(weight.device)] = lut
+        decoded = lut[raw.to(torch.long)]
 
     scale = scale.to(device=weight.device)
     scale_name = str(scale_name).lower()
@@ -666,54 +683,49 @@ def dequantize_native_fp8_weight(
     else:
         scale_value = scale.to(torch.float32)
 
-    target_shape = tuple(weight.shape)
-    matrix_shape = target_shape[-2:]
-    if scale_value.dim() == 0:
-        scale_value = scale_value.reshape((1, 1))
-    elif scale_value.dim() == 1:
-        count = scale_value.numel()
-        if count == 1:
-            scale_value = scale_value.reshape(1, 1)
-        elif count == matrix_shape[0]:
-            scale_value = scale_value.reshape(matrix_shape[0], 1)
-        elif count == matrix_shape[1]:
-            scale_value = scale_value.reshape(1, matrix_shape[1])
-    # Packed MoE experts may carry a leading expert dimension.  A 2-D scale
-    # is shared by all experts; a same-rank scale keeps the leading dimensions.
-    if scale_value.dim() == 2 and weight.dim() > 2:
-        scale_value = scale_value.reshape((1,) * (weight.dim() - 2) + tuple(scale_value.shape))
-    if tuple(scale_value.shape) != target_shape:
-        if scale_value.dim() != weight.dim():
-            raise ValueError(
-                f"{scale_name} must match the matrix rank for native FP8 weight; got "
-                f"{tuple(scale_value.shape)}"
+    rows, cols = decoded.shape[-2:]
+    if scale_value.dim() < 2:
+        scale_value = scale_value.reshape(1, 1)
+    scale_rows, scale_cols = scale_value.shape[-2:]
+    if rows % scale_rows or cols % scale_cols:
+        raise ValueError(
+            f"native FP8 weight shape ({rows}, {cols}) is not divisible by "
+            f"{scale_name} grid ({scale_rows}, {scale_cols})"
+        )
+    block_m = rows // scale_rows
+    block_n = cols // scale_cols
+    global _NATIVE_FP8_DECODE_LOGGED
+    if not _NATIVE_FP8_DECODE_LOGGED:
+        logger.info(
+            "  [Native FP8 decode] payload=%s weight=%s scale=%s/%s "
+            "block=%dx%d -> %s backend=%s",
+            weight.dtype,
+            tuple(weight.shape),
+            scale_name,
+            tuple(scale_value.shape),
+            block_m,
+            block_n,
+            dtype,
+            decode_backend,
+        )
+        _NATIVE_FP8_DECODE_LOGGED = True
+    original_shape = decoded.shape
+    quantized_blocks = decoded.reshape(
+        -1, scale_rows, block_m, scale_cols, block_n
+    )
+    scale_blocks = scale_value.reshape(-1, scale_rows, scale_cols)
+    if quantized_blocks.shape[0] != scale_blocks.shape[0]:
+        if scale_blocks.shape[0] == 1:
+            scale_blocks = scale_blocks.expand(
+                quantized_blocks.shape[0], scale_rows, scale_cols
             )
-        scale_prefix = tuple(scale_value.shape[:-2])
-        target_prefix = target_shape[:-2]
-        if len(scale_prefix) == len(target_prefix) and all(
-            source in (1, target) for source, target in zip(scale_prefix, target_prefix)
-        ):
-            scale_value = scale_value.expand(target_prefix + tuple(scale_value.shape[-2:]))
-        elif scale_prefix != target_prefix:
-            raise ValueError(
-                f"native FP8 scale leading shape {scale_prefix} does not match "
-                f"weight {target_prefix}"
-            )
-        out, width = matrix_shape
-        rows, cols = tuple(scale_value.shape[-2:])
-        if rows == out and cols > 0 and width % cols == 0:
-            scale_value = scale_value.repeat_interleave(width // cols, dim=-1)
-        elif cols == width and rows > 0 and out % rows == 0:
-            scale_value = scale_value.repeat_interleave(out // rows, dim=-2)
-        elif rows > 0 and cols > 0 and out % rows == 0 and width % cols == 0:
-            scale_value = scale_value.repeat_interleave(out // rows, dim=-2)
-            scale_value = scale_value.repeat_interleave(width // cols, dim=-1)
         else:
             raise ValueError(
-                f"native FP8 scale shape {tuple(scale_value.shape)} is incompatible "
-                f"with weight shape {target_shape}"
+                f"native FP8 leading batch mismatch: weight={tuple(original_shape)}, "
+                f"{scale_name}={tuple(scale_value.shape)}"
             )
-    return (decoded * scale_value).to(dtype)
+    scale_blocks = scale_blocks.unsqueeze(-1).unsqueeze(2)
+    return (quantized_blocks * scale_blocks).to(dtype).reshape(original_shape)
 
 
 def _canonical_dynamic_qparam(
