@@ -206,6 +206,8 @@ _MLA_SELFROTERR_POST_LN = {
 
 def load_all_rotation_matrices(
     rotation_matrix_path: str,
+    *,
+    strict: bool = False,
 ) -> Optional[Dict[str, torch.Tensor]]:
     """加载全部旋转矩阵 (R1/R2/R3/R4).
 
@@ -233,13 +235,32 @@ def load_all_rotation_matrices(
         data = torch.load(pt_path, weights_only=True)
         if isinstance(data, dict) and 'rot' in data:
             mats = {}
+            from .utils import _check_orthogonal
             for key in ['rot', 'rot_b_proj', 'rot_uv', 'rot_kv_b_proj']:
                 if key in data:
-                    mats[key] = data[key]
+                    value = data[key]
+                    if not isinstance(value, torch.Tensor) or not _check_orthogonal(value):
+                        return _fail(
+                            f"{pt_path} key={key} is not a valid orthogonal matrix; "
+                            "check that this is the exported 4-R QuaRot bundle."
+                        )
+                    mats[key] = value
                     logger.info(f"Loaded rotation matrix {key}: shape={mats[key].shape}")
             if mats:
                 return mats
         return None
+
+    def _fail(message: str):
+        if strict:
+            raise ValueError("L2 rotation matrix validation failed: " + message)
+        logger.warning(message)
+        return None
+
+    if not os.path.exists(rotation_matrix_path):
+        return _fail(
+            f"file or directory does not exist: {rotation_matrix_path}. "
+            "For GLM-5.2 L2 use the 4-R bundle (rotation_matrices.pt/rotate_matrix_w8a8.pt)."
+        )
 
     # Direct file path
     if os.path.isfile(rotation_matrix_path):
@@ -255,22 +276,26 @@ def load_all_rotation_matrices(
             if result is not None:
                 return result
 
-    # File doesn't exist → try parent directory (user may give .../model/rotate_matrix.pt
-    # but actual file is .../model/rotation_matrices.pt)
+    # A file path may be a differently named bundle; also try its parent.
     parent = os.path.dirname(rotation_matrix_path)
     if os.path.isdir(parent):
-        result = _try_load_pt(os.path.join(parent, 'rotation_matrices.pt'))
-        if result is not None:
-            return result
+        for candidate in ['rotation_matrices.pt', 'rotate_matrix_w8a8.pt']:
+            result = _try_load_pt(os.path.join(parent, candidate))
+            if result is not None:
+                return result
 
-    # Fallback: single rotation matrix
-    if os.path.exists(rotation_matrix_path) or os.path.isdir(parent):
+    # A safetensors/pt file containing one valid R1 remains acceptable for
+    # coarse L2.  It is deliberately not treated as a 4-R fine-grained bundle.
+    if os.path.isfile(rotation_matrix_path):
         R1 = load_rotation_matrix(rotation_matrix_path)
         if R1 is not None:
             return {'rot': R1}
 
-    logger.warning(f"No rotation matrix found at or near: {rotation_matrix_path}")
-    return None
+    return _fail(
+        f"no valid orthogonal rotation found at {rotation_matrix_path}. "
+        "Do not pass rot.safetensors (key=rot.weight); use the 4-R bundle "
+        "with keys rot/rot_b_proj/rot_kv_b_proj/rot_uv."
+    )
 
 
 def _rotate_kv_a_proj_block(
@@ -1674,8 +1699,13 @@ def diagnose_layers(
     Returns:
         每层诊断结果列表
     """
-    # Load rotation matrices if provided
-    rot_mats = load_all_rotation_matrices(rotation_matrix) if rotation_matrix else None
+    # Load rotation matrices if provided.  L2 is deliberately strict: a
+    # supplied path that resolves to a non-orthogonal weight (for example
+    # rot.safetensors/rot.weight) must stop before expensive model loading.
+    rot_mats = (
+        load_all_rotation_matrices(rotation_matrix, strict=True)
+        if rotation_matrix else None
+    )
     if rot_mats is not None:
         R = rot_mats.get('rot')
         n_mats = len(rot_mats)
@@ -1703,6 +1733,21 @@ def diagnose_layers(
                          'num_attention_heads', 'head_dim', 'hidden_size']:
                 if hasattr(cfg, key):
                     model_config[key] = getattr(cfg, key)
+
+        model_type_name = str(model_type or "").lower()
+        config_type_name = str(getattr(get_text_config(provider.ref_model.config), "model_type", "")).lower()
+        is_glm_mla = model_type_name in {"glm_moe_dsa", "glm_mla", "glm5", "glm-5"}
+        is_glm_mla = is_glm_mla or config_type_name in {"glm_moe_dsa", "glm_mla"}
+        if rotation_matrix and mla_fine and is_glm_mla and rot_mats is not None:
+            required = {"rot", "rot_b_proj", "rot_kv_b_proj", "rot_uv"}
+            missing = sorted(required.difference(rot_mats))
+            if missing:
+                raise ValueError(
+                    "L2 rotation matrix validation failed: GLM-5 fine-grained "
+                    "diagnosis requires the 4-R bundle "
+                    "(rot, rot_b_proj, rot_kv_b_proj, rot_uv); "
+                    f"missing: {', '.join(missing)}."
+                )
 
         all_results = []
         for layer_idx in candidate_layers:
