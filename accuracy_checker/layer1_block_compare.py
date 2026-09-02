@@ -2377,6 +2377,21 @@ class ShardedBlockComparator:
                 return fp
         if w is None:
             raise KeyError(f"streaming expert weight not found: {weight_key}")
+        if str(w.dtype).startswith("torch.float8"):
+            actual_scale = reader.get_tensor(f"{quant_name}.weight_scale_inv")
+            actual_scale_name = "weight_scale_inv"
+            if actual_scale is None:
+                actual_scale = reader.get_tensor(f"{quant_name}.weight_scale")
+                actual_scale_name = "weight_scale"
+            if actual_scale is not None:
+                fp = dequantize_native_fp8_weight(
+                    w,
+                    actual_scale,
+                    dtype=self.dtype,
+                    scale_name=actual_scale_name,
+                )
+                del w, actual_scale
+                return fp.to(device, non_blocking=True)
         if w_type == "FP8_E4M3":
             if not (
                 str(w.dtype).startswith("torch.float8")

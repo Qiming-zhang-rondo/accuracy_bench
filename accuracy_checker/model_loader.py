@@ -35,6 +35,7 @@ _INFERRED_QUANT_WARNINGS = set()
 _DEEPSEEK_V4_FP4_MARKER = "__acc_deepseek_v4_fp4__"
 _NATIVE_FP8_MARKER = "__acc_native_fp8__"
 _NATIVE_FP8_DECODE_LOGGED = False
+_NATIVE_FP8_CHECKPOINT_CACHE = {}
 
 # ============================================================================
 # 运行时注册 glm_moe_dsa (transformers < 5.5 可能没有)
@@ -242,7 +243,7 @@ def is_quantized_model(model_path: str) -> bool:
                 return True
         except Exception as e:
             logger.debug(f"is_quantized_model config parse failed: {e}")
-    return False
+    return is_native_fp8_model(model_path)
 
 
 def _config_declares_native_fp8(config: Dict[str, Any]) -> bool:
@@ -275,6 +276,91 @@ def _config_declares_native_fp8(config: Dict[str, Any]) -> bool:
     return False
 
 
+def _native_fp8_safetensors_info(model_path: str) -> Optional[Tuple[str, str, str]]:
+    """Inspect safetensors headers for a real FP8 payload without loading data.
+
+    Returns ``(dtype, shard_name, tensor_key)``.  This is the fallback for
+    converted checkpoints whose config.json dropped ``quantization_config``.
+    Only the small JSON header is read; multi-GB tensor payloads are untouched.
+    """
+    cache_key = os.path.realpath(model_path)
+    if cache_key in _NATIVE_FP8_CHECKPOINT_CACHE:
+        return _NATIVE_FP8_CHECKPOINT_CACHE[cache_key]
+
+    shard_names = []
+    for index_name in (
+        "model.safetensors.index.json",
+        "quant_model_weights.safetensors.index.json",
+    ):
+        index_path = os.path.join(model_path, index_name)
+        try:
+            with open(index_path, "r", encoding="utf-8") as handle:
+                weight_map = json.load(handle).get("weight_map", {})
+            shard_names.extend(weight_map.values())
+        except (OSError, json.JSONDecodeError, AttributeError):
+            continue
+    try:
+        shard_names.extend(
+            entry.name for entry in os.scandir(model_path)
+            if entry.name.endswith(".safetensors")
+        )
+    except OSError:
+        pass
+
+    seen = set()
+    info = None
+    for shard_name in shard_names:
+        shard_path = os.path.join(model_path, shard_name)
+        real_path = os.path.realpath(shard_path)
+        if real_path in seen or not os.path.isfile(shard_path):
+            continue
+        seen.add(real_path)
+        try:
+            with open(shard_path, "rb") as handle:
+                header_size_raw = handle.read(8)
+                if len(header_size_raw) != 8:
+                    continue
+                header_size = int.from_bytes(header_size_raw, "little")
+                if header_size <= 0 or header_size > 64 * 1024 * 1024:
+                    continue
+                header = json.loads(handle.read(header_size))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        for tensor_key, metadata in header.items():
+            if not isinstance(metadata, dict):
+                continue
+            tensor_dtype = str(metadata.get("dtype", "")).upper()
+            if tensor_dtype in {"F8_E4M3", "F8_E4M3FN", "F8_E5M2"}:
+                info = (tensor_dtype, shard_name, tensor_key)
+                break
+        if info is not None:
+            break
+    _NATIVE_FP8_CHECKPOINT_CACHE[cache_key] = info
+    return info
+
+
+def is_native_fp8_model(model_path: str) -> bool:
+    """Detect a native FP8 checkpoint from config or actual tensor headers."""
+    # A modelslim descriptor is authoritative: such a checkpoint may retain
+    # the source model's fp8 config even though its actual weights are W4/W8.
+    if os.path.isfile(os.path.join(model_path, "quant_model_description.json")):
+        return False
+    if _config_declares_native_fp8(_read_raw_model_config(model_path)):
+        return True
+    info = _native_fp8_safetensors_info(model_path)
+    if info is not None:
+        tensor_dtype, shard_name, tensor_key = info
+        logger.info(
+            "  [Native FP8 detect] config 未声明 FP8；从 safetensors header "
+            "检测到 %s (%s:%s)",
+            tensor_dtype,
+            shard_name,
+            tensor_key,
+        )
+        return True
+    return False
+
+
 def is_deepseek_v4_fp4_model(model_path: str) -> bool:
     """Whether this is the official DeepSeek-V4 packed-FP4 reference format."""
     config_path = os.path.join(model_path, "config.json")
@@ -300,7 +386,7 @@ def native_quant_description(model_path: str) -> Optional[dict]:
     """
     if is_deepseek_v4_fp4_model(model_path):
         return {_DEEPSEEK_V4_FP4_MARKER: "DEEPSEEK_FP4"}
-    if _config_declares_native_fp8(_read_raw_model_config(model_path)):
+    if is_native_fp8_model(model_path):
         return {_NATIVE_FP8_MARKER: "FP8_E4M3"}
     return None
 
@@ -1812,6 +1898,27 @@ def _load_msslim_quant_param(name: str, param, sf_reader: ShardWeightReader,
                 )
                 param._acc_quant_type = "DEEPSEEK_FP4"
                 return True
+    # The tensor dtype is the final authority.  Some converted reference
+    # directories retain a quant_model_description.json that does not describe
+    # native GLM FP8 accurately.  If the payload itself is float8 and carries
+    # weight_scale_inv, decode it before consulting that descriptor.
+    if name.endswith(".weight"):
+        actual_weight = sf_reader.get_tensor(name)
+        if actual_weight is not None and str(actual_weight.dtype).startswith("torch.float8"):
+            actual_base = name.rsplit(".", 1)[0]
+            actual_scale = sf_reader.get_tensor(f"{actual_base}.weight_scale_inv")
+            if actual_scale is None:
+                actual_scale = sf_reader.get_tensor(f"{actual_base}.weight_scale")
+            if actual_scale is not None:
+                decoded = dequantize_native_fp8_weight(
+                    actual_weight,
+                    actual_scale,
+                    dtype=dtype,
+                    scale_name="weight_scale_inv",
+                )
+                _assign_param_checked(name, param, decoded, "actual native FP8 decode")
+                param._acc_quant_type = "FP8_E4M3"
+                return True
     # Native FP8 checkpoints (for example GLM-5.3) carry no msModelSlim
     # descriptor.  Decode both the common ``weight_scale_inv`` spelling and
     # the vLLM-compatible ``weight_scale`` spelling before descriptor lookup.
@@ -2545,14 +2652,27 @@ def _load_3d_expert_nonquant_indexed(name, param, sf_reader, dtype):
 def _dequant_single_expert_indexed(weight_key, quant_type, sf_reader, dtype, use_fake_quant):
     """Dequantize a single expert weight using ShardWeightReader."""
     quant_type = normalize_quant_type(quant_type)
+    actual_weight = sf_reader.get_tensor(weight_key)
+    if actual_weight is not None and str(actual_weight.dtype).startswith("torch.float8"):
+        actual_base = weight_key.rsplit('.', 1)[0]
+        actual_scale = sf_reader.get_tensor(f"{actual_base}.weight_scale_inv")
+        if actual_scale is None:
+            actual_scale = sf_reader.get_tensor(f"{actual_base}.weight_scale")
+        if actual_scale is not None:
+            return dequantize_native_fp8_weight(
+                actual_weight,
+                actual_scale,
+                dtype=dtype,
+                scale_name="weight_scale_inv",
+            )
     if quant_type == "FLOAT":
-        weight_data = sf_reader.get_tensor(weight_key)
+        weight_data = actual_weight
         if weight_data is not None:
             return weight_data.to(dtype)
         return None
 
     if quant_type == "FP8_E4M3":
-        weight_data = sf_reader.get_tensor(weight_key)
+        weight_data = actual_weight
         if weight_data is None:
             return None
         if not (
@@ -2575,7 +2695,7 @@ def _dequant_single_expert_indexed(weight_key, quant_type, sf_reader, dtype, use
     if use_fake_quant:
         return None
 
-    weight_data = sf_reader.get_tensor(weight_key)
+    weight_data = actual_weight
     if weight_data is None:
         return None
 
@@ -3150,7 +3270,7 @@ def load_model_for_comparison(
     from .dspark import is_dspark_checkpoint
 
     is_quant = is_quantized_model(model_path)
-    native_fp8 = _config_declares_native_fp8(_read_raw_model_config(model_path))
+    native_fp8 = is_native_fp8_model(model_path)
 
     if is_dspark_checkpoint(model_path):
         if layers is not None:
