@@ -581,10 +581,17 @@ class ShardedBlockComparator:
             if self._ref_quant_desc is None:
                 self._ref_quant_desc = native_quant_description(self.ref_model_path)
                 if self._ref_quant_desc is not None and self.verbose:
-                    logger.info(
-                        "  [DeepSeek-V4 ref] detected official packed FP4 experts "
-                        "(.scale, 32-column groups)"
-                    )
+                    if "__acc_native_fp8__" in self._ref_quant_desc:
+                        logger.info(
+                            "  [Native FP8 ref] detected E4M3 checkpoint; "
+                            "weights will be decoded to %s on A3",
+                            self.dtype,
+                        )
+                    else:
+                        logger.info(
+                            "  [DeepSeek-V4 ref] detected official packed FP4 experts "
+                            "(.scale, 32-column groups)"
+                        )
         if self._quant_is_quant and not self._quant_is_ct:
             _desc_path = os.path.join(self.quant_model_path, "quant_model_description.json")
             if os.path.exists(_desc_path):
@@ -595,10 +602,17 @@ class ShardedBlockComparator:
             if self._quant_quant_desc is None:
                 self._quant_quant_desc = native_quant_description(self.quant_model_path)
                 if self._quant_quant_desc is not None and self.verbose:
-                    logger.info(
-                        "  [DeepSeek-V4 quant] detected official packed FP4 experts "
-                        "(.scale, 32-column groups)"
-                    )
+                    if "__acc_native_fp8__" in self._quant_quant_desc:
+                        logger.info(
+                            "  [Native FP8 quant] detected E4M3 checkpoint; "
+                            "weights will be decoded to %s on A3",
+                            self.dtype,
+                        )
+                    else:
+                        logger.info(
+                            "  [DeepSeek-V4 quant] detected official packed FP4 experts "
+                            "(.scale, 32-column groups)"
+                        )
 
     def _init_rotary_emb(self, model, device: str):
         """Initialize global and compressor-owned rotary embeddings."""
@@ -2310,6 +2324,8 @@ class ShardedBlockComparator:
             and ".experts." in weight_key
         ):
             return "DEEPSEEK_FP4"
+        if quant_desc_str and quant_desc_str.get("__acc_native_fp8__") == "FP8_E4M3":
+            return "FP8_E4M3"
         return _lookup_quant_descriptor(
             quant_desc_str, weight_key, normalize_quant_type(default)
         )
@@ -2327,6 +2343,7 @@ class ShardedBlockComparator:
         from .model_loader import (
             dequantize_weight_mx, _dequant_msslim_weight,
             dequantize_deepseek_v4_fp4, dequantize_weight_mxfp8_npu,
+            dequantize_native_fp8_weight,
         )
         reader = (
             _ExpertSliceReader(sf_reader, expert_id, num_experts)
@@ -2360,6 +2377,28 @@ class ShardedBlockComparator:
                 return fp
         if w is None:
             raise KeyError(f"streaming expert weight not found: {weight_key}")
+        if w_type == "FP8_E4M3":
+            if not (
+                str(w.dtype).startswith("torch.float8")
+                or w.dtype == torch.uint8
+            ):
+                return w.to(device, non_blocking=True)
+            quant_name = weight_key.rsplit('.', 1)[0]
+            scale_key = None
+            scale = None
+            for suffix in ("weight_scale_inv", "weight_scale", "scale_inv", "scale"):
+                candidate = reader.get_tensor(f"{quant_name}.{suffix}")
+                if candidate is not None:
+                    scale_key, scale = suffix, candidate
+                    break
+            # Decode on CPU and transfer BF16.  This is intentional on A3:
+            # native FP8 kernels are unavailable, and transferring the raw
+            # float8 tensor can fail in torch_npu before the LUT decoder runs.
+            fp = dequantize_native_fp8_weight(
+                w, scale, dtype=self.dtype, scale_name=scale_key or "scale"
+            )
+            del w, scale
+            return fp.to(device, non_blocking=True)
         # Some Ascend torch_npu releases cannot cast a native float8 E4M3
         # tensor on NPU (aclnnInplaceCopy/561103).  First try the NPU-safe
         # byte-LUT decoder, which reinterprets the FP8 payload as uint8 and

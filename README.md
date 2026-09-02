@@ -20,7 +20,7 @@ python3 run_accuracy_check.py --mode full \
   --ref_devices npu:0,1,2,3 --quant_devices npu:4,5,6,7 \
   --compare_mode grouped_dual --layers_per_shard 2 --cache_top_k 1 --top_k 1 \
   --quant_method dequantize \
-  --rotation_matrix <ROT>  # BF16 ref + 量化 quant 必传; 同量化类型不传
+  --rotation_matrix <ROT>  # 仅旋转 checkpoint 需要；原生 FP8 ref 会自动解码到 --dtype
 
 # L1 only (找坏层 + cache 供 L2 用)
 python3 run_accuracy_check.py --l1 --ref_model <REF> --quant_model <QUANT> \
@@ -63,7 +63,7 @@ Chat/Instruct 模型建议使用 `--messages '[{"role":"user","content":"你好"
 
 ## 定界使用实例
 
-定界回答的是“坏输出来自量化权重，还是来自部署框架”。`--quant_model` 运行 Transformers 反量化基线；提供 `--ref_model` 后还会增加 BF16/FP16 基线，用于区分量化回归与 base 模型本身行为。
+定界回答的是“坏输出来自量化权重，还是来自部署框架”。`--quant_model` 运行 Transformers 反量化基线；提供 `--ref_model` 后还会增加参考基线。参考 checkpoint 可以是 BF16/FP16，也可以是配置声明的原生 FP8：工具会先按 E4M3 + block scale 解码到 `--dtype`（A3 默认 BF16），不会要求 NPU 直接执行 native FP8。
 
 ```bash
 # 1. 本地复现：ref + 量化模型 + Transformers generate
@@ -220,7 +220,7 @@ python3 run_accuracy_check.py --mode l1 --model_type dspark \
 
 ## 使用约束
 
-1. **必须提供 FP16/BF16 ref 模型** (不支持无 ref 比对)
+1. **必须提供参考 ref 模型**（BF16/FP16 或配置声明的原生 FP8；A3 上原生 FP8 会自动解码到 `--dtype`，不支持无 ref 比对）
 2. **L2 前必须先跑 L1** (`--l1 --cache_top_k N` 或 `--l1 --l1_target_layers ...`)
 3. **`--rotation_matrix`**: 只在 checkpoint 确实使用 QuaRot 等旋转且 R 未融合进权重时传；普通非旋转 W8A8 不传。不能仅凭“BF16 ref vs W8A8 quant”判断存在旋转
    > 前提: R 独立可逆且 ref/quant 使用同一旋转契约；不确定时先检查量化配置与权重生成参数

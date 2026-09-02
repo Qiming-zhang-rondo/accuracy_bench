@@ -83,7 +83,7 @@ def parse_base_name(weight_key: str) -> str:
     "model.layers.0.self_attn.q_proj.weight_scale" -> "model.layers.0.self_attn.q_proj"
     """
     quant_suffixes = [
-        ".weight_scale", ".weight_offset",
+        ".weight_scale_inv", ".weight_scale", ".weight_offset",
         ".deq_scale", ".input_scale", ".input_offset", ".quant_bias",
         ".kv_cache_scale", ".kv_cache_offset",
         ".scale_bias",

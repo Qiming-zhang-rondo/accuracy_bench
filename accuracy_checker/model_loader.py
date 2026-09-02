@@ -33,6 +33,7 @@ import logging
 logger = logging.getLogger(__name__)
 _INFERRED_QUANT_WARNINGS = set()
 _DEEPSEEK_V4_FP4_MARKER = "__acc_deepseek_v4_fp4__"
+_NATIVE_FP8_MARKER = "__acc_native_fp8__"
 
 # ============================================================================
 # 运行时注册 glm_moe_dsa (transformers < 5.5 可能没有)
@@ -224,6 +225,12 @@ def is_quantized_model(model_path: str) -> bool:
                 qconfig = config.get("text_config", {}).get("quantization_config", {})
             if qconfig.get("quant_method") == "compressed-tensors":
                 return True
+            # GLM-5.3 and other native checkpoints advertise FP8 directly
+            # (quant_method=fp8, fmt=e4m3) rather than shipping an
+            # msModelSlim descriptor.  They still need to be decoded to
+            # BF16 on A3, whose runtime does not execute native FP8 weights.
+            if _config_declares_native_fp8(config):
+                return True
             # The official DeepSeek-V4-Flash reference checkpoint stores
             # routed experts as packed E2M1 FP4 (with ``.scale`` tensors),
             # despite advertising an FP8 conversion config for deployment.
@@ -234,6 +241,36 @@ def is_quantized_model(model_path: str) -> bool:
                 return True
         except Exception as e:
             logger.debug(f"is_quantized_model config parse failed: {e}")
+    return False
+
+
+def _config_declares_native_fp8(config: Dict[str, Any]) -> bool:
+    """Return whether a checkpoint config declares native FP8 weights.
+
+    Keep this deliberately scoped to quantization/dtype fields so an
+    unrelated string containing ``fp8`` cannot make a BF16 model look
+    quantized.  ``text_config`` is handled because multimodal GLM exports
+    place ``quantization_config`` there.
+    """
+    configs = [config]
+    nested = config.get("text_config")
+    if isinstance(nested, dict):
+        configs.append(nested)
+    for item in configs:
+        qconfig = item.get("quantization_config")
+        if isinstance(qconfig, dict):
+            method = str(qconfig.get("quant_method", "")).lower()
+            fmt = str(qconfig.get("fmt", qconfig.get("format", ""))).lower()
+            weight_dtype = str(qconfig.get("weight_dtype", "")).lower()
+            if method in {"fp8", "mxfp8", "float8"}:
+                return True
+            if any(token in value for value in (fmt, weight_dtype)
+                   for token in ("fp8", "float8", "e4m3", "e5m2")):
+                return True
+        for key in ("torch_dtype", "dtype", "weight_dtype", "quant_dtype"):
+            value = str(item.get(key, "")).lower()
+            if "float8" in value or "fp8" in value:
+                return True
     return False
 
 
@@ -256,11 +293,14 @@ def native_quant_description(model_path: str) -> Optional[dict]:
 
     Most exports carry ``quant_model_description.json``.  The official V4
     reference does not: its routed experts are packed FP4 and use per-group
-    ``.scale`` keys, so a small marker keeps the generic indexed loader on the
-    correct decode path.
+    ``.scale`` keys.  Native GLM FP8 exports likewise omit the msModelSlim
+    descriptor and use ``weight_scale_inv``; small markers keep the generic
+    indexed loader on the correct decode path.
     """
     if is_deepseek_v4_fp4_model(model_path):
         return {_DEEPSEEK_V4_FP4_MARKER: "DEEPSEEK_FP4"}
+    if _config_declares_native_fp8(_read_raw_model_config(model_path)):
+        return {_NATIVE_FP8_MARKER: "FP8_E4M3"}
     return None
 
 
@@ -588,6 +628,92 @@ def dequantize_deepseek_v4_native_weight(
     if str(weight.dtype).startswith("torch.float8"):
         return dequantize_deepseek_v4_fp8(weight, scale, dtype=dtype)
     return None
+
+
+def dequantize_native_fp8_weight(
+    weight: Tensor,
+    scale: Optional[Tensor] = None,
+    dtype: torch.dtype = torch.bfloat16,
+    block_size: Tuple[int, int] = (128, 128),
+    scale_name: str = "weight_scale_inv",
+) -> Tensor:
+    """Decode a native E4M3 FP8 matrix into the requested runtime dtype.
+
+    GLM-5.3's public checkpoint uses E4M3 payloads and ``weight_scale_inv``
+    block scales, while A3 torch_npu installations generally cannot execute
+    a native float8 parameter.  Decode the payload through the same byte LUT
+    used by the MXFP8 path, then expand either [out, in] or block [out/bo,
+    in/bi] scales.  ``weight_scale_inv`` is multiplied during dequantization;
+    uint8 E8M0 scales retain the MXFP8 exponent interpretation.
+    """
+    if weight.dim() < 2:
+        raise ValueError(f"native FP8 weight must be at least 2-D, got {tuple(weight.shape)}")
+    raw = weight if weight.dtype == torch.uint8 else weight.view(torch.uint8)
+    lut = _FP8_E4M3FN_LUT_BY_DEVICE.get(str(weight.device))
+    if lut is None:
+        lut = torch.tensor(_FP8_E4M3FN_LUT, dtype=torch.float32, device=weight.device)
+        _FP8_E4M3FN_LUT_BY_DEVICE[str(weight.device)] = lut
+    decoded = lut[raw.to(torch.long)]
+    if scale is None:
+        return decoded.to(dtype)
+
+    scale = scale.to(device=weight.device)
+    scale_name = str(scale_name).lower()
+    if scale.dtype == torch.uint8:
+        scale_value = torch.pow(2.0, scale.to(torch.float32) - 127.0)
+    elif "e8m0" in str(scale.dtype).lower():
+        scale_value = _decode_deepseek_v4_e8m0_scale(scale, device=weight.device)
+    else:
+        scale_value = scale.to(torch.float32)
+
+    target_shape = tuple(weight.shape)
+    matrix_shape = target_shape[-2:]
+    if scale_value.dim() == 0:
+        scale_value = scale_value.reshape((1, 1))
+    elif scale_value.dim() == 1:
+        count = scale_value.numel()
+        if count == 1:
+            scale_value = scale_value.reshape(1, 1)
+        elif count == matrix_shape[0]:
+            scale_value = scale_value.reshape(matrix_shape[0], 1)
+        elif count == matrix_shape[1]:
+            scale_value = scale_value.reshape(1, matrix_shape[1])
+    # Packed MoE experts may carry a leading expert dimension.  A 2-D scale
+    # is shared by all experts; a same-rank scale keeps the leading dimensions.
+    if scale_value.dim() == 2 and weight.dim() > 2:
+        scale_value = scale_value.reshape((1,) * (weight.dim() - 2) + tuple(scale_value.shape))
+    if tuple(scale_value.shape) != target_shape:
+        if scale_value.dim() != weight.dim():
+            raise ValueError(
+                f"{scale_name} must match the matrix rank for native FP8 weight; got "
+                f"{tuple(scale_value.shape)}"
+            )
+        scale_prefix = tuple(scale_value.shape[:-2])
+        target_prefix = target_shape[:-2]
+        if len(scale_prefix) == len(target_prefix) and all(
+            source in (1, target) for source, target in zip(scale_prefix, target_prefix)
+        ):
+            scale_value = scale_value.expand(target_prefix + tuple(scale_value.shape[-2:]))
+        elif scale_prefix != target_prefix:
+            raise ValueError(
+                f"native FP8 scale leading shape {scale_prefix} does not match "
+                f"weight {target_prefix}"
+            )
+        out, width = matrix_shape
+        rows, cols = tuple(scale_value.shape[-2:])
+        if rows == out and cols > 0 and width % cols == 0:
+            scale_value = scale_value.repeat_interleave(width // cols, dim=-1)
+        elif cols == width and rows > 0 and out % rows == 0:
+            scale_value = scale_value.repeat_interleave(out // rows, dim=-2)
+        elif rows > 0 and cols > 0 and out % rows == 0 and width % cols == 0:
+            scale_value = scale_value.repeat_interleave(out // rows, dim=-2)
+            scale_value = scale_value.repeat_interleave(width // cols, dim=-1)
+        else:
+            raise ValueError(
+                f"native FP8 scale shape {tuple(scale_value.shape)} is incompatible "
+                f"with weight shape {target_shape}"
+            )
+    return (decoded * scale_value).to(dtype)
 
 
 def _canonical_dynamic_qparam(
@@ -1447,6 +1573,9 @@ def _load_ct_param(name: str, param, sf_reader: ShardWeightReader,
     tensor = sf_reader.get_tensor(name)
     scale_key = name.replace('.weight', '.weight_scale')
     scale_tensor = sf_reader.get_tensor(scale_key)
+    if scale_tensor is None:
+        scale_key = name.replace('.weight', '.weight_scale_inv')
+        scale_tensor = sf_reader.get_tensor(scale_key)
     if tensor is None and name.endswith('.weight'):
         # compressed-tensors MXFP4 stores the packed nibbles separately.
         packed_key = name.replace('.weight', '.weight_packed')
@@ -1458,7 +1587,11 @@ def _load_ct_param(name: str, param, sf_reader: ShardWeightReader,
             return True
     if tensor is None:
         return False
-    if tensor.dtype == torch.int8 and scale_tensor is not None:
+    if str(tensor.dtype).startswith("torch.float8"):
+        param.data = dequantize_native_fp8_weight(
+            tensor, scale_tensor, dtype=dtype, scale_name=scale_key.rsplit('.', 1)[-1]
+        )
+    elif tensor.dtype == torch.int8 and scale_tensor is not None:
         w_fp = tensor.to(dtype) * scale_tensor.to(dtype)
         param.data = w_fp
     else:
@@ -1667,6 +1800,42 @@ def _load_msslim_quant_param(name: str, param, sf_reader: ShardWeightReader,
                 )
                 param._acc_quant_type = "DEEPSEEK_FP4"
                 return True
+    # Native FP8 checkpoints (for example GLM-5.3) carry no msModelSlim
+    # descriptor.  Decode both the common ``weight_scale_inv`` spelling and
+    # the vLLM-compatible ``weight_scale`` spelling before descriptor lookup.
+    if (
+        quant_desc_str.get(_NATIVE_FP8_MARKER) == "FP8_E4M3"
+        and name.endswith(".weight")
+    ):
+        weight_data = sf_reader.get_tensor(name)
+        if weight_data is None:
+            weight_data = sf_reader.get_tensor(weight_key)
+        if weight_data is not None:
+            quant_name = weight_key.rsplit(".", 1)[0]
+            scale_key = None
+            scale = None
+            for suffix in ("weight_scale_inv", "weight_scale", "scale_inv", "scale"):
+                candidate = sf_reader.get_tensor(f"{quant_name}.{suffix}")
+                if candidate is not None:
+                    scale_key, scale = suffix, candidate
+                    break
+            # FP8 quantization configs commonly exempt embeddings, norms and
+            # a few projections.  Do not reinterpret those ordinary BF16/
+            # FP16 tensors as byte-level FP8 just because the model has a
+            # native-FP8 config; only decode an actual FP8/uint8 payload.
+            if not (
+                str(weight_data.dtype).startswith("torch.float8")
+                or weight_data.dtype == torch.uint8
+            ):
+                _assign_param_checked(name, param, weight_data.to(dtype), "FLOAT exempt tensor")
+                param._acc_quant_type = "FLOAT"
+                return True
+            decoded = dequantize_native_fp8_weight(
+                weight_data, scale, dtype=dtype, scale_name=scale_key or "scale"
+            )
+            _assign_param_checked(name, param, decoded, "native FP8 decode")
+            param._acc_quant_type = "FP8_E4M3"
+            return True
     quant_type = normalize_quant_type(
         _quant_desc_type_for_reader(quant_desc_str, weight_key, sf_reader)
     )
@@ -2143,6 +2312,8 @@ def _count_experts_in_map(sf_reader: ShardWeightReader, test_key_tmpl: str) -> i
 def _quant_desc_type_for_reader(quant_desc: dict, key: str,
                                 sf_reader: ShardWeightReader) -> str:
     """Resolve a quant type through both runtime and official V4 names."""
+    if quant_desc.get(_NATIVE_FP8_MARKER) == "FP8_E4M3":
+        return "FP8_E4M3"
     base = parse_base_name(key)
     candidates = [key, base]
     for prefix in ("model.model.", "model."):
@@ -2367,6 +2538,27 @@ def _dequant_single_expert_indexed(weight_key, quant_type, sf_reader, dtype, use
         if weight_data is not None:
             return weight_data.to(dtype)
         return None
+
+    if quant_type == "FP8_E4M3":
+        weight_data = sf_reader.get_tensor(weight_key)
+        if weight_data is None:
+            return None
+        if not (
+            str(weight_data.dtype).startswith("torch.float8")
+            or weight_data.dtype == torch.uint8
+        ):
+            return weight_data.to(dtype)
+        quant_name = weight_key.rsplit('.', 1)[0]
+        scale_key = None
+        scale = None
+        for suffix in ("weight_scale_inv", "weight_scale", "scale_inv", "scale"):
+            candidate = sf_reader.get_tensor(f"{quant_name}.{suffix}")
+            if candidate is not None:
+                scale_key, scale = suffix, candidate
+                break
+        return dequantize_native_fp8_weight(
+            weight_data, scale, dtype=dtype, scale_name=scale_key or "scale"
+        )
 
     if use_fake_quant:
         return None
@@ -2946,6 +3138,7 @@ def load_model_for_comparison(
     from .dspark import is_dspark_checkpoint
 
     is_quant = is_quantized_model(model_path)
+    native_fp8 = _config_declares_native_fp8(_read_raw_model_config(model_path))
 
     if is_dspark_checkpoint(model_path):
         if layers is not None:
@@ -2972,7 +3165,7 @@ def load_model_for_comparison(
     # Full-load mode (single device)
     single_device = device.split(',')[0] if isinstance(device, str) and ',' in device else device
 
-    if is_quant and use_fake_quant:
+    if is_quant and use_fake_quant and not native_fp8:
         if verbose:
             logger.info(f"  量化模型, FakeQuant 模式加载")
         model = AutoModelForCausalLM.from_pretrained(
@@ -2986,15 +3179,18 @@ def load_model_for_comparison(
 
     if is_quant:
         if verbose:
-            logger.info(f"  量化模型, 反量化模式加载")
+            mode = "原生 FP8→BF16 反量化" if native_fp8 else "反量化"
+            logger.info(f"  量化模型, {mode}模式加载")
         # Load with dequantize: skeleton + load all weights + dequant
         model = create_model_skeleton(model_path, dtype, verbose=verbose)
         weight_map = build_weight_index(model_path)
         reader = ShardWeightReader(model_path, weight_map)
         num_layers = model.config.num_hidden_layers
         all_layers = list(range(num_layers))
+        quant_desc = native_quant_description(model_path)
         load_layer_weights_indexed(model, model_path, all_layers, single_device, dtype,
                                    weight_map, reader, is_quant=is_quant,
+                                   quant_desc=quant_desc,
                                    include_auxiliary=True, verbose=verbose)
         reader.close()
         model = model.to(single_device)
