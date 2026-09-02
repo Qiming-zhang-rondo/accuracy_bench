@@ -773,13 +773,28 @@ def dequantize_native_fp8_weight(
     if scale_value.dim() < 2:
         scale_value = scale_value.reshape(1, 1)
     scale_rows, scale_cols = scale_value.shape[-2:]
-    if rows % scale_rows or cols % scale_cols:
+    configured_block_m, configured_block_n = block_size
+    expected_scale_rows = (rows + configured_block_m - 1) // configured_block_m
+    expected_scale_cols = (cols + configured_block_n - 1) // configured_block_n
+
+    # Fine-grained FP8 scale grids use ceil(dim / block_size): the last block
+    # is allowed to be shorter than 128.  For example, a (576, 6144) GLM-5.3
+    # matrix legitimately carries a (5, 48) scale grid.  Keep compatibility
+    # with full-element and older exactly-divisible scale layouts as well.
+    if (scale_rows, scale_cols) == (rows, cols):
+        block_m, block_n = 1, 1
+    elif (scale_rows, scale_cols) == (expected_scale_rows, expected_scale_cols):
+        block_m, block_n = configured_block_m, configured_block_n
+    elif rows % scale_rows == 0 and cols % scale_cols == 0:
+        block_m = rows // scale_rows
+        block_n = cols // scale_cols
+    else:
         raise ValueError(
-            f"native FP8 weight shape ({rows}, {cols}) is not divisible by "
-            f"{scale_name} grid ({scale_rows}, {scale_cols})"
+            f"native FP8 {scale_name} grid ({scale_rows}, {scale_cols}) is "
+            f"incompatible with weight shape ({rows}, {cols}); expected "
+            f"ceil-grid ({expected_scale_rows}, {expected_scale_cols}) for "
+            f"block={configured_block_m}x{configured_block_n}"
         )
-    block_m = rows // scale_rows
-    block_n = cols // scale_cols
     global _NATIVE_FP8_DECODE_LOGGED
     if not _NATIVE_FP8_DECODE_LOGGED:
         logger.info(
@@ -796,22 +811,35 @@ def dequantize_native_fp8_weight(
         )
         _NATIVE_FP8_DECODE_LOGGED = True
     original_shape = decoded.shape
-    quantized_blocks = decoded.reshape(
-        -1, scale_rows, block_m, scale_cols, block_n
-    )
+    decoded_flat = decoded.reshape(-1, rows, cols)
     scale_blocks = scale_value.reshape(-1, scale_rows, scale_cols)
-    if quantized_blocks.shape[0] != scale_blocks.shape[0]:
+    if decoded_flat.shape[0] != scale_blocks.shape[0]:
         if scale_blocks.shape[0] == 1:
             scale_blocks = scale_blocks.expand(
-                quantized_blocks.shape[0], scale_rows, scale_cols
+                decoded_flat.shape[0], scale_rows, scale_cols
             )
         else:
             raise ValueError(
                 f"native FP8 leading batch mismatch: weight={tuple(original_shape)}, "
                 f"{scale_name}={tuple(scale_value.shape)}"
             )
-    scale_blocks = scale_blocks.unsqueeze(-1).unsqueeze(2)
-    return (quantized_blocks * scale_blocks).to(dtype).reshape(original_shape)
+
+    if rows % block_m == 0 and cols % block_n == 0:
+        # Common fast path: no padding/expanded scale tensor is required.
+        quantized_blocks = decoded_flat.reshape(
+            -1, scale_rows, block_m, scale_cols, block_n
+        )
+        scale_blocks = scale_blocks.unsqueeze(-1).unsqueeze(2)
+        result = (quantized_blocks * scale_blocks).reshape(-1, rows, cols)
+    else:
+        # Tail blocks are cropped to the real matrix dimensions.  Expanding
+        # only the small, non-divisible matrices keeps the large aligned
+        # expert weights on the reshape-only fast path above.
+        expanded_scale = scale_blocks.repeat_interleave(block_m, dim=-2)
+        expanded_scale = expanded_scale.repeat_interleave(block_n, dim=-1)
+        expanded_scale = expanded_scale[..., :rows, :cols]
+        result = decoded_flat * expanded_scale
+    return result.to(dtype).reshape(original_shape)
 
 
 def _canonical_dynamic_qparam(
