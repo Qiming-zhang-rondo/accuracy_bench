@@ -478,18 +478,20 @@ def _try_cache_match(
         )
         return None
 
-    # Strategy 3: layer + side + method only (loosest)
+    # Never fall back across model hashes. That can silently replay a cache
+    # from a different model version merely because it is the sole file for
+    # this layer/side/method.
     pattern = (
         f"*_s*_L{target_layer}_{side}_"
         f"{CACHE_FORMAT_VERSION}_*_{quant_method}.pt"
     )
     matches = glob.glob(base + pattern)
-    if len(matches) == 1:
-        logger.info(f"  [CACHE] Matched by layer/side/method only: {os.path.basename(matches[0])}")
-        return torch.load(matches[0], weights_only=True, map_location=device)
-    if len(matches) > 1:
-        logger.info(f"  [CACHE] {len(matches)} ambiguous matches for L{target_layer} {side}, "
-              f"cannot resolve without model_path. Skip.")
+    if matches:
+        logger.info(
+            f"  [CACHE] No cache for requested model hash {mh}; ignored "
+            f"{len(matches)} cache(s) from other model paths for "
+            f"L{target_layer} {side}."
+        )
         return None
 
     return None

@@ -387,6 +387,7 @@ class ShardedBlockComparator:
         self.auto_cache_bad_layer = auto_cache_bad_layer
         self.bad_layer_threshold = bad_layer_threshold
         self.cache_top_k = cache_top_k
+        self._cache_entries_this_run = {}
         self.quant_method = quant_method
         self.l1_target_layers = l1_target_layers  # [5,6,7] 等
         self.compare_mode = compare_mode
@@ -834,6 +835,7 @@ class ShardedBlockComparator:
                            seqlen, layer_idx, "quant", self.quant_method, quant_input,
                            layer_state=quant_layer_state,
                            input_ids=getattr(self, "_input_ids", None))
+        self._cache_entries_this_run[layer_idx] = (p1, p2)
         del ref_input, quant_input
 
         if self.l1_target_layers is not None:
@@ -3615,6 +3617,25 @@ class ShardedBlockComparator:
         ref_reader.close()
         quant_reader.close()
         self._cache_top_k_cleanup(layer_cos_sims, layer_inputs, self.cache_top_k, self.verbose)
+        from .cache import save_latest_l1_cache_manifest
+        current_cache_layers = sorted(
+            layer_idx
+            for layer_idx, paths in self._cache_entries_this_run.items()
+            if all(path and os.path.exists(path) for path in paths)
+        )
+        manifest_path = save_latest_l1_cache_manifest(
+            self.ref_model_path,
+            self.quant_model_path,
+            self._prompt_text,
+            self.quant_method,
+            current_cache_layers,
+        )
+        if self.verbose:
+            logger.info(
+                "  [L2 CACHE] latest manifest: layers=%s (%s)",
+                current_cache_layers,
+                os.path.basename(manifest_path),
+            )
         report = BlockCompareReport()
         report.quant_method = self.quant_method
         report.activation_quant_enabled = bool(self.activation_quant)
@@ -3703,6 +3724,7 @@ class ShardedBlockComparator:
             else f"{input_ids.shape[1]}_tokens"
         )
         self._input_ids = input_ids.detach().cpu()
+        self._cache_entries_this_run = {}
         if self.compare_mode == "grouped_dual":
             return self._compare_grouped_dual(input_ids, layers_per_shard=layers_per_shard, **kwargs)
         return self._compare_dual_sharded(input_ids, layers_per_shard=layers_per_shard, **kwargs)

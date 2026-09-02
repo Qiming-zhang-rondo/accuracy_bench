@@ -1132,10 +1132,29 @@ def _mode_l2(args, l1_report=None):
 
     # 从 cache 扫描可用层
     if target_layers is None:
-        from accuracy_checker.cache import get_cache_dir, model_hash, prompt_hash
+        from accuracy_checker.cache import (
+            get_cache_dir,
+            load_latest_l1_cache_manifest,
+            model_hash,
+            prompt_hash,
+        )
         import re
         _cache_dir = get_cache_dir()
-        if args.ref_model and os.path.exists(_cache_dir):
+        if args.ref_model and args.quant_model and os.path.exists(_cache_dir):
+            latest_layers = load_latest_l1_cache_manifest(
+                args.ref_model,
+                args.quant_model,
+                _cache_input_identity(args),
+                args.quant_method,
+            )
+            if latest_layers is not None:
+                target_layers = latest_layers
+                logger.info(
+                    "  [L2] 使用最近一次 L1 cache manifest: %s",
+                    target_layers,
+                )
+        # Backward compatibility for caches written before manifests existed.
+        if target_layers is None and args.ref_model and os.path.exists(_cache_dir):
             ref_mh = model_hash(args.ref_model)
             ph = prompt_hash(_cache_input_identity(args))
             cached_layers = set()

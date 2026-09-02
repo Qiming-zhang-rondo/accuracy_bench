@@ -11,8 +11,10 @@ Cache 目录:
   目录不存在时自动创建。
 """
 
-import os
 import hashlib
+import json
+import os
+import time
 
 import torch
 
@@ -55,6 +57,58 @@ def _cache_key(model_path, prompt, seqlen, target_layer, side, quant_mode):
     mh = model_hash(model_path)
     ph = prompt_hash(prompt)
     return f"{mh}_{ph}_s{seqlen}_L{target_layer}_{side}_{CACHE_FORMAT_VERSION}_{INT4_UNPACK_VERSION}_{quant_mode}.pt"
+
+
+def _latest_manifest_path(ref_model_path, quant_model_path, prompt, quant_mode):
+    identity = "\0".join((ref_model_path, quant_model_path, prompt, quant_mode))
+    digest = hashlib.sha256(identity.encode()).hexdigest()[:20]
+    return os.path.join(get_cache_dir(), f"latest_l1_{digest}.json")
+
+
+def save_latest_l1_cache_manifest(ref_model_path, quant_model_path, prompt,
+                                  quant_mode, layers):
+    """Publish the cache layers produced by the latest successful L1 run."""
+    cache_dir = get_cache_dir()
+    os.makedirs(cache_dir, exist_ok=True)
+    path = _latest_manifest_path(
+        ref_model_path, quant_model_path, prompt, quant_mode
+    )
+    payload = {
+        "version": 1,
+        "created_at": time.time(),
+        "ref_model_hash": model_hash(ref_model_path),
+        "quant_model_hash": model_hash(quant_model_path),
+        "prompt_hash": prompt_hash(prompt),
+        "quant_mode": quant_mode,
+        "layers": sorted({int(layer) for layer in layers}),
+    }
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+    return path
+
+
+def load_latest_l1_cache_manifest(ref_model_path, quant_model_path, prompt,
+                                  quant_mode):
+    """Return the latest L1 layer set, or None for legacy/no manifest."""
+    path = _latest_manifest_path(
+        ref_model_path, quant_model_path, prompt, quant_mode
+    )
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, TypeError):
+        return None
+    layers = payload.get("layers")
+    if not isinstance(layers, list):
+        return None
+    try:
+        return sorted({int(layer) for layer in layers})
+    except (TypeError, ValueError):
+        return None
 
 
 def save_cache(model_path, prompt, seqlen, target_layer, side, quant_mode,

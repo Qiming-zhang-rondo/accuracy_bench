@@ -31,6 +31,7 @@ from accuracy_checker.model_loader import (
     create_model_skeleton,
     is_quantized_model,
     is_compressed_tensors_model,
+    native_quant_description,
     load_layer_weights_indexed,
     move_layers_to_device,
     unload_layers_to_meta,
@@ -98,8 +99,16 @@ class ReplayProvider:
         self.ref_reader = ShardWeightReader(ref_model_path, self.ref_weight_map)
         self.quant_reader = ShardWeightReader(quant_model_path, self.quant_weight_map)
 
-        # --- quant description (msmodelslim) ---
+        # --- per-checkpoint quant descriptions ---
+        # The reference is not necessarily BF16.  GLM-5.3 reference weights
+        # are native FP8, so reusing the target W4/W8 descriptor for both
+        # sides corrupts expert shape inference during L2 replay.
+        self.ref_quant_desc = self._load_quant_desc(ref_model_path)
+        if self.ref_quant_desc is None:
+            self.ref_quant_desc = native_quant_description(ref_model_path)
         self.quant_desc = self._load_quant_desc(quant_model_path)
+        if self.quant_desc is None:
+            self.quant_desc = native_quant_description(quant_model_path)
         self.is_quant = is_quantized_model(quant_model_path)
         self.is_ct = is_compressed_tensors_model(quant_model_path)
 
@@ -120,6 +129,12 @@ class ReplayProvider:
             logger.info(f"[ReplayProvider] Model has {self.num_layers} layers")
             logger.info(f"[ReplayProvider] ref_rotary: {self.ref_rotary is not None}")
             logger.info(f"[ReplayProvider] quant_rotary: {self.quant_rotary is not None}")
+            logger.info(
+                "[ReplayProvider] ref is_quant=%s is_ct=%s quant_desc=%s",
+                self.ref_is_quant,
+                self.ref_is_ct,
+                self._quant_desc_source(self.ref_quant_desc),
+            )
             logger.info(f"[ReplayProvider] quant is_quant={self.is_quant} is_ct={self.is_ct}")
 
     def _load_quant_desc(self, model_path: str) -> Optional[dict]:
@@ -131,6 +146,16 @@ class ReplayProvider:
             with open(desc_path) as f:
                 return normalize_quant_desc_values(json.load(f))
         return None
+
+    @staticmethod
+    def _quant_desc_source(quant_desc: Optional[dict]) -> str:
+        if not quant_desc:
+            return "none"
+        if quant_desc.get("__acc_native_fp8__") == "FP8_E4M3":
+            return "native_fp8"
+        if "__acc_deepseek_v4_fp4__" in quant_desc:
+            return "native_deepseek_v4"
+        return "quant_model_description"
 
     def get_layer_handle(
         self,
@@ -184,11 +209,13 @@ class ReplayProvider:
             self.ref_model, self.ref_model_path, device,
             self.ref_weight_map, self.ref_reader,
             self.ref_is_quant, self.ref_is_ct,
+            self.ref_quant_desc,
         )
         self._load_embed_tokens(
             self.quant_model, self.quant_model_path, quant_device,
             self.quant_weight_map, self.quant_reader,
             self.is_quant, self.is_ct,
+            self.quant_desc,
         )
 
         # 加载目标层权重
@@ -196,11 +223,13 @@ class ReplayProvider:
             self.ref_model, self.ref_model_path, [layer_idx], device,
             self.ref_weight_map, self.ref_reader,
             self.ref_is_quant, self.ref_is_ct,
+            self.ref_quant_desc,
         )
         self._load_layer_weights(
             self.quant_model, self.quant_model_path, [layer_idx], quant_device,
             self.quant_weight_map, self.quant_reader,
             self.is_quant, self.is_ct,
+            self.quant_desc,
         )
 
         # 获取 hidden_states
@@ -225,12 +254,14 @@ class ReplayProvider:
                 self.ref_model, self.ref_model_path, [layer_idx], device,
                 self.ref_weight_map, self.ref_reader,
                 self.ref_is_quant, self.ref_is_ct,
+                self.ref_quant_desc,
                 clear_others=False,
             )
             self._load_layer_weights(
                 self.quant_model, self.quant_model_path, [layer_idx], quant_device,
                 self.quant_weight_map, self.quant_reader,
                 self.is_quant, self.is_ct,
+                self.quant_desc,
                 clear_others=False,
             )
         else:
@@ -288,7 +319,7 @@ class ReplayProvider:
                 device=device, dtype=self.dtype,
                 weight_map=self.ref_weight_map, sf_reader=self.ref_reader,
                 is_quant=self.ref_is_quant, is_ct=self.ref_is_ct,
-                quant_desc=None,
+                quant_desc=self.ref_quant_desc if self.ref_is_quant else None,
                 use_fake_quant=False, verbose=False,
             )
             move_layers_to_device(self.ref_model, [pl], device, clear_others=False, skip_3d_experts=False)
@@ -373,6 +404,7 @@ class ReplayProvider:
 
     def _load_embed_tokens(
         self, model, model_path, device, weight_map, reader, is_quant, is_ct,
+        quant_desc,
     ):
         """加载 embed_tokens + norm + lm_head 等非层权重。
 
@@ -387,12 +419,13 @@ class ReplayProvider:
                 device=device, dtype=self.dtype,
                 weight_map=weight_map, sf_reader=reader,
                 is_quant=is_quant, is_ct=is_ct,
-                quant_desc=self.quant_desc if is_quant else None,
+                quant_desc=quant_desc if is_quant else None,
                 use_fake_quant=False, verbose=False,
             )
 
     def _load_layer_weights(
         self, model, model_path, layers, device, weight_map, reader, is_quant, is_ct,
+        quant_desc,
         clear_others: bool = True,
     ):
         """加载指定层的权重。"""
@@ -401,7 +434,7 @@ class ReplayProvider:
             device=device, dtype=self.dtype,
             weight_map=weight_map, sf_reader=reader,
             is_quant=is_quant, is_ct=is_ct,
-            quant_desc=self.quant_desc if is_quant else None,
+            quant_desc=quant_desc if is_quant else None,
             use_fake_quant=False, verbose=False,
         )
         # 把目标层移到 device (L2需要完整前向, 不跳过3D expert)
