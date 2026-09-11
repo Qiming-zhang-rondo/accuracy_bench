@@ -19,6 +19,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
+from .token_display import token_display_text
+
 
 _ID_KEYS = ("input_ids", "prompt_token_ids", "tokens")
 _MASK_KEYS = ("attention_mask", "attn_mask", "key_padding_mask")
@@ -223,11 +225,12 @@ def _token_from_item(item: Any) -> Optional[CapturedToken]:
             token_id=int(tid),
             value=float(value) if value is not None else None,
             probability=float(probability) if probability is not None else None,
-            token_str=str(
+            token_str=token_display_text(
                 item.get("token_str")
                 or item.get("decoded_token")
                 or item.get("text")
-                or ""
+                or "",
+                int(tid),
             ),
         )
     if isinstance(item, (list, tuple)) and len(item) >= 2:

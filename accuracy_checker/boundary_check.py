@@ -928,6 +928,8 @@ def _detect_sustained_logits_branch(logits_data, tokenizer):
     """
     import statistics
 
+    from .token_display import token_display_text
+
     positions = list(logits_data.all_token_positions or logits_data.token_positions)
     counts_by_rank = logits_data.topn_overlap_counts or {}
     ranks = sorted((int(rank) for rank in counts_by_rank), reverse=True)
@@ -983,18 +985,24 @@ def _detect_sustained_logits_branch(logits_data, tokenizer):
     context_text = None
     if prefix_end_id is not None:
         try:
-            prefix_end_text = tokenizer.decode([int(prefix_end_id)])
+            prefix_end_text = token_display_text(
+                tokenizer.decode([int(prefix_end_id)]), prefix_end_id
+            )
         except Exception:
             prefix_end_text = None
     if target_id is not None:
         try:
-            target_text = tokenizer.decode([int(target_id)])
+            target_text = token_display_text(
+                tokenizer.decode([int(target_id)]), target_id
+            )
         except Exception:
             target_text = None
         try:
             left = max(0, target_index - 16)
             right = min(len(input_ids), target_index + 17)
-            context_text = tokenizer.decode([int(token_id) for token_id in input_ids[left:right]])
+            context_text = token_display_text(
+                tokenizer.decode([int(token_id) for token_id in input_ids[left:right]])
+            )
         except Exception:
             context_text = None
     confidence = min(1.0, max(

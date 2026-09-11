@@ -28,20 +28,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
-import re
-
 import torch
 
 from .report_schema import LogitsData, TokenProb
-
-# 匹配 Unicode 不可见字符 (零宽空格 \u200b, 零宽连字 \u200c/d, BOM \ufeff, 等控制字符)
-_INVISIBLE_RE = re.compile(r'[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\x00-\x1f\x7f]')
+from .token_display import token_display_text
 
 
 def _clean_token_str(raw: str, tid: int = 0) -> str:
-    """清除不可见字符, 空格替换为 ·, 返回可见标签或 #token_id 兜底."""
-    cleaned = _INVISIBLE_RE.sub('', raw).replace(" ", "·").strip()
-    return cleaned or f"#{tid}"
+    """Backward-compatible alias for the shared display-only formatter."""
+    return token_display_text(raw, tid)
 
 
 # ---------------------------------------------------------------------------

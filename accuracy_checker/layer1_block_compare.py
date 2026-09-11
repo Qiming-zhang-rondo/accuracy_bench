@@ -28,6 +28,7 @@ from .model_structure import (
     is_kimi_k3_layer,
 )
 from .report_schema import LogitsData
+from .token_display import token_display_text
 import logging
 
 
@@ -1031,8 +1032,14 @@ class ShardedBlockComparator:
         quant_topk_tokens = None
         if self.tokenizer is not None:
             try:
-                ref_topk_tokens = [self.tokenizer.decode([tid]) for tid in ref_topk[:top_k]]
-                quant_topk_tokens = [self.tokenizer.decode([tid]) for tid in quant_topk[:top_k]]
+                ref_topk_tokens = [
+                    token_display_text(self.tokenizer.decode([tid]), tid)
+                    for tid in ref_topk[:top_k]
+                ]
+                quant_topk_tokens = [
+                    token_display_text(self.tokenizer.decode([tid]), tid)
+                    for tid in quant_topk[:top_k]
+                ]
             except Exception as e:
                 logger.warning(f"Token decoding failed: {e}")
 
@@ -1311,8 +1318,14 @@ class ShardedBlockComparator:
         quant_tokens_decoded = None
         if self.tokenizer:
             try:
-                ref_tokens_decoded = [self.tokenizer.decode([tid]) for tid in ref_topk]
-                quant_tokens_decoded = [self.tokenizer.decode([tid]) for tid in quant_topk]
+                ref_tokens_decoded = [
+                    token_display_text(self.tokenizer.decode([tid]), tid)
+                    for tid in ref_topk
+                ]
+                quant_tokens_decoded = [
+                    token_display_text(self.tokenizer.decode([tid]), tid)
+                    for tid in quant_topk
+                ]
             except Exception as e:
                 logger.warning(f"Failed to decode tokens: {e}")
 
