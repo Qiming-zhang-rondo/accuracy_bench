@@ -1,0 +1,732 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Accuracy Bench｜大模型量化精度诊断工具</title>
+  <style>
+    :root {
+      --ink: #172033;
+      --muted: #667085;
+      --line: #e5e7eb;
+      --paper: #f4f7fb;
+      --card: #ffffff;
+      --navy: #183b56;
+      --teal: #176b55;
+      --teal-2: #2d8a70;
+      --teal-soft: #e8f4ef;
+      --blue: #3867d6;
+      --blue-soft: #edf3ff;
+      --indigo: #4f46e5;
+      --orange: #e8793a;
+      --orange-soft: #fff0e6;
+      --red: #c2413b;
+      --red-soft: #fff0ef;
+      --shadow: 0 18px 55px rgba(24, 59, 86, .10);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 0 0, rgba(45, 138, 112, .08), transparent 26rem),
+        var(--paper);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      line-height: 1.55;
+    }
+
+    .deck {
+      width: min(1180px, calc(100% - 40px));
+      margin: 32px auto 80px;
+    }
+
+    .slide {
+      position: relative;
+      min-height: 664px;
+      margin: 0 0 28px;
+      padding: 58px 64px;
+      overflow: hidden;
+      background: var(--card);
+      border: 1px solid rgba(24, 59, 86, .08);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+    }
+
+    .slide::before {
+      content: "";
+      position: absolute;
+      inset: 0 0 auto;
+      height: 5px;
+      background: linear-gradient(90deg, var(--teal), var(--blue), var(--indigo));
+    }
+
+    .slide-no {
+      position: absolute;
+      top: 30px;
+      right: 38px;
+      color: #98a2b3;
+      font-size: 12px;
+      letter-spacing: .12em;
+    }
+
+    h1, h2, h3, p { margin-top: 0; }
+    h1 {
+      max-width: 880px;
+      margin-bottom: 24px;
+      color: var(--navy);
+      font-size: clamp(42px, 6.2vw, 78px);
+      line-height: 1.04;
+      letter-spacing: -.045em;
+    }
+    h2 {
+      margin-bottom: 28px;
+      color: var(--navy);
+      font-size: clamp(30px, 4vw, 46px);
+      line-height: 1.14;
+      letter-spacing: -.035em;
+    }
+    h3 { margin-bottom: 8px; font-size: 18px; }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 18px;
+      color: var(--teal);
+      font-size: 13px;
+      font-weight: 750;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+    .eyebrow::before {
+      content: "";
+      width: 26px;
+      height: 3px;
+      border-radius: 9px;
+      background: currentColor;
+    }
+    .lead {
+      max-width: 850px;
+      color: #42526b;
+      font-size: clamp(18px, 2vw, 24px);
+      line-height: 1.55;
+    }
+    .small { color: var(--muted); font-size: 13px; }
+    .accent { color: var(--teal); }
+    .orange { color: var(--orange); }
+    .indigo { color: var(--indigo); }
+
+    .hero {
+      display: grid;
+      grid-template-columns: 1.15fr .85fr;
+      gap: 44px;
+      align-items: center;
+      min-height: 540px;
+    }
+    .hero-copy { position: relative; z-index: 2; }
+    .hero-note {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      margin-top: 36px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .hero-note span {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--teal-2);
+      box-shadow: 0 0 0 6px var(--teal-soft);
+    }
+    .hero-visual {
+      position: relative;
+      min-height: 430px;
+      display: grid;
+      place-items: center;
+    }
+    .orbit {
+      position: absolute;
+      width: 390px;
+      height: 390px;
+      border: 1px dashed rgba(56, 103, 214, .28);
+      border-radius: 50%;
+      animation: drift 18s linear infinite;
+    }
+    .orbit::after {
+      content: "";
+      position: absolute;
+      top: 36px;
+      right: 32px;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: var(--orange);
+      box-shadow: 0 0 0 9px var(--orange-soft);
+    }
+    @keyframes drift { to { transform: rotate(360deg); } }
+    .diagnostic-card {
+      position: relative;
+      z-index: 1;
+      width: 335px;
+      padding: 28px;
+      border-radius: 22px;
+      background: linear-gradient(155deg, #173b56, #1c4b5e 60%, #176b55);
+      color: white;
+      box-shadow: 0 28px 70px rgba(24, 59, 86, .28);
+    }
+    .diag-title { color: rgba(255,255,255,.72); font-size: 12px; letter-spacing: .12em; }
+    .diag-main { margin: 8px 0 24px; font-size: 27px; font-weight: 760; }
+    .spark { display: flex; height: 110px; gap: 8px; align-items: end; }
+    .spark i { flex: 1; border-radius: 7px 7px 2px 2px; background: rgba(255,255,255,.32); }
+    .spark i:nth-child(6), .spark i:nth-child(7) { background: #ffb27f; }
+    .diag-foot { display: flex; justify-content: space-between; margin-top: 18px; color: rgba(255,255,255,.78); font-size: 12px; }
+
+    .kpis {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+      margin-top: 44px;
+    }
+    .kpi, .card {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: white;
+    }
+    .kpi { padding: 20px; }
+    .kpi strong { display: block; color: var(--navy); font-size: 29px; line-height: 1.1; }
+    .kpi span { color: var(--muted); font-size: 13px; }
+
+    .problem-grid {
+      display: grid;
+      grid-template-columns: .88fr 1.12fr;
+      gap: 34px;
+      align-items: stretch;
+    }
+    .quote {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      min-height: 390px;
+      padding: 34px;
+      border-radius: 22px;
+      background: var(--navy);
+      color: white;
+    }
+    .quote p { font-size: 27px; line-height: 1.45; letter-spacing: -.02em; }
+    .quote footer { color: rgba(255,255,255,.66); font-size: 13px; }
+    .pain-list { display: grid; gap: 14px; }
+    .pain {
+      display: grid;
+      grid-template-columns: 42px 1fr;
+      gap: 14px;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: #fbfcfe;
+    }
+    .pain b {
+      display: grid;
+      place-items: center;
+      width: 42px;
+      height: 42px;
+      border-radius: 13px;
+      color: var(--red);
+      background: var(--red-soft);
+    }
+    .pain strong { display: block; margin-bottom: 2px; }
+    .pain span { color: var(--muted); font-size: 14px; }
+
+    .funnel {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 18px;
+      margin-top: 36px;
+    }
+    .stage {
+      position: relative;
+      min-height: 310px;
+      padding: 24px 22px;
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      background: linear-gradient(180deg, white, #fafcff);
+    }
+    .stage:not(:last-child)::after {
+      content: "→";
+      position: absolute;
+      z-index: 2;
+      top: 44%;
+      right: -25px;
+      width: 32px;
+      height: 32px;
+      display: grid;
+      place-items: center;
+      border-radius: 50%;
+      color: var(--blue);
+      background: white;
+      border: 1px solid var(--line);
+      box-shadow: 0 5px 14px rgba(24, 59, 86, .09);
+    }
+    .stage-num {
+      display: inline-grid;
+      place-items: center;
+      width: 42px;
+      height: 42px;
+      margin-bottom: 46px;
+      border-radius: 14px;
+      color: white;
+      background: var(--teal);
+      font-weight: 800;
+    }
+    .stage:nth-child(2) .stage-num { background: var(--blue); }
+    .stage:nth-child(3) .stage-num { background: var(--orange); }
+    .stage:nth-child(4) .stage-num { background: var(--indigo); }
+    .stage p { color: var(--muted); font-size: 14px; }
+    .tag {
+      display: inline-block;
+      margin: 3px 3px 0 0;
+      padding: 4px 8px;
+      border-radius: 999px;
+      background: #f0f3f7;
+      color: #556070;
+      font-size: 11px;
+    }
+
+    .feature-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 18px;
+    }
+    .feature {
+      padding: 24px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: white;
+    }
+    .feature-head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+    .icon {
+      display: grid;
+      place-items: center;
+      width: 44px;
+      height: 44px;
+      border-radius: 13px;
+      color: var(--teal);
+      background: var(--teal-soft);
+      font-weight: 800;
+    }
+    .feature:nth-child(2) .icon { color: var(--blue); background: var(--blue-soft); }
+    .feature:nth-child(3) .icon { color: var(--orange); background: var(--orange-soft); }
+    .feature:nth-child(4) .icon { color: var(--indigo); background: #efefff; }
+    .feature p { margin: 0; color: var(--muted); font-size: 14px; }
+    .formula {
+      margin-top: 15px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      color: #42526b;
+      background: #f6f8fb;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+    }
+
+    .report-demo {
+      display: grid;
+      grid-template-columns: .88fr 1.12fr;
+      gap: 28px;
+      align-items: center;
+    }
+    .mock-window {
+      overflow: hidden;
+      border: 1px solid #dce2ea;
+      border-radius: 18px;
+      background: white;
+      box-shadow: 0 18px 40px rgba(24, 59, 86, .12);
+    }
+    .mock-bar { display: flex; gap: 7px; padding: 13px 16px; background: #f5f7fa; }
+    .mock-bar i { width: 9px; height: 9px; border-radius: 50%; background: #d0d5dd; }
+    .mock-body { padding: 20px; }
+    .mock-summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px; }
+    .mini { padding: 12px; border-radius: 10px; background: #f6f8fb; }
+    .mini span { display: block; color: #98a2b3; font-size: 9px; }
+    .mini b { color: var(--navy); font-size: 13px; }
+    .curve { width: 100%; height: 155px; margin-top: 14px; }
+    .legend { display: flex; gap: 14px; margin-top: 10px; color: var(--muted); font-size: 10px; }
+    .legend i { display: inline-block; width: 8px; height: 8px; margin-right: 4px; border-radius: 50%; }
+    .bullet-list { display: grid; gap: 16px; }
+    .bullet { display: grid; grid-template-columns: 22px 1fr; gap: 12px; }
+    .bullet::before { content: "✓"; color: var(--teal); font-weight: 900; }
+    .bullet strong { display: block; }
+    .bullet span { color: var(--muted); font-size: 14px; }
+
+    .tech-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 18px;
+      margin-top: 30px;
+    }
+    .tech {
+      min-height: 250px;
+      padding: 24px;
+      border-radius: 20px;
+      background: #f8fafc;
+      border: 1px solid var(--line);
+    }
+    .tech-index { color: var(--teal); font-size: 12px; font-weight: 800; letter-spacing: .1em; }
+    .tech h3 { margin-top: 40px; }
+    .tech p { color: var(--muted); font-size: 14px; }
+    .tech-rule { width: 42px; height: 3px; margin-top: 18px; border-radius: 5px; background: var(--teal); }
+    .tech:nth-child(2) .tech-index { color: var(--blue); }
+    .tech:nth-child(2) .tech-rule { background: var(--blue); }
+    .tech:nth-child(3) .tech-index { color: var(--orange); }
+    .tech:nth-child(3) .tech-rule { background: var(--orange); }
+
+    .matrix {
+      display: grid;
+      grid-template-columns: 1.1fr 1fr;
+      gap: 26px;
+      margin-top: 28px;
+    }
+    .matrix-box { padding: 25px; border: 1px solid var(--line); border-radius: 19px; }
+    .model-cloud { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 22px; }
+    .model-cloud span {
+      padding: 9px 13px;
+      border: 1px solid #dfe5eb;
+      border-radius: 12px;
+      color: #344054;
+      background: #fbfcfe;
+      font-size: 13px;
+    }
+    .formats { display: grid; gap: 12px; margin-top: 20px; }
+    .format { display: grid; grid-template-columns: 74px 1fr; align-items: center; gap: 10px; }
+    .format b { color: var(--navy); font-size: 13px; }
+    .format em {
+      justify-self: start;
+      padding: 5px 10px;
+      border-radius: 999px;
+      color: var(--teal);
+      background: var(--teal-soft);
+      font-size: 11px;
+      font-style: normal;
+      font-weight: 750;
+    }
+
+    .closing {
+      display: grid;
+      grid-template-columns: 1fr .8fr;
+      gap: 48px;
+      align-items: center;
+      min-height: 510px;
+    }
+    .big-statement {
+      margin-bottom: 28px;
+      color: var(--navy);
+      font-size: clamp(34px, 4.6vw, 58px);
+      font-weight: 800;
+      line-height: 1.16;
+      letter-spacing: -.04em;
+    }
+    .takeaways { display: grid; gap: 14px; }
+    .takeaway { padding-left: 16px; border-left: 3px solid var(--teal); color: #42526b; }
+    .closing-panel {
+      padding: 30px;
+      border-radius: 24px;
+      background: linear-gradient(155deg, #173b56, #176b55);
+      color: white;
+    }
+    .closing-panel h3 { font-size: 23px; }
+    .closing-panel ol { margin: 22px 0 0; padding-left: 22px; color: rgba(255,255,255,.82); }
+    .closing-panel li { padding: 8px 0; }
+
+    .nav {
+      position: fixed;
+      z-index: 20;
+      right: 18px;
+      top: 50%;
+      display: grid;
+      gap: 8px;
+      transform: translateY(-50%);
+    }
+    .nav a {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: #bcc5d0;
+      transition: .2s ease;
+    }
+    .nav a:hover { transform: scale(1.5); background: var(--teal); }
+
+    @media (max-width: 860px) {
+      .slide { min-height: auto; padding: 48px 28px; }
+      .hero, .problem-grid, .report-demo, .matrix, .closing { grid-template-columns: 1fr; }
+      .hero-visual { display: none; }
+      .funnel, .kpis, .tech-grid { grid-template-columns: repeat(2, 1fr); }
+      .stage:not(:last-child)::after { display: none; }
+      .nav { display: none; }
+    }
+    @media (max-width: 560px) {
+      .deck { width: min(100% - 18px, 1180px); margin-top: 10px; }
+      .slide { border-radius: 16px; padding: 42px 20px; }
+      .funnel, .kpis, .tech-grid, .feature-grid { grid-template-columns: 1fr; }
+    }
+
+    @media print {
+      @page { size: A4 landscape; margin: 0; }
+      body { background: white; }
+      .deck { width: 100%; margin: 0; }
+      .slide {
+        width: 297mm;
+        min-height: 210mm;
+        margin: 0;
+        border: 0;
+        border-radius: 0;
+        box-shadow: none;
+        page-break-after: always;
+      }
+      .slide:last-child { page-break-after: auto; }
+      .nav { display: none; }
+      .orbit { animation: none; }
+    }
+  </style>
+</head>
+<body>
+  <nav class="nav" aria-label="页面导航">
+    <a href="#cover" title="封面"></a><a href="#why" title="为什么需要"></a>
+    <a href="#flow" title="诊断链路"></a><a href="#core" title="核心能力"></a>
+    <a href="#report" title="报告呈现"></a><a href="#engineering" title="工程能力"></a>
+    <a href="#scope" title="支持范围"></a><a href="#summary" title="总结"></a>
+  </nav>
+
+  <main class="deck">
+    <section class="slide" id="cover">
+      <div class="slide-no">01 / 08</div>
+      <div class="hero">
+        <div class="hero-copy">
+          <div class="eyebrow">Accuracy Bench</div>
+          <h1>大模型量化<br><span class="accent">精度诊断工具</span></h1>
+          <p class="lead">从“输出不对”逐步收敛到“哪条执行路径、哪一层、哪个子图、哪个算子”，为量化方案迭代提供可解释、可复现的证据链。</p>
+          <div class="hero-note"><span></span>面向 Ascend NPU · 支持超大 MoE 与长上下文</div>
+        </div>
+        <div class="hero-visual" aria-hidden="true">
+          <div class="orbit"></div>
+          <div class="diagnostic-card">
+            <div class="diag-title">L1 LAYER ALIGNMENT</div>
+            <div class="diag-main">首个显著发散：Layer 73</div>
+            <div class="spark">
+              <i style="height:92%"></i><i style="height:88%"></i><i style="height:83%"></i>
+              <i style="height:76%"></i><i style="height:70%"></i><i style="height:43%"></i>
+              <i style="height:28%"></i><i style="height:24%"></i>
+            </div>
+            <div class="diag-foot"><span>Ref vs Quant</span><span>Cosine / Rel-L2 / SNR</span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="slide" id="why">
+      <div class="slide-no">02 / 08</div>
+      <div class="eyebrow">Problem</div>
+      <h2>量化精度问题，难点不在“发现”，而在<span class="orange">快速归因</span></h2>
+      <div class="problem-grid">
+        <blockquote class="quote">
+          <p>同样一个坏输出，可能来自权重量化、激活量化、推理框架、并行通信、KV Cache，也可能只是低 margin 下的采样分叉。</p>
+          <footer>没有分层证据时，只能反复换参数、换版本、重跑整模型。</footer>
+        </blockquote>
+        <div class="pain-list">
+          <div class="pain"><b>1</b><div><strong>端到端现象无法直接定位</strong><span>乱码、复读、答案漂移只是结果，不能说明根因在哪。</span></div></div>
+          <div class="pain"><b>2</b><div><strong>大模型不适合整模型双份常驻</strong><span>数百 B MoE、长 prompt、混合量化对显存和内存提出更高要求。</span></div></div>
+          <div class="pain"><b>3</b><div><strong>逐层误差不等于根因</strong><span>误差会沿网络传播，最低 cosine 层可能只是被上游污染。</span></div></div>
+          <div class="pain"><b>4</b><div><strong>不同执行栈难以公平比较</strong><span>必须统一 input_ids、position 与 sampler 前 logits 才能排除输入差异。</span></div></div>
+        </div>
+      </div>
+      <div class="kpis">
+        <div class="kpi"><strong>定位</strong><span>从模型级缩小到算子级</span></div>
+        <div class="kpi"><strong>定界</strong><span>框架路径 vs 量化权重</span></div>
+        <div class="kpi"><strong>复现</strong><span>输入与中间状态可追溯</span></div>
+        <div class="kpi"><strong>解释</strong><span>指标、结论与修复点关联</span></div>
+      </div>
+    </section>
+
+    <section class="slide" id="flow">
+      <div class="slide-no">03 / 08</div>
+      <div class="eyebrow">Diagnostic Funnel</div>
+      <h2>四层漏斗：从异常输出收敛到根因算子</h2>
+      <p class="lead">每一级回答一个明确问题，并把下一步搜索空间压缩一个数量级。</p>
+      <div class="funnel">
+        <article class="stage">
+          <div class="stage-num">B</div>
+          <h3>Boundary 定界</h3>
+          <p>同一 checkpoint 用纯 Transformers 重放，判断异常更偏部署框架执行路径，还是量化模型本身。</p>
+          <span class="tag">必现生成</span><span class="tag">偶现 logits replay</span>
+        </article>
+        <article class="stage">
+          <div class="stage-num">L1</div>
+          <h3>逐层粗定位</h3>
+          <p>Ref/Quant 逐 block 对比 hidden state，找到首个显著突降层和最大误差层。</p>
+          <span class="tag">Cosine</span><span class="tag">Rel-L2</span><span class="tag">SNR</span>
+        </article>
+        <article class="stage">
+          <div class="stage-num">L2</div>
+          <h3>反事实子图诊断</h3>
+          <p>将 Quant 子图输出替换为 Ref 对应输出，观察误差恢复比例，定位关键边界与根因嫌疑。</p>
+          <span class="tag">Patch Recovery</span><span class="tag">SelfRotErr</span>
+        </article>
+        <article class="stage">
+          <div class="stage-num">P</div>
+          <h3>Token / Logits 证据</h3>
+          <p>在 token position 上比较分布、排序与 margin，识别真正分岔点和低 margin 敏感翻转。</p>
+          <span class="tag">KL</span><span class="tag">Top-K overlap</span><span class="tag">Margin</span>
+        </article>
+      </div>
+    </section>
+
+    <section class="slide" id="core">
+      <div class="slide-no">04 / 08</div>
+      <div class="eyebrow">Core Methods</div>
+      <h2>关键不是多算几个指标，而是让指标对应<span class="accent">可验证的判断</span></h2>
+      <div class="feature-grid">
+        <article class="feature">
+          <div class="feature-head"><div class="icon">Δ</div><div><h3>L1：首个发散层</h3><div class="small">定位误差开始显著放大的位置</div></div></div>
+          <p>同时观察绝对阈值与相邻层 delta，避免把“误差累积后的最低点”误判为起因。</p>
+          <div class="formula">Δcos(l) = cos(l) − cos(l−1)</div>
+        </article>
+        <article class="feature">
+          <div class="feature-head"><div class="icon">↺</div><div><h3>L2：反事实恢复</h3><div class="small">直接验证“替换它能否修复”</div></div></div>
+          <p>大子图用 Patch Recovery；旋转空间内部链路用 SelfRotErr / RotBErr；离散路由看 Flip Rate。</p>
+          <div class="formula">Recovery = (Ebase − Epatched) / Ebase</div>
+        </article>
+        <article class="feature">
+          <div class="feature-head"><div class="icon">≋</div><div><h3>Boundary：执行路径定界</h3><div class="small">区分框架、算子与权重问题</div></div></div>
+          <p>必现问题比较生成结果；偶现问题直接导入现场 input_ids 与 logits，避免重复 tokenize 和 ChatTemplate。</p>
+          <div class="formula">captured input_ids → Transformers replay</div>
+        </article>
+        <article class="feature">
+          <div class="feature-head"><div class="icon">K</div><div><h3>Logits：分岔敏感度</h3><div class="small">不把所有 Top-1 flip 都判成严重异常</div></div></div>
+          <p>联合 cosine、KL、Top-K overlap 与 Top-1/Top-2 margin，识别低 margin 排序翻转和持续性分岔。</p>
+          <div class="formula">高相似 + 小 margin flip ⇒ ranking-sensitive</div>
+        </article>
+      </div>
+    </section>
+
+    <section class="slide" id="report">
+      <div class="slide-no">05 / 08</div>
+      <div class="eyebrow">Evidence Report</div>
+      <h2>一份报告串起“现象—层—子图—token”证据链</h2>
+      <div class="report-demo">
+        <div class="mock-window" aria-label="报告界面示意图">
+          <div class="mock-bar"><i></i><i></i><i></i></div>
+          <div class="mock-body">
+            <div class="mock-summary">
+              <div class="mini"><span>BOUNDARY</span><b>Framework Path</b></div>
+              <div class="mini"><span>FIRST DROP</span><b>Layer 73</b></div>
+              <div class="mini"><span>ROOT SUSPECT</span><b>q_a_proj</b></div>
+            </div>
+            <svg class="curve" viewBox="0 0 520 170" role="img" aria-label="逐层余弦相似度曲线示意">
+              <defs><linearGradient id="area" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#176b55" stop-opacity=".28"/><stop offset="1" stop-color="#176b55" stop-opacity="0"/></linearGradient></defs>
+              <path d="M12 146H508M12 104H508M12 62H508M12 20H508" stroke="#e8ecf1" stroke-width="1"/>
+              <path d="M12 28 C88 30,106 36,168 40 S267 43,304 54 S338 104,368 119 S448 133,508 139 L508 160 L12 160Z" fill="url(#area)"/>
+              <path d="M12 28 C88 30,106 36,168 40 S267 43,304 54 S338 104,368 119 S448 133,508 139" fill="none" stroke="#176b55" stroke-width="4" stroke-linecap="round"/>
+              <line x1="338" y1="12" x2="338" y2="158" stroke="#e8793a" stroke-width="2" stroke-dasharray="5 5"/>
+              <circle cx="338" cy="104" r="6" fill="#e8793a" stroke="white" stroke-width="3"/>
+            </svg>
+            <div class="legend"><span><i style="background:#176b55"></i>逐层 cosine</span><span><i style="background:#e8793a"></i>首个显著突降</span></div>
+          </div>
+        </div>
+        <div class="bullet-list">
+          <div class="bullet"><div><strong>一屏结论</strong><span>先给定界结论、首个候选层、关键修复边界和根因嫌疑。</span></div></div>
+          <div class="bullet"><div><strong>逐层与子图可下钻</strong><span>从全层趋势进入目标层，查看 Recovery、SelfRotErr、RotBErr 与 Flip Rate。</span></div></div>
+          <div class="bullet"><div><strong>长序列按需渲染</strong><span>6 万级 position 使用 Canvas、虚拟列表和按需 Top-K 明细，兼顾连续性与交互性能。</span></div></div>
+          <div class="bullet"><div><strong>完整实验归档</strong><span>输入方式、量化配置、设备拓扑、逐次生成及 JSON/HTML 结果可追溯。</span></div></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="slide" id="engineering">
+      <div class="slide-no">06 / 08</div>
+      <div class="eyebrow">Engineering for Large Models</div>
+      <h2>围绕超大模型做工程化，而不是假设整模型都能常驻</h2>
+      <div class="tech-grid">
+        <article class="tech">
+          <div class="tech-index">MEMORY</div>
+          <h3>分片加载与流式 Expert</h3>
+          <p>模型骨架置于 meta device，按 shard 加载当前层；MoE expert 按路由命中流式读取或以压缩形态常驻，降低峰值占用。</p>
+          <div class="tech-rule"></div>
+        </article>
+        <article class="tech">
+          <div class="tech-index">PARALLEL</div>
+          <h3>Ref / Quant 并发与长 Prefill TP</h3>
+          <p>Ref、Quant 使用独立设备组并发 forward；GLM/DeepSeek 长 prefill 支持 query-parallel blockwise exact top-k。</p>
+          <div class="tech-rule"></div>
+        </article>
+        <article class="tech">
+          <div class="tech-index">FIDELITY</div>
+          <h3>量化描述自动驱动</h3>
+          <p>识别 W8A8、W4A8、W4A4、MXFP8/MXFP4、原生 FP8 ref 与混合精度 descriptor，按实际格式执行反量化或激活 QDQ。</p>
+          <div class="tech-rule"></div>
+        </article>
+      </div>
+      <div class="kpis">
+        <div class="kpi"><strong>Exact</strong><span>分块 top-k / online softmax 数学等价</span></div>
+        <div class="kpi"><strong>Bounded</strong><span>临时张量受 query/key block 控制</span></div>
+        <div class="kpi"><strong>Cached</strong><span>L1 候选层状态复用于 L2</span></div>
+        <div class="kpi"><strong>Traceable</strong><span>配置、输入与结果统一归档</span></div>
+      </div>
+    </section>
+
+    <section class="slide" id="scope">
+      <div class="slide-no">07 / 08</div>
+      <div class="eyebrow">Coverage</div>
+      <h2>覆盖主流模型结构与多种量化形态</h2>
+      <div class="matrix">
+        <div class="matrix-box">
+          <h3>模型结构</h3>
+          <p class="small">同一套流程通过结构探测适配 Dense、MoE、MLA/DSA、线性注意力与投机解码草稿模型。</p>
+          <div class="model-cloud">
+            <span>GLM-5.x</span><span>DeepSeek-V4</span><span>Qwen3</span>
+            <span>Qwen3 MoE</span><span>Qwen3.5 / 3.6</span><span>Qwen3-VL</span>
+            <span>Kimi K3</span><span>DSpark L1</span>
+          </div>
+        </div>
+        <div class="matrix-box">
+          <h3>量化格式</h3>
+          <p class="small">参考侧与量化侧分别识别；原生 FP8 参考权重可解码到 A3 支持的 BF16 执行。</p>
+          <div class="formats">
+            <div class="format"><b>W8A8</b><em>已支持</em></div>
+            <div class="format"><b>W4A8</b><em>已支持</em></div>
+            <div class="format"><b>W4A4</b><em>已支持</em></div>
+            <div class="format"><b>MXFP8</b><em>已支持</em></div>
+            <div class="format"><b>MXFP4</b><em>已支持</em></div>
+          </div>
+        </div>
+      </div>
+      <p class="small" style="margin-top:22px">注：覆盖深度依模型结构而异；DSpark 当前聚焦 standalone draft 的 L1 对齐，超大 ModuleList MoE 的 L2 受单层物化能力约束。</p>
+    </section>
+
+    <section class="slide" id="summary">
+      <div class="slide-no">08 / 08</div>
+      <div class="closing">
+        <div>
+          <div class="eyebrow">Summary</div>
+          <div class="big-statement">把量化精度优化从“经验试错”变成<span class="accent">证据驱动</span>。</div>
+          <div class="takeaways">
+            <div class="takeaway"><strong>先定界：</strong>明确是部署框架路径还是量化模型本身。</div>
+            <div class="takeaway"><strong>再定位：</strong>L1 找层，L2 用反事实实验找关键子图与算子。</div>
+            <div class="takeaway"><strong>最后验证：</strong>用 token/logits 分布和真实坏例闭环修复效果。</div>
+          </div>
+        </div>
+        <aside class="closing-panel">
+          <h3>在总体量化方案中的位置</h3>
+          <ol>
+            <li>量化策略设计与校准</li>
+            <li>模型转换与部署</li>
+            <li><strong>Accuracy Bench 精度诊断</strong></li>
+            <li>按根因调整混合精度 / 算子 / 框架</li>
+            <li>回归验证与报告归档</li>
+          </ol>
+        </aside>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
