@@ -8,6 +8,31 @@
 - **部署工程师**: 关心哪层坏 → L1 找 cos_sim 最低层
 - **框架开发**: 关心误差来自量化还是推理框架 → 定界 (反量化 → generate)
 
+## Qwen3.8-Flash-Next 文本适配
+
+模型的真实 HF 类型为 `qwen4_exp` / `qwen4_exp_text`，不是 Qwen3.5 的别名。
+需安装包含 `transformers.models.qwen4_exp` 的 Transformers（本地 CPU 对照测试使用 5.19.0）。
+CLI 可使用 `--model_type qwen4_exp`（或 `qwen3_8_flash_next`），参数页面也已提供该选项。
+
+- L1 推荐 `--compare_mode grouped_dual --prefill_parallel pp`，保留官方 GatedDeltaNet、QSA、PLE 和四路 hyper-connection 计算；最终 logits 先经过官方 `hyper_connection_mixer`。
+- PLE 大词表支持原始浮点及 `ngram_embedding.shard_N.weight` 分片，使用 safetensors mmap 按需读取行，不将整张词表复制到 NPU。表缺失、分片不全或不支持的 PLE 量化格式会报错。
+- L2 使用 L1 缓存中的原始 `input_ids`，重放 PLE/注意力/MoE；细粒度诊断包含 hyper-connection 的张量投影。不会将 QSA mask 当成 GLM indexer 的 top-k IDs 做 flip-rate 统计。
+- Boundary 支持同一文本结构的生成/KV cache 与 captured-input logits replay。普通权重按 PP 分配；routed expert 沿用按需加载/反量化的小算子路径，**不是全部 BF16 expert 常驻**，不能视为部署性能基准。
+- 目前不支持 QSA 的长 prefill TP、视觉输入、MTP 比较；`--prefill_parallel tp` 对本模型明确报错。先用短 prompt 验证，再逐步增加长度，原生 QSA 的长序列显存和速度仍需单独优化。
+
+已用官方小尺寸模型检查按层 logits、流式 expert、PLE 分片、decode cache、L2 replay 和混合量化加载；尚未在 A3 上验证完整模型及实际量化产物，不能据此宣称整模 NPU 验收通过。
+
+```bash
+python3 run_accuracy_check.py --mode l1 \
+  --ref_model /path/to/Qwen3.8-Flash-Next \
+  --quant_model /path/to/quantized-checkpoint \
+  --model_type qwen4_exp --compare_mode grouped_dual \
+  --ref_devices npu:0,1,2,3 --quant_devices npu:4,5,6,7 \
+  --prefill_parallel pp --layers_per_shard 1 --cache_top_k 1 \
+  --quant_method dequantize --dtype bfloat16 \
+  --prompt '你好，请简要介绍自己。'
+```
+
 ## TL;DR
 
 > **前置**: `npu-smi info` 确认卡空闲; `OMP_NUM_THREADS=8` 防 futex livelock (streaming expert 必设)

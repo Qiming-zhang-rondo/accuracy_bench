@@ -214,7 +214,7 @@ def parse_args():
                                  "glm_mla", "glm_moe_dsa",
                                  "deepseek_v4",
                                  "qwen3", "qwen3_moe", "qwen3_5_moe", "qwen3_vl",
-                                 "qwen3_6", "qwen3_6_moe", "kimi_k3", "dspark"],
+                                 "qwen3_6", "qwen3_6_moe", "qwen4_exp", "qwen3_8_flash_next", "kimi_k3", "dspark"],
                         help="L2: 模型类型 (默认 auto 自动检测; 偶尔需手动覆盖; "
                              "qwen3=Qwen3/Qwen2, qwen3_moe=Qwen3 MoE, "
                              "qwen3_5_moe=Qwen3.5/3.6 official model_type, "
@@ -611,6 +611,9 @@ def run_hf_l1(args, ref_device, target_device, dtype):
     from transformers import AutoTokenizer
     from accuracy_checker.glm_dsa_blockwise import install_glm_dsa_blockwise_indexer
     from accuracy_checker.deepseek_v4_blockwise import install_deepseek_v4_blockwise_runtime
+    from accuracy_checker.qwen4_exp import check_parallel_mode
+    for path in (args.ref_model, args.quant_model):
+        check_parallel_mode(path, getattr(args, "prefill_parallel", "pp"))
     ref_tp_devices = _parse_dev_list(getattr(args, "ref_devices", None)) or [ref_device]
     quant_tp_devices = _parse_dev_list(getattr(args, "quant_devices", None)) or [target_device]
     glm_blockwise_ok = install_glm_dsa_blockwise_indexer(

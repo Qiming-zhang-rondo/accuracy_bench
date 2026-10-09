@@ -152,6 +152,9 @@ def uses_attention_residuals(layer: nn.Module) -> bool:
 
 def get_layer_state_kwarg(layer: nn.Module) -> Optional[str]:
     """Return the cross-layer state keyword understood by this decoder layer."""
+    from .qwen4_exp import is_qwen4_layer
+    if is_qwen4_layer(layer):
+        return None  # QSA selection is per-layer, not GLM's cross-layer top-k.
     if uses_attention_residuals(layer):
         return "block_residual"
     attn = _safe_getattr(layer, "self_attn")

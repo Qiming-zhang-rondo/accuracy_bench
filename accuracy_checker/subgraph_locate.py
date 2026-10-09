@@ -736,6 +736,9 @@ def detect_model_type(layer: torch.nn.Module) -> str:
     """
     if is_kimi_k3_layer(layer):
         return 'kimi_k3'
+    from .qwen4_exp import is_qwen4_layer
+    if is_qwen4_layer(layer):
+        return 'qwen4_exp'
 
     # DeepSeek-V4 uses HCA/CSA attention and hash/router MoE modules; do not
     # mistake its ``mlp`` for GLM-MoE-DSA merely because both are sparse MoE.
@@ -912,6 +915,22 @@ def _get_qwen3_5_moe_subgraph_names(layer: torch.nn.Module, mla_fine: bool) -> L
     return names
 
 
+def _get_qwen4_subgraph_names(layer: torch.nn.Module, mla_fine: bool) -> List[str]:
+    names = _get_qwen3_5_moe_subgraph_names(layer, mla_fine)
+    if getattr(layer, 'ple', None) is not None:
+        names.insert(0, 'ple')
+    # The whole hyper-connection returns (read, bypass, injection). Existing
+    # patch hooks replace only the first tuple element, so expose tensor-valued
+    # projections instead of labelling that partial cut a whole-module patch.
+    if mla_fine:
+        for prefix in ('attn_hyper_connection', 'mlp_hyper_connection'):
+            names.extend(f'{prefix}.{name}' for name in (
+                'input_mix_weight_down', 'input_mix_weight_up', 'block_inject_weight'))
+        # QSA returns a visibility mask, not GLM top-k IDs/scores. Do not feed
+        # that mask into the GLM indexer flip-rate metric.
+    return names
+
+
 def _get_kimi_k3_subgraph_names(layer: torch.nn.Module, mla_fine: bool) -> List[str]:
     """Subgraphs for Kimi K3 KDA/MLA + Stable LatentMoE + AttnRes."""
     names = ['self_attn']
@@ -985,6 +1004,9 @@ def _get_glm_mla_subgraph_names(layer: torch.nn.Module, mla_fine: bool) -> List[
 # Dispatch table for model-type → subgraph name generator.
 # Each helper takes (layer, mla_fine) and returns the list of subgraph names.
 _SUBGRAPH_NAME_DISPATCH = {
+    'qwen4_exp': _get_qwen4_subgraph_names,
+    'qwen4_exp_text': _get_qwen4_subgraph_names,
+    'qwen3_8_flash_next': _get_qwen4_subgraph_names,
     'glm_moe_dsa': _get_glm_moe_dsa_subgraph_names,
     'deepseek_v4': _get_deepseek_v4_subgraph_names,
     'qwen3_5_moe': _get_qwen3_5_moe_subgraph_names,

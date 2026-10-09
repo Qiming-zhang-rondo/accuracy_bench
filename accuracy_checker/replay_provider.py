@@ -329,6 +329,7 @@ class ReplayProvider:
             with torch.no_grad():
                 kwargs = self._build_layer_kwargs(
                     self.ref_model, h, device, layer, layer_state,
+                    input_ids=getattr(self, "_last_input_ids", None),
                 )
                 out = layer(h, **kwargs)
             if isinstance(out, tuple):
@@ -371,6 +372,9 @@ class ReplayProvider:
             "position_embeddings": position_embeddings,
             "position_ids": position_ids,
         }
+        from .qwen4_exp import is_qwen4_layer, layer_kwargs
+        if is_qwen4_layer(layer):
+            return layer_kwargs(layer, hidden, position_ids, position_embeddings, input_ids)
         attention_mask = build_replay_attention_mask(layer, hidden)
         if is_v4:
             if input_ids is None and getattr(getattr(layer, "mlp", None), "is_hash", False):
@@ -469,6 +473,9 @@ class ReplayProvider:
         ref_hidden = torch.randn(batch_size, seq_len, hidden_size, dtype=self.dtype, device=device)
         quant_hidden = torch.randn(batch_size, seq_len, hidden_size, dtype=self.dtype, device=quant_device)
         self._last_input_ids = torch.zeros(batch_size, seq_len, dtype=torch.long)
+        from .qwen4_exp import expand_embedding
+        ref_hidden = expand_embedding(self.ref_model, ref_hidden)
+        quant_hidden = expand_embedding(self.quant_model, quant_hidden)
         text_config = get_text_config(self.ref_model.config)
         if str(getattr(text_config, "model_type", "")).lower() == "deepseek_v4":
             hc_mult = int(getattr(text_config, "hc_mult", 4))
@@ -513,6 +520,9 @@ class ReplayProvider:
         quant_embed = self.quant_model.get_input_embeddings()
         quant_embed = quant_embed.to(quant_device)
         quant_hidden = quant_embed(input_ids.to(quant_device))
+        from .qwen4_exp import expand_embedding
+        ref_hidden = expand_embedding(self.ref_model, ref_hidden)
+        quant_hidden = expand_embedding(self.quant_model, quant_hidden)
 
         text_config = get_text_config(self.ref_model.config)
         if str(getattr(text_config, "model_type", "")).lower() == "deepseek_v4":

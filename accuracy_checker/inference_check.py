@@ -230,6 +230,8 @@ def distribute_model(model, device_list: List[str]) -> List[nn.Module]:
             _register_module_input_hook(final_norm, device_list[-1])
     # DeepSeek-V4 collapses its hc_mult residual streams before final norm.
     hc_head = getattr(components.text_model, "hc_head", None)
+    if hc_head is None:
+        hc_head = getattr(components.text_model, "hyper_connection_mixer", None)
     if hc_head is not None:
         hc_head.to(device_list[-1])
         if n_devices > 1:
@@ -1493,6 +1495,9 @@ def _hf_create_skeleton(model_path: str, torch_dtype: torch.dtype,
 
     is_quant = is_quantized_model(model_path)
     has_3d_experts, use_streaming = _hf_detect_streaming_mode(model, model_path, is_quant)
+    from .qwen4_exp import is_qwen4
+    if is_qwen4(model.config):
+        use_streaming = True
 
     if use_streaming:
         if verbose:
@@ -1500,6 +1505,11 @@ def _hf_create_skeleton(model_path: str, torch_dtype: torch.dtype,
         expert_shapes = _prepare_expert_placeholders(model)
         if verbose:
             logger.info(f"  替换 {len(expert_shapes)} 个 3D expert 参数为 placeholder")
+
+    if is_qwen4(model.config):
+        # Only ordinary text weights and tiny expert placeholders are allocated;
+        # the PLE mmap table deliberately has no parameter to materialize.
+        model.to_empty(device="cpu")
 
     return model, is_quant, use_streaming
 
@@ -1622,7 +1632,10 @@ def _hf_load_weights(model: nn.Module, model_path: str, torch_dtype: torch.dtype
         logger.info(f"\n[4/6] 加载权重 ({'量化' if is_quant else '非量化'})...")
 
     t0 = time.time()
-    if is_quant:
+    from .qwen4_exp import is_qwen4, load_boundary_weights
+    if is_qwen4(model.config):
+        load_boundary_weights(model, model_path, torch_dtype, expert_chunk_size)
+    elif is_quant:
         _hf_load_quant_weights(model, model_path, torch_dtype, device_list,
                                use_cpu_dequant, use_streaming, verbose,
                                expert_chunk_size=expert_chunk_size)
@@ -1982,6 +1995,9 @@ def hf_inference_check(
     if num_runs < 1 or concurrency < 1:
         raise ValueError("num_runs 和 concurrency 必须为正整数")
     device_list = parse_devices(devices)
+
+    from .qwen4_exp import check_parallel_mode
+    check_parallel_mode(model_path, prefill_parallel)
 
     # Install the GLM DSA long-prefill runtime before model construction.  In
     # TP mode keeps the PP-sharded model layers on their owning cards while

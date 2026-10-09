@@ -142,6 +142,16 @@ def require_model_runtime_support(model_path: str) -> None:
     installed Transformers package.
     """
     raw_config = _read_raw_model_config(model_path)
+    from .qwen4_exp import is_qwen4
+    if is_qwen4(raw_config):
+        try:
+            from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForCausalLM  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "Qwen3.8-Flash-Next requires Transformers with official qwen4_exp support; "
+                "upgrade Transformers. It cannot be loaded as Qwen3.5."
+            ) from exc
+        return
     if not _looks_like_deepseek_v4_config(raw_config):
         return
     try:
@@ -1371,6 +1381,10 @@ class ShardWeightReader:
     def _resolve_key(self, key: str):
         """Return ``(resolved_key, shard_file)`` including prefix fallback."""
         direct_candidates = [key]
+        # Text-only Qwen4 runtime omits the vision container, not its weights'
+        # semantics. Preserve the on-disk key for safe_open and quant scales.
+        if key.startswith("model."):
+            direct_candidates.append("model.language_model." + key[len("model."):])
         for prefix in ("model.model.", "model."):
             if key.startswith(prefix):
                 direct_candidates.append(key[len(prefix):])
@@ -1681,13 +1695,13 @@ def _decide_should_load(name: str, layer_idx: Optional[int], layer_set: set,
     if not include_auxiliary and _is_auxiliary_predictor_name(name):
         return False
     if load_embed_only:
-        if layer_idx is None and "norm" not in name and "lm_head" not in name:
+        if layer_idx is None and "norm" not in name and "lm_head" not in name and "hyper_connection_mixer" not in name:
             if verbose and 'embed' in name and param is not None:
                 logger.info(f"  [DEBUG EMBED] will load: {name}, shape={param.shape}, device={param.device}")
             return True
         return False
     if load_norm_head_only:
-        return layer_idx is None and ("norm" in name or "lm_head" in name)
+        return layer_idx is None and ("norm" in name or "lm_head" in name or "hyper_connection_mixer" in name)
     if include_auxiliary and _is_auxiliary_predictor_name(name):
         return True
     return layer_idx is not None and layer_idx in layer_set
@@ -2109,6 +2123,10 @@ def _load_named_buffers(model: nn.Module, sf_reader: ShardWeightReader,
             # 直接搬运到目标 device (buffers 通常很小, ~256 float32)
             buf.data = b_data.to(buf.dtype).to(buf.device)
             loaded_count += 1
+        elif ".ple.ple_embedding." in bname:
+            from .qwen4_exp import is_qwen4
+            if is_qwen4(getattr(model, "config", None)):
+                raise ValueError(f"Qwen4 PLE hash buffer missing or wrong shape: {bname}")
     return loaded_count
 
 
@@ -2234,6 +2252,18 @@ def load_layer_weights_indexed(
     load_embed_only = (layers == [])
     load_norm_head_only = (-1 in layers)
 
+    from .qwen4_exp import is_qwen4
+    qwen4 = is_qwen4(getattr(model, "config", None))
+    if qwen4:
+        from .utils import get_model_components
+        parts = get_model_components(model)
+        selected = ([parts.embed] if load_embed_only else
+                    [parts.lm_head, parts.text_model.hyper_connection_mixer] if load_norm_head_only else
+                    [parts.layers[i] for i in layers])
+        for module in selected:
+            if any(t.is_meta for t in tuple(module.parameters()) + tuple(module.buffers())):
+                module.to_empty(device="cpu")
+
     loaded_count = 0
     skipped_count = 0
 
@@ -2256,6 +2286,7 @@ def load_layer_weights_indexed(
             module for module in (
                 get_norm_module(model), get_lm_head_module(model),
                 getattr(text_model, "hc_head", None),
+                getattr(text_model, "hyper_connection_mixer", None),
             ) if module is not None
         )
         if not final_modules:
@@ -2325,6 +2356,8 @@ def load_layer_weights_indexed(
         if result == "loaded":
             loaded_count += 1
         else:
+            if qwen4:
+                raise ValueError(f"Qwen4 required parameter was not loaded: {name} ({result})")
             skipped_count += 1
 
     # 加载 register_buffer 注册的非参数张量
@@ -2446,7 +2479,12 @@ def _count_experts(sf_reader: ShardWeightReader, expert_prefix: str,
 def _count_experts_in_map(sf_reader: ShardWeightReader, test_key_tmpl: str) -> int:
     """Fast path: count experts by checking weight_map membership (no I/O)."""
     num_experts = 0
-    for i in range(300):
+    # Qwen4 has 512 experts (and other models may have more); the historic
+    # 300-probe cap silently truncated split checkpoints during L2 loading.
+    import re
+    upper_bound = 1 + max((int(match[1]) for key in sf_reader.weight_map
+                          if (match := re.search(r"\.experts\.(\d+)\.", key))), default=-1)
+    for i in range(upper_bound):
         test_key = test_key_tmpl.format(i=i)
         resolved_key, _ = sf_reader._resolve_key(test_key)
         if resolved_key is not None:
@@ -2843,7 +2881,10 @@ def _initialize_rotary_modules(model: nn.Module,
             tensors = tuple(module.parameters()) + tuple(module.buffers())
             materialized = [tensor for tensor in tensors if not tensor.is_meta]
             target_device = str(materialized[0].device) if materialized else "cpu"
-        module.to(target_device)
+        if any(tensor.is_meta for tensor in module.buffers()):
+            module.to_empty(device=target_device)
+        else:
+            module.to(target_device)
         layer_types = getattr(module, "layer_types", None)
         if layer_types:
             for layer_type in layer_types:
@@ -3103,6 +3144,7 @@ def create_model_skeleton(
     """
     from .dspark import is_dspark_checkpoint
     from .kimi_fla_shim import is_kimi_k3_checkpoint
+    from .qwen4_exp import is_qwen4, install_lazy_ple
 
     require_model_runtime_support(model_path)
     is_dspark = is_dspark_checkpoint(model_path)
@@ -3143,6 +3185,13 @@ def create_model_skeleton(
         kimi_expert_counts, kimi_model_cls = kimi_streaming_context
         if is_dspark:
             model, config = _create_dspark_model_from_config(model_path, dtype)
+        elif is_qwen4(config):
+            # The tool compares text only. The upstream text CausalLM retains
+            # PLE/QSA/cache behavior without allocating an unused vision tower.
+            from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForCausalLM
+            text_config = getattr(config, "text_config", config)
+            model = Qwen4ExpForCausalLM._from_config(
+                text_config, dtype=dtype, attn_implementation="eager")
         elif use_kimi_streaming_skeleton:
             # Reuse the class imported before the scoped range/post_init patch;
             # calling AutoModel again could reload the dynamic module and lose it.
@@ -3175,7 +3224,10 @@ def create_model_skeleton(
                 # 设置 dtype
                 for p in model.parameters():
                     p.data = p.data.to(dtype)
-    if use_kimi_streaming_skeleton:
+    if is_qwen4(config):
+        install_lazy_ple(model, model_path)
+        model._acc_bench_lazy_meta = True
+    elif use_kimi_streaming_skeleton:
         collapsed_layers = _finalize_kimi_streaming_skeleton(
             model, kimi_expert_counts
         )

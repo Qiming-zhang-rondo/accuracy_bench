@@ -783,6 +783,9 @@ class ShardedBlockComparator:
 
             ref_hidden = ref_emb_out.to(ref_device)
             quant_hidden = quant_emb_out.to(quant_device)
+            from .qwen4_exp import expand_embedding
+            ref_hidden = expand_embedding(ref_model, ref_hidden)
+            quant_hidden = expand_embedding(quant_model, quant_hidden)
             if str(self._model_config.get("model_type", "")).lower() == "deepseek_v4":
                 hc_mult = int(self._model_config.get("hc_mult", 4))
                 ref_hidden = ref_hidden.unsqueeze(2).expand(
@@ -1062,10 +1065,15 @@ class ShardedBlockComparator:
     def _get_hc_head(model):
         """Return DeepSeek-V4's final hyper-connection collapse module."""
         from .utils import get_model_components
-        return getattr(get_model_components(model).text_model, "hc_head", None)
+        text_model = get_model_components(model).text_model
+        return getattr(text_model, "hc_head", None) or getattr(text_model, "hyper_connection_mixer", None)
 
     @classmethod
     def _collapse_hc_streams(cls, model, hidden_states):
+        from .qwen4_exp import is_qwen4
+        if is_qwen4(getattr(model, "config", None)):
+            mixer = cls._get_hc_head(model)
+            return mixer(hidden_states.to(next(mixer.parameters()).device))
         if hidden_states.dim() != 4:
             return hidden_states
         hc_head = cls._get_hc_head(model)
@@ -3447,6 +3455,10 @@ class ShardedBlockComparator:
     def _build_single_layer_forward_kwargs(
         self, layer, hidden_states, position_ids, position_embeddings, previous_state
     ):
+        from .qwen4_exp import is_qwen4_layer, layer_kwargs
+        if is_qwen4_layer(layer):
+            return layer_kwargs(layer, hidden_states, position_ids, position_embeddings,
+                                getattr(self, "_input_ids", None))
         kwargs = {"position_ids": position_ids}
         if position_embeddings is not None:
             kwargs["position_embeddings"] = position_embeddings

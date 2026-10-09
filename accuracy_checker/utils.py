@@ -147,6 +147,12 @@ def normalize_quant_desc_keys(quant_desc: dict, model) -> dict:
             continue
         value = normalize_quant_type(value)
 
+        if (getattr(getattr(model, "config", None), "model_type", "") == "qwen4_exp_text"
+                and key.startswith("model.language_model.")):
+            new_desc["model." + key[len("model.language_model."):]] = value
+            new_desc[key] = value
+            continue
+
         if has_nested_language_model and key.startswith("model.language_model."):
             new_key = "model.model." + key[len("model."):]
             new_desc[new_key] = value

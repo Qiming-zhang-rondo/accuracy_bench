@@ -675,6 +675,7 @@
                 <option value="qwen3_6_moe">qwen3_6_moe</option>
                 <option value="qwen3_6">qwen3_6</option>
                 <option value="qwen3_5_moe">qwen3_5_moe</option>
+                <option value="qwen4_exp">qwen4_exp (Qwen3.8-Flash-Next · text)</option>
                 <option value="qwen3_moe">qwen3_moe</option>
                 <option value="qwen3">qwen3</option>
                 <option value="qwen3_vl">qwen3_vl</option>
@@ -1137,6 +1138,7 @@
         qwen3: "Qwen3",
         qwen3_moe: "Qwen3 MoE",
         qwen3_5_moe: "Qwen3.5 MoE",
+        qwen4_exp: "Qwen3.8-Flash-Next (text)",
         qwen3_6: "Qwen3.6",
         qwen3_6_moe: "Qwen3.6 MoE",
         qwen3_vl: "Qwen3 VL",
@@ -1153,6 +1155,7 @@
         var p = pathText();
         if (p.indexOf("dspark") !== -1 || p.indexOf("speculator") !== -1) return "dspark";
         if (p.indexOf("kimi") !== -1 || p.indexOf("moonshot") !== -1 || p.indexOf("k3") !== -1) return "kimi_k3";
+        if (/qwen[-_. ]?3[._-]?8|qwen4[_-]?exp/.test(p)) return "qwen4_exp";
         if (/qwen[-_. ]?3[._-]?6/.test(p)) return "qwen3_6_moe";
         if (/qwen[-_. ]?3[._-]?5/.test(p)) return "qwen3_5_moe";
         if (p.indexOf("qwen3") !== -1 && (p.indexOf("vl") !== -1 || p.indexOf("vision") !== -1)) return "qwen3_vl";
@@ -1165,7 +1168,7 @@
       }
 
       function isMoe(type) {
-        return ["moe", "glm_moe_dsa", "deepseek_v4", "qwen3_moe", "qwen3_5_moe", "qwen3_6", "qwen3_6_moe", "kimi_k3"].indexOf(type) !== -1;
+        return ["moe", "glm_moe_dsa", "deepseek_v4", "qwen3_moe", "qwen3_5_moe", "qwen3_6", "qwen3_6_moe", "qwen4_exp", "kimi_k3"].indexOf(type) !== -1;
       }
 
       function inferredModelSizeB() {
