@@ -630,6 +630,7 @@ def run_boundary(
         messages = []
 
     limitations: List[str] = []
+    from .qwen4_tp import configure_options as qwen4_tp_options
     evidence: Dict[str, Any] = {
         "quant_model_path": quant_model_path,
         "ref_model_path": ref_model_path,
@@ -643,6 +644,7 @@ def run_boundary(
         "stop_on_first_badcase": stop_on_first_badcase,
         "expert_chunk_size": expert_chunk_size or 8,
         "prefill_parallel": prefill_parallel,
+        "qwen4_qsa_indexer_tp_options": qwen4_tp_options(),
         "deepseek_v4_query_block": deepseek_v4_query_block or int(
             os.getenv("ACC_DEEPSEEK_V4_QUERY_BLOCK", "64")
         ),

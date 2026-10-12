@@ -18,9 +18,15 @@ CLI 可使用 `--model_type qwen4_exp`（或 `qwen3_8_flash_next`），参数页
 - PLE 大词表支持原始浮点及 `ngram_embedding.shard_N.weight` 分片，使用 safetensors mmap 按需读取行，不将整张词表复制到 NPU。表缺失、分片不全或不支持的 PLE 量化格式会报错。
 - L2 使用 L1 缓存中的原始 `input_ids`，重放 PLE/注意力/MoE；细粒度诊断包含 hyper-connection 的张量投影。不会将 QSA mask 当成 GLM indexer 的 top-k IDs 做 flip-rate 统计。
 - Boundary 支持同一文本结构的生成/KV cache 与 captured-input logits replay。普通权重按 PP 分配；routed expert 沿用按需加载/反量化的小算子路径，**不是全部 BF16 expert 常驻**，不能视为部署性能基准。
-- 目前不支持 QSA 的长 prefill TP、视觉输入、MTP 比较；`--prefill_parallel tp` 对本模型明确报错。先用短 prompt 验证，再逐步增加长度，原生 QSA 的长序列显存和速度仍需单独优化。
+- `--prefill_parallel tp` 支持 **QSA indexer Query Parallel**：L1/full 使用各自 Ref/Quant 组，Boundary 使用 `--devices`。`--qwen4_query_block 64` 控制 round-robin query 分块；`--qwen4_tp_min_tokens 1024` 控制最小启用长度，两项均可在 HTML 设置。短输入、单卡、decode 保持官方路径；无法压缩为 causal + padding 的特殊 mask 也回退官方路径。
+- QSA 按可见 token 序列压缩 K（不能照搬 GLM），完整压缩块的 mean/norm/RoPE 只算一次，压缩 K 每个参与设备传输一次，Q 仅发给负责设备；原始 BF16/FP16 传输、目标卡 FP32 score。使用独立 worker/stream，不逐 query 同步；仅 gather int32 选择结果。每个 query 仍使用官方同长度 score vector 做 top-k，不改变 tie-breaking 或做近似筛选。
+- **这不是整模 TP**：主 attention、GatedDeltaNet、MoE、层 placement 和 decode 不变；主 attention/dense mask 的长序列显存占用仍存在，不能据此承诺 64K prefill 已解决或 N 卡线性加速。视觉输入、MTP 比较仍未支持。日志分开记录 worker wall time（含通信/计算/等待）、indices gather 和 indexer 总时间，不将 launch time 当成设备耗时。
 
 已用官方小尺寸模型检查按层 logits、流式 expert、PLE 分片、decode cache、L2 replay 和混合量化加载；尚未在 A3 上验证完整模型及实际量化产物，不能据此宣称整模 NPU 验收通过。
+
+启用 indexer TP：将下面命令的 `--prefill_parallel pp` 改为 `--prefill_parallel tp`，可追加
+`--qwen4_query_block 64 --qwen4_tp_min_tokens 1024`。日志出现 `[Qwen4 QSA TP]` 才表示该层实际走到并行分支。
+真实双卡校验可执行 `python3 -m pytest tests/test_qwen4_tp.py::test_real_two_accelerators -q`（不足两张 NPU/CUDA 卡时跳过，不代表硬件验证通过）。
 
 ```bash
 python3 run_accuracy_check.py --mode l1 \

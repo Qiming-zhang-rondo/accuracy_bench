@@ -1997,7 +1997,7 @@ def hf_inference_check(
     device_list = parse_devices(devices)
 
     from .qwen4_exp import check_parallel_mode
-    check_parallel_mode(model_path, prefill_parallel)
+    check_parallel_mode(model_path, prefill_parallel, [device_list])
 
     # Install the GLM DSA long-prefill runtime before model construction.  In
     # TP mode keeps the PP-sharded model layers on their owning cards while

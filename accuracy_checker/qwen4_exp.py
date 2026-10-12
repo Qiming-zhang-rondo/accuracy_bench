@@ -23,11 +23,13 @@ def is_qwen4_layer(layer):
     return type(layer).__name__ == "Qwen4ExpTextDecoderLayer"
 
 
-def check_parallel_mode(model_path, mode):
+def check_parallel_mode(model_path, mode, device_groups=None):
     from .model_loader import _read_raw_model_config
-    if mode == "tp" and is_qwen4(_read_raw_model_config(model_path)):
-        raise ValueError("Qwen3.8-Flash-Next currently uses official QSA with PP layer ownership; "
-                         "use --prefill_parallel pp. GLM/DeepSeek TP is not compatible with Qwen4 QSA.")
+    if is_qwen4(_read_raw_model_config(model_path)):
+        from .qwen4_tp import install_query_parallel, configure_options
+        install_query_parallel(mode, device_groups)
+        logger.info("  Qwen4 QSA indexer runtime: mode=%s, groups=%s, options=%s; "
+                    "main attention/GDN/decode remain on owner", mode, device_groups, configure_options())
 
 
 def expand_embedding(model, hidden):

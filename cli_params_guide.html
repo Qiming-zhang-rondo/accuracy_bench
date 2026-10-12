@@ -733,7 +733,17 @@
                 <option value="pp">pp · 按层分片（默认）</option>
                 <option value="tp">tp · Query block 跨卡并行</option>
               </select>
-              <span class="hint">GLM/DeepSeek-V4 长 prompt 使用 TP 时，按 query block 分配到对应设备组；完整 K 每层每 helper 只复制一次，模型层仍按 PP 放置。Boundary Quant-only 会使用全部 <code>--devices</code>。</span>
+              <span class="hint">GLM/DeepSeek-V4 按 query block 跨卡计算。Qwen3.8 仅并行 QSA indexer，复用压缩 K；主 attention、GatedDeltaNet、decode 不变，不是整模 TP。模型层仍按 PP 放置；Boundary Quant-only 使用全部 <code>--devices</code>。</span>
+            </div>
+            <div id="qwen4QueryBlockField" class="hidden" aria-hidden="true">
+              <label for="qwen4QueryBlock">Qwen3.8 QSA query block</label>
+              <input id="qwen4QueryBlock" type="number" min="1" step="1" value="64">
+              <span class="hint">默认 64；query blocks round-robin 分配，不合并成整卡大 shard。仅 QSA indexer。</span>
+            </div>
+            <div id="qwen4TpMinTokensField" class="hidden" aria-hidden="true">
+              <label for="qwen4TpMinTokens">Qwen3.8 TP 最小输入长度</label>
+              <input id="qwen4TpMinTokens" type="number" min="1" step="1" value="1024">
+              <span class="hint">默认 1024 tokens；短输入/单卡/decode 走官方路径。特殊非前缀 mask 安全回退。</span>
             </div>
             <div id="glmAttnQueryBlockField">
               <label for="glmAttnQueryBlock">GLM attention query block</label>
@@ -1047,6 +1057,8 @@
             <tr><td><code>--compare_mode</code></td><td>dual</td><td>dual / grouped_dual；MoE 推荐 grouped_dual，DSpark 必须 dual。</td></tr>
             <tr><td><code>--prefill_parallel</code></td><td>pp</td><td>GLM/DeepSeek-V4 长 prefill：pp 保留按层分片及 owner 单卡 blockwise attention；tp 按 query block 跨设备组并行 indexer 和 sparse attention。Boundary Quant-only 使用全部 <code>--devices</code>，L1/full 使用对应 Ref/Quant 设备组。模型层 placement 仍为 PP。</td></tr>
             <tr><td><code>--glm_attn_query_block</code></td><td>64</td><td>GLM 长 prefill attention 的 query block 大小。增大可减少 launch 次数，但会增加临时显存；未指定时也可用 ACC_GLM_DSA_ATTN_QUERY_BLOCK。</td></tr>
+            <tr><td><code>--qwen4_query_block</code></td><td>64</td><td>Qwen3.8 QSA indexer TP 的 query 分配/传输块大小；压缩 K 每卡复用一次。不会并行主 attention/GDN。</td></tr>
+            <tr><td><code>--qwen4_tp_min_tokens</code></td><td>1024</td><td>触发 QSA indexer TP 的最小 prefill 长度；单 token decode 不受影响。原生主 attention 的长序列显存占用仍需注意。</td></tr>
             <tr><td><code>--glm_attn_selected_block</code></td><td>512</td><td>GLM attention selected top-k 的分块大小。workspace 近似按 query block×selected block 增长；未指定时也可用 ACC_GLM_DSA_ATTN_SELECTED_BLOCK。</td></tr>
             <tr><td><code>--deepseek_v4_query_block</code></td><td>64</td><td>DeepSeek-V4 blockwise/Query Parallel 每个实际 query tile 的大小；也可用 ACC_DEEPSEEK_V4_QUERY_BLOCK。</td></tr>
             <tr><td><code>--deepseek_v4_key_block</code></td><td>1024</td><td>DeepSeek-V4 每次流式处理的 key tile 大小；也可用 ACC_DEEPSEEK_V4_KEY_BLOCK。峰值 score 近似随 query_block×key_block 增长。</td></tr>
@@ -1099,6 +1111,7 @@
         "refModel", "quantModel", "mode", "modelType", "visibleDevices",
         "modelSizeB", "perDeviceMemory", "refDevices", "quantDevices",
         "compareMode", "prefillParallel", "glmAttnQueryBlock", "glmAttnSelectedBlock", "deepseekV4QueryBlock", "deepseekV4KeyBlock", "chatTemplateMode", "kimiKdaBackend", "layersPerShard",
+        "qwen4QueryBlock", "qwen4TpMinTokens",
         "quantMethod", "dtype", "activationQuantType", "activationQuantBackend", "activationQuantGroupSize", "cacheTopK", "cacheDir", "mlaFine",
         "outputDir", "prompt", "rawPromptFile", "promptFile", "requestJson", "boundaryIssueMode", "capturedLogitsJson", "capturedRequestJson", "numRuns", "concurrency",
         "maxNewTokens", "noRef", "frameworkReproduced", "stopOnFirstBadcase",
@@ -1267,6 +1280,8 @@
         var grouped = compare === "grouped_dual";
         setFieldVisibility("compareModeField", l1Flow && !dspark);
         setFieldVisibility("prefillParallelField", longPrefillFlow && !dspark);
+        setFieldVisibility("qwen4QueryBlockField", longPrefillFlow && type === "qwen4_exp" && !dspark);
+        setFieldVisibility("qwen4TpMinTokensField", longPrefillFlow && type === "qwen4_exp" && !dspark);
         setFieldVisibility("glmAttnQueryBlockField", longPrefillFlow && type === "glm_moe_dsa" && !dspark);
         setFieldVisibility("glmAttnSelectedBlockField", longPrefillFlow && type === "glm_moe_dsa" && !dspark);
         setFieldVisibility("deepseekV4QueryBlockField", longPrefillFlow && type === "deepseek_v4" && !dspark);
@@ -1419,6 +1434,11 @@
         }
         if (!dspark && type === "glm_moe_dsa" && ["l1", "full", "boundary"].indexOf(mode) !== -1 && (!/^\d+$/.test(el.glmAttnQueryBlock.value) || Number(el.glmAttnQueryBlock.value) < 1)) {
           addIssue(errors, "glmAttnQueryBlock", "GLM attention query block 必须是大于 0 的整数");
+        }
+        if (!dspark && type === "qwen4_exp" && ["l1", "full", "boundary"].indexOf(mode) !== -1) {
+          ["qwen4QueryBlock", "qwen4TpMinTokens"].forEach(function (name) {
+            if (!/^\d+$/.test(el[name].value) || Number(el[name].value) < 1) addIssue(errors, name, "Qwen3.8 TP 参数必须是正整数");
+          });
         }
         if (!dspark && type === "glm_moe_dsa" && ["l1", "full", "boundary"].indexOf(mode) !== -1 && (!/^\d+$/.test(el.glmAttnSelectedBlock.value) || Number(el.glmAttnSelectedBlock.value) < 1)) {
           addIssue(errors, "glmAttnSelectedBlock", "GLM attention selected-key block 必须是大于 0 的整数");
@@ -1675,6 +1695,10 @@
             }
             args.push(line("--compare_mode", compare));
             if (el.prefillParallel.value === "tp") args.push(line("--prefill_parallel", "tp"));
+            if (type === "qwen4_exp") {
+              args.push(line("--qwen4_query_block", el.qwen4QueryBlock.value || "64"));
+              args.push(line("--qwen4_tp_min_tokens", el.qwen4TpMinTokens.value || "1024"));
+            }
             args.push(line("--layers_per_shard", el.layersPerShard.value || "2"));
             if (type === "glm_moe_dsa") {
               args.push(line("--glm_attn_query_block", el.glmAttnQueryBlock.value || "64"));
@@ -1713,6 +1737,10 @@
           args.push(line("--devices", "npu:" + logicalIds.join(",")));
           args.push(line("--dtype", el.dtype.value));
           if (el.prefillParallel.value === "tp") args.push(line("--prefill_parallel", "tp"));
+          if (type === "qwen4_exp") {
+            args.push(line("--qwen4_query_block", el.qwen4QueryBlock.value || "64"));
+            args.push(line("--qwen4_tp_min_tokens", el.qwen4TpMinTokens.value || "1024"));
+          }
           if (type === "glm_moe_dsa") {
             args.push(line("--glm_attn_query_block", el.glmAttnQueryBlock.value || "64"));
             args.push(line("--glm_attn_selected_block", el.glmAttnSelectedBlock.value || "512"));

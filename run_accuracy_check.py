@@ -138,8 +138,12 @@ def parse_args():
     parser.add_argument(
         "--prefill_parallel", type=str, default="pp", choices=["pp", "tp"],
         help=("长 prefill 并行方式: pp=保留按层分片（默认）, "
-              "tp=GLM/DeepSeek-V4 query-parallel 跨设备组并行"),
+              "tp=GLM/DeepSeek-V4 query-parallel；Qwen3.8 为 QSA indexer query-parallel（非整模 TP）"),
     )
+    parser.add_argument("--qwen4_query_block", type=parse_positive_int, default=64,
+                        help="Qwen3.8 QSA TP query block（默认 64，round-robin 分配，不合并大 shard）")
+    parser.add_argument("--qwen4_tp_min_tokens", type=parse_positive_int, default=1024,
+                        help="Qwen3.8 QSA TP 最小 prefill 长度（默认 1024；decode 保持原路径）")
     parser.add_argument(
         "--glm_attn_query_block", type=parse_positive_int, default=None,
         help="GLM 长 prefill attention query block（默认 64；也可用 ACC_GLM_DSA_ATTN_QUERY_BLOCK）",
@@ -612,10 +616,11 @@ def run_hf_l1(args, ref_device, target_device, dtype):
     from accuracy_checker.glm_dsa_blockwise import install_glm_dsa_blockwise_indexer
     from accuracy_checker.deepseek_v4_blockwise import install_deepseek_v4_blockwise_runtime
     from accuracy_checker.qwen4_exp import check_parallel_mode
-    for path in (args.ref_model, args.quant_model):
-        check_parallel_mode(path, getattr(args, "prefill_parallel", "pp"))
     ref_tp_devices = _parse_dev_list(getattr(args, "ref_devices", None)) or [ref_device]
     quant_tp_devices = _parse_dev_list(getattr(args, "quant_devices", None)) or [target_device]
+    for path in (args.ref_model, args.quant_model):
+        check_parallel_mode(path, getattr(args, "prefill_parallel", "pp"),
+                            [ref_tp_devices, quant_tp_devices])
     glm_blockwise_ok = install_glm_dsa_blockwise_indexer(
         parallel_mode=getattr(args, "prefill_parallel", "pp"),
         device_groups=[ref_tp_devices, quant_tp_devices],
@@ -1589,6 +1594,8 @@ def _mode_inference(args):
 
 def main():
     args = parse_args()
+    from accuracy_checker.qwen4_tp import configure_options as configure_qwen4_tp
+    configure_qwen4_tp(args.qwen4_query_block, args.qwen4_tp_min_tokens)
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
         format="%(message)s",

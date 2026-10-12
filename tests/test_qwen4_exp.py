@@ -156,12 +156,16 @@ def test_expert_count_above_300():
     assert _count_experts_in_map(reader, 'model.layers.0.mlp.experts.{i}.gate_proj.weight') == 512
 
 
-def test_qsa_does_not_claim_glm_tp(checkpoint):
+def test_qsa_uses_own_tp_runtime(checkpoint):
     from accuracy_checker.qwen4_exp import check_parallel_mode
+    from accuracy_checker.qwen4_tp import _runtime
     path, _ = checkpoint
-    check_parallel_mode(str(path), 'pp')
-    with pytest.raises(ValueError, match='not compatible'):
-        check_parallel_mode(str(path), 'tp')
+    try:
+        check_parallel_mode(str(path), 'tp', [['cpu']])
+        assert _runtime['mode'] == 'tp'
+        assert _runtime['groups'] == [['cpu']]
+    finally:
+        check_parallel_mode(str(path), 'pp')
 
 
 def test_missing_weight_fails_before_forward(checkpoint):
