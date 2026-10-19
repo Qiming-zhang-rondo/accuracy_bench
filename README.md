@@ -39,6 +39,34 @@ python3 run_accuracy_check.py --mode l1 \
   --prompt '你好，请简要介绍自己。'
 ```
 
+### Qwen PLE 首个坏层快速诊断（不加载整模型）
+
+如果 Layer 0 正常、Layer 1 突降，可以先运行独立脚本；默认检查零基 Layer 1
+（官方配置 `ple_layer_ids=[2]`）。只读取哈希 buffer 和抽查的 ngram 行，不加载
+decoder、MoE 或整张 PLE 词表，不改 L1/L2/TP 的执行逻辑。
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 OMP_NUM_THREADS=8 \
+python3 diagnose_qwen4_ple.py \
+  --ref_model /path/to/Qwen3.8-Flash-Next \
+  --quant_model /path/to/quantized-checkpoint \
+  --layer 1 --device npu:0 \
+  --prompt 'Write a poem in the style of a limerick about a programmer debugging at 3 AM.' \
+  --output reports/qwen4_ple_diagnostic.json
+```
+
+- `--device cpu` 不需要 NPU；`npu:0` 额外比较**当前安装的 Transformers** 在 CPU/NPU 上计算的行号与独立 CPU 哈希结果。仅构造 meta 上的 NGram 模块并捕获行号，不分配大词表。运行时校验失败/缺失明确记为未完成，不当作 PASS。
+- 最严谨的输入是 `--l1_cache /path/to/某一层缓存.pt`（必须包含 `input_ids`），或 `--input_ids_json ids.json`（整数数组、`{"input_ids":[...]}`、`{"prompt":[...]}`）。这两种直接用记录的 IDs，不重新 tokenize。也支持与 L1 一致的 `--prompt_file` 原始文本和 `--chat_template_mode auto|always|never`；文本仅用 ref tokenizer 渲染一次，两边共用 IDs，报告记录 token hash。
+- 对**完整输入**计算哈希，不截断历史。查表默认均匀抽查最多 256 个位置，另加有上限的 EOS 邻近位置；`--max_positions` 可调整。另用独立单行切片校验生产 gather，覆盖所有分片的首尾行。报告明确记录抽查范围，不表示整个词表都校验过。
+- `HASH_METADATA_DIFFERENCE` / `HASH_ROW_DIFFERENCE`：核对哈希 buffer、EOS 和配置；浮点格式的哈希参数直接判无效，不尝试转整数修复。
+- `LOOKUP_IMPLEMENTATION_DIFFERENCE`：生产分片 gather 与独立逐行读取不同。两种读取都依赖连续行分片约定，不能靠此证明导出时的分片编号正确。
+- `TABLE_VALUE_DIFFERENCE`：同一行号的 ref/quant 内容不同，不等同于读取 bug，也可能来自导出或表变换。`SAMPLED_LOOKUP_ALIGNED` 仅说明本次哈希和抽查查表一致。
+- 本脚本**不执行 PLE 投影、门控、卷积或 activation QDQ**。若查表通过而 L1 仍异常，下一步用相同 hidden 检查 PLE 内部，尤其是开启 `--activation_quant AUTO` 时的描述文件和激活量化路径。
+
+终端显示摘要，JSON 保存具体 buffer 值、分片映射、差异位置和下一步建议。默认输出时间戳报告，
+手动指定 `--output` 会覆盖该报告文件。退出码 0 表示抽查对齐，1 表示发现差异/校验未完成，
+2 表示输入、元数据或运行失败；三种情况均尝试保存 JSON。
+
 ## TL;DR
 
 > **前置**: `npu-smi info` 确认卡空闲; `OMP_NUM_THREADS=8` 防 futex livelock (streaming expert 必设)
