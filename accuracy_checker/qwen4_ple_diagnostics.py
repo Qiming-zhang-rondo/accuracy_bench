@@ -10,14 +10,14 @@ import bisect
 import hashlib
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
 from safetensors import safe_open
 
 from .model_loader import ShardWeightReader, build_weight_index
-from .qwen4_exp import MMapNGramEmbedding
+from .qwen4_exp import MMapNGramEmbedding, resolve_ple_hash_buffers, validate_ple_pair_configs
 
 
 BUFFER_NAMES = ("layer_multipliers", "ngram_heads_vocab_sizes", "ngram_heads_offsets")
@@ -30,23 +30,32 @@ def tensor_comparison(ref, quant):
     """Exact equality plus numerical diagnostics; never turn NaN into a pass."""
     ref, quant = ref.detach().cpu(), quant.detach().cpu()
     same_shape = ref.shape == quant.shape
+    same_dtype = ref.dtype == quant.dtype
     finite = bool(torch.isfinite(ref).all() and torch.isfinite(quant).all())
-    result = dict(shape_match=same_shape, finite=finite,
+    result = dict(shape_match=same_shape, dtype_match=same_dtype, finite=finite,
+                  ref_dtype=str(ref.dtype), quant_dtype=str(quant.dtype),
                   ref_shape=list(ref.shape), quant_shape=list(quant.shape),
                   equal=False, max_abs_diff=None, rel_l2=None)
     if not same_shape or not finite:
         return result
-    # Equality is evaluated before float conversion (hash integers exceed 2**53).
-    result["equal"] = bool(torch.equal(ref, quant))
-    result["different_elements"] = int((ref != quant).sum())
-    result["first_differences"] = (ref != quant).nonzero()[:8].tolist()
+    # torch.equal/int-tensor comparisons promote int64 to BF16/float and can
+    # report a rounded hash integer as equal. Python int-vs-float comparison
+    # preserves the integer exactly, including values beyond 2**53.
+    if same_dtype:
+        different = ref != quant
+    else:
+        different = torch.tensor([a != b for a, b in zip(ref.flatten().tolist(), quant.flatten().tolist())],
+                                 dtype=torch.bool).reshape(ref.shape)
+    result["different_elements"] = int(different.sum())
+    result["first_differences"] = different.nonzero()[:8].tolist()
+    result["equal"] = same_dtype and result["different_elements"] == 0
     if ref.numel():
         a, b = ref.double(), quant.double()
         diff = torch.linalg.vector_norm(a - b).item()
         norm = torch.linalg.vector_norm(a).item()
         result["max_abs_diff"] = (a - b).abs().max().item()
         result["rel_l2"] = diff / norm if norm else (0.0 if diff == 0 else None)
-        result["numeric_metrics_note"] = "float64 diagnostics; exact equality uses original dtype"
+        result["numeric_metrics_note"] = "approximate float64 diagnostics (may round large integers); equal requires matching dtype and exact values"
     return result
 
 
@@ -125,6 +134,8 @@ class PLECheckpoint:
     table: MMapNGramEmbedding | None
     issues: list
     table_metadata: list
+    effective_buffers: dict = field(default_factory=dict)
+    recovered_names: list = field(default_factory=list)
 
     def close(self):
         self.reader.close()
@@ -133,9 +144,9 @@ class PLECheckpoint:
         eos = self.config["eos_token_id"]
         if isinstance(eos, list):
             eos = eos[0]
-        return dict(multipliers=self.buffers[BUFFER_NAMES[0]],
-                    head_vocab_sizes=self.buffers[BUFFER_NAMES[1]],
-                    head_offsets=self.buffers[BUFFER_NAMES[2]],
+        return dict(multipliers=self.effective_buffers[BUFFER_NAMES[0]],
+                    head_vocab_sizes=self.effective_buffers[BUFFER_NAMES[1]],
+                    head_offsets=self.effective_buffers[BUFFER_NAMES[2]],
                     ngram_size=int(self.config["ngram_size"]),
                     heads_per_ngram=int(self.config["heads_per_ngram"]), eos_token_id=int(eos))
 
@@ -162,12 +173,16 @@ def inspect_checkpoint(path, layer_idx, *, dtype=torch.bfloat16):
                 issue("missing_hash_buffer", name)
                 continue
             checkpoint.buffers[name] = value
-            if value.dtype != torch.int64:
-                issue("hash_buffer_dtype", f"{name}: {value.dtype}, expected int64; no silent cast/repair")
             if tuple(value.shape) != (n if name == BUFFER_NAMES[0] else heads,):
                 issue("hash_buffer_shape", f"{name}: {tuple(value.shape)}")
         if not checkpoint.issues:
-            sizes, offsets = [checkpoint.buffers[name] for name in BUFFER_NAMES[1:]]
+            try:
+                checkpoint.effective_buffers, checkpoint.recovered_names = resolve_ple_hash_buffers(
+                    config, layer_idx, checkpoint.buffers)
+            except ValueError as exc:
+                issue("hash_buffer_invalid", str(exc))
+        if not checkpoint.issues:
+            sizes, offsets = [checkpoint.effective_buffers[name] for name in BUFFER_NAMES[1:]]
             expected_offsets = torch.cat([torch.zeros(1, dtype=torch.long), sizes.cumsum(0)[:-1]])
             if bool((sizes <= 0).any()) or not torch.equal(offsets, expected_offsets):
                 issue("hash_head_layout", "head sizes must be positive and offsets cumulative")
@@ -241,7 +256,7 @@ def capture_runtime_ngram_ids(checkpoint, input_ids, device="cpu"):
     with torch.device("meta"):
         module = Qwen4ExpTextNGramEmbedding(config, config.ple_embed_dim, checkpoint.layer_idx, ple_index)
     for name in BUFFER_NAMES:
-        module.register_buffer(name, checkpoint.buffers[name].to(device))
+        module.register_buffer(name, checkpoint.effective_buffers[name].to(device))
     capture = Capture()
     module.ngram_embedding = capture
     with torch.no_grad():
@@ -267,33 +282,54 @@ def diagnose_pair(ref, quant, input_ids, *, max_positions=256, device="cpu"):
     if max_positions < 1:
         raise ValueError("max_positions must be positive")
     ids = validate_input_ids(input_ids)
-    report = dict(schema_version=1, layer=ref.layer_idx, input_shape=list(ids.shape),
+    report = dict(schema_version=2, layer=ref.layer_idx, input_shape=list(ids.shape),
                   input_ids_sha256=token_hash(ids), device=device, checks={}, checkpoints={},
                   findings=[], limitations=[
                       "No decoder/PLE projection forward: a passing lookup does not clear PLE gating, convolution or quantization.",
                       "Only selected lookup rows are read, not the full table; no whole-checkpoint correctness claim.",
                       "The scalar audit assumes contiguous row shards, as the production loader does."])
-    def finding(code, message):
-        report["findings"].append(dict(code=code, message=message))
+    def finding(code, message, severity="warning"):
+        report["findings"].append(dict(code=code, message=message, severity=severity))
     for side, checkpoint in (("ref", ref), ("quant", quant)):
         report["checkpoints"][side] = dict(path=checkpoint.path, config={k: checkpoint.config.get(k) for k in CONTRACT_FIELDS},
                 issues=checkpoint.issues, table_parts=checkpoint.table_metadata,
                 buffers={k: dict(dtype=str(v.dtype), shape=list(v.shape), values=v.tolist())
-                         for k, v in checkpoint.buffers.items()})
+                         for k, v in checkpoint.buffers.items()},
+                effective_buffers={k: dict(dtype=str(v.dtype), shape=list(v.shape), values=v.tolist())
+                                   for k, v in checkpoint.effective_buffers.items()},
+                recovered_names=checkpoint.recovered_names,
+                recovery_scope="in memory only; checkpoint files remain unchanged")
+        if checkpoint.recovered_names:
+            finding("HASH_METADATA_RECOVERED", f"{side}: {', '.join(checkpoint.recovered_names)} 原始 dtype 为浮点；"
+                    "已严格验证等于官方配置重建整数的对应浮点 cast，运行时使用重建 int64；未修改 checkpoint 文件。", "info")
     contract_diff = {k: dict(ref=ref.config.get(k), quant=quant.config.get(k)) for k in CONTRACT_FIELDS
                      if ref.config.get(k) != quant.config.get(k)}
     report["checks"]["config_differences"] = contract_diff
+    try:
+        validate_ple_pair_configs(ref.config, quant.config)
+        report["checks"]["config_contract"] = dict(compatible=True)
+    except ValueError as exc:
+        report["checks"]["config_contract"] = dict(compatible=False, error=str(exc))
+        finding("CONFIG_CONTRACT_MISMATCH", str(exc))
     if contract_diff:
-        finding("CONFIG_DIFFERENCE", "核对两边 PLE 配置；缺省字段与显式默认值也会列出，不自动认定不等价。")
+        finding("CONFIG_DIFFERENCE", "原始 PLE 配置字段不同；语义检查采用官方默认值，并规范化 EOS 格式，见 config_contract。", "info")
     for name in BUFFER_NAMES:
         if name in ref.buffers and name in quant.buffers:
             comparison = tensor_comparison(ref.buffers[name], quant.buffers[name])
             report["checks"]["buffer_" + name] = comparison
             if not comparison["equal"]:
-                finding("HASH_METADATA_DIFFERENCE", f"{name} 不一致：先核对导出/配置，不是浮点量化容差。")
+                effective_equal = (name in ref.effective_buffers and name in quant.effective_buffers
+                                   and tensor_comparison(ref.effective_buffers[name], quant.effective_buffers[name])["equal"])
+                finding("RAW_HASH_METADATA_DIFFERENCE", f"{name} 原始 checkpoint 元数据不一致；见 effective_buffer 校验，不能将原始值报告为 PASS。",
+                        "info" if effective_equal else "warning")
+        if name in ref.effective_buffers and name in quant.effective_buffers:
+            comparison = tensor_comparison(ref.effective_buffers[name], quant.effective_buffers[name])
+            report["checks"]["effective_buffer_" + name] = comparison
+            if not comparison["equal"]:
+                finding("HASH_METADATA_DIFFERENCE", f"{name} 重建后的 ref/quant 哈希参数仍不一致，核对模型配置。")
     if ref.issues or quant.issues:
         report["status"] = "INVALID_METADATA"
-        finding("INVALID_METADATA", "哈希 buffer 格式异常，已停止查表；不会转 dtype 掩盖问题。")
+        finding("INVALID_METADATA", "哈希 buffer 无法通过官方配置校验，已停止查表；不会直接转 dtype 或覆盖冲突值。")
         return report
     for checkpoint in (ref, quant):
         if int(ids.max()) >= int(checkpoint.config["vocab_size"]):
@@ -346,8 +382,8 @@ def diagnose_pair(ref, quant, input_ids, *, max_positions=256, device="cpu"):
         finding("TABLE_VALUE_DIFFERENCE", "相同行号读出的表值不同；可能是导出/表变换/量化，不直接判为读取 bug。")
     if not report["checks"]["sampled_lookup_outputs"]["equal"]:
         finding("LOOKUP_OUTPUT_DIFFERENCE", "本次抽查位置的查表输出不一致；结合行号和同行表值检查定位。")
-    if not report["findings"]:
-        report["status"] = "SAMPLED_LOOKUP_ALIGNED"
+    if not any(item["severity"] != "info" for item in report["findings"]):
+        report["status"] = "RECOVERED_LOOKUP_ALIGNED" if ref.recovered_names or quant.recovered_names else "SAMPLED_LOOKUP_ALIGNED"
         report["next_step"] = "本次哈希和抽查查表结果一致。下一步给两边 PLE 同一 hidden state，定位投影、门控、卷积及后续层内误差；不是整层验收通过。"
     else:
         report["status"] = "NEEDS_REVIEW"

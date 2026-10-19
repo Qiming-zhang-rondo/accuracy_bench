@@ -2084,6 +2084,9 @@ def _load_named_buffers(model: nn.Module, sf_reader: ShardWeightReader,
     loaded_count = 0
     if not hasattr(model, 'named_buffers'):
         return loaded_count
+    from .qwen4_exp import is_qwen4, PLE_HASH_BUFFER_NAMES, resolve_ple_hash_buffers
+    qwen4 = is_qwen4(getattr(model, "config", None))
+    ple_hash_by_module = {}
     for bname, buf in model.named_buffers():
         if buf is None:
             continue
@@ -2110,6 +2113,22 @@ def _load_named_buffers(model: nn.Module, sf_reader: ShardWeightReader,
             )
         )
         if not should_load:
+            continue
+        if qwen4 and ".ple.ple_embedding." in bname and bname.rsplit(".", 1)[-1] in PLE_HASH_BUFFER_NAMES:
+            module_name, short_name = bname.rsplit(".", 1)
+            if module_name not in ple_hash_by_module:
+                raw = {key: sf_reader.get_tensor(module_name + "." + key) for key in PLE_HASH_BUFFER_NAMES}
+                effective, recovered = resolve_ple_hash_buffers(model.config, b_layer_idx, raw)
+                ple_hash_by_module[module_name] = effective
+                if recovered:
+                    logger.warning(
+                        "  [Qwen4 PLE hash] layer=%s restored exact int64 from config "
+                        "(validated rounded checkpoint: %s); checkpoint files unchanged",
+                        b_layer_idx, ", ".join(recovered),
+                    )
+            # Explicit int64, including after to_empty/meta shard recycling.
+            buf.data = ple_hash_by_module[module_name][short_name].to(device=buf.device, dtype=torch.int64)
+            loaded_count += 1
             continue
         # 从 weight_map 找 key (msmodelslim 量化场景 key 在 quant_model_weights-*.safetensors)
         try:

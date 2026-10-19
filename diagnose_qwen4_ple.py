@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Read-only PLE/hash/lookup diagnostics; does not run a complete L1 model.
 
-Exit 0: sampled lookup checks aligned; 1: differences/incomplete checks;
+Exit 0: sampled lookup checks aligned (including validated metadata recovery);
+1: differences/incomplete checks;
 2: invalid metadata, invalid input, or execution failure. See JSON for scope.
 """
 import argparse
@@ -95,7 +96,9 @@ def main(argv=None):
         for name, value in report["checks"].items():
             check = value.get("comparison", value)
             if "equal" in check:
-                print(f"  {'PASS' if check['equal'] else 'DIFF'} {name}: max_abs_diff={check.get('max_abs_diff')}, rel_l2={check.get('rel_l2')}")
+                print(f"  {'PASS' if check['equal'] else 'DIFF'} {name}: dtype_match={check.get('dtype_match')}, "
+                      f"different_elements={check.get('different_elements')}, "
+                      f"max_abs_diff≈{check.get('max_abs_diff')}, rel_l2≈{check.get('rel_l2')}")
             elif value.get("status") == "unavailable":
                 print(f"  NOT CHECKED {name}: {value['error']}")
         for side, value in report["checkpoints"].items():
@@ -114,7 +117,7 @@ def main(argv=None):
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(_json_safe(report), ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
         print(f"[PLE] JSON: {output.resolve()}")
-    return 0 if report["status"] == "SAMPLED_LOOKUP_ALIGNED" else (2 if report["status"] in {"ERROR", "INVALID_METADATA"} else 1)
+    return 0 if report["status"] in {"SAMPLED_LOOKUP_ALIGNED", "RECOVERED_LOOKUP_ALIGNED"} else (2 if report["status"] in {"ERROR", "INVALID_METADATA"} else 1)
 
 
 if __name__ == "__main__":

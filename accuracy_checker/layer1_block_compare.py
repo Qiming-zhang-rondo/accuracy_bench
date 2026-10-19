@@ -465,6 +465,10 @@ class ShardedBlockComparator:
         with open(config_path, 'r') as f:
             config = json.load(f)
         self._model_config = config
+        from .qwen4_exp import is_qwen4, validate_ple_pair_configs
+        if is_qwen4(config):
+            with open(os.path.join(self.quant_model_path, "config.json")) as handle:
+                validate_ple_pair_configs(config, json.load(handle))
         self.num_layers = config.get('num_hidden_layers', None)
         # 嵌套 config (如 Qwen3.5 MoE): num_hidden_layers 在 text_config 里
         if self.num_layers is None:

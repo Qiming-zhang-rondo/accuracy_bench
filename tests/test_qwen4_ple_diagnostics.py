@@ -11,9 +11,11 @@ from accuracy_checker.qwen4_ple_diagnostics import (
     inspect_checkpoint,
     tensor_comparison,
 )
+from accuracy_checker.qwen4_exp import rebuild_ple_hash_buffers
 
 
-def _write_checkpoint(path, *, multimodal=False, multipliers=None, changed_row=None):
+def _write_checkpoint(path, *, multimodal=False, multipliers=None, changed_row=None,
+                      metadata_dtype=None, multiplier_delta=0):
     path.mkdir()
     text_config = {
         "model_type": "qwen4_exp_text", "vocab_size": 32, "hidden_size": 8,
@@ -29,11 +31,13 @@ def _write_checkpoint(path, *, multimodal=False, multipliers=None, changed_row=N
     table = torch.arange(48, dtype=torch.float32).reshape(12, 4)
     if changed_row is not None:
         table[changed_row] += 3
-    metadata = {
-        stem + ".layer_multipliers": torch.tensor([3, 5, 7]) if multipliers is None else multipliers,
-        stem + ".ngram_heads_vocab_sizes": torch.tensor([5, 7]),
-        stem + ".ngram_heads_offsets": torch.tensor([0, 5]),
-    }
+    buffers = rebuild_ple_hash_buffers(text_config, 1)
+    buffers["layer_multipliers"][-1] += multiplier_delta
+    if metadata_dtype is not None:
+        buffers = {name: value.to(metadata_dtype) for name, value in buffers.items()}
+    if multipliers is not None:
+        buffers["layer_multipliers"] = multipliers
+    metadata = {stem + "." + name: value for name, value in buffers.items()}
     # Separate files and uneven shards expose both file/key and row-offset errors.
     weight_map = {}
     for i, (start, stop) in enumerate(((0, 2), (2, 7), (7, 12))):
@@ -136,22 +140,22 @@ def test_same_checkpoint_comparison_is_exact(tmp_path):
 
 def test_changed_hash_buffer_value_is_detectable(tmp_path):
     ref_path, _ = _write_checkpoint(tmp_path / "ref")
-    quant_path, _ = _write_checkpoint(tmp_path / "quant", multipliers=torch.tensor([3, 5, 9]))
+    quant_path, _ = _write_checkpoint(tmp_path / "quant", multiplier_delta=128)
     ref = inspect_checkpoint(str(ref_path), 1)
     quant = inspect_checkpoint(str(quant_path), 1)
     try:
         comparison = tensor_comparison(ref.buffers["layer_multipliers"], quant.buffers["layer_multipliers"])
         assert not comparison["equal"]
-        assert comparison["max_abs_diff"] == 2
-        ids = torch.tensor([[1, 4, 2, 6, 7]])
-        assert not torch.equal(_hash(ids, ref.buffers["layer_multipliers"]),
-                               _hash(ids, quant.buffers["layer_multipliers"]))
+        assert comparison["different_elements"] == 1
+        assert quant.issues
+        assert quant.table is None
+        assert not quant.effective_buffers
     finally:
         ref.close()
         quant.close()
 
 
-def test_float_hash_metadata_is_reported_not_silently_repaired(tmp_path):
+def test_conflicting_float_hash_metadata_is_rejected(tmp_path):
     path, _ = _write_checkpoint(tmp_path / "checkpoint", multipliers=torch.tensor([3., 5., 7.]))
     checkpoint = inspect_checkpoint(str(path), 1)
     try:
@@ -211,6 +215,34 @@ def test_tensor_comparison_zero_reference_has_no_infinite_json_metric():
     json.dumps(result, allow_nan=False)
 
 
+@pytest.mark.parametrize("value,dtype", [(20000003, torch.bfloat16), (2**60 + 3, torch.float64)])
+def test_tensor_comparison_does_not_promote_large_integer_equality(value, dtype):
+    ref = torch.tensor([value], dtype=torch.int64)
+    rounded = ref.to(dtype)
+    # torch.equal would silently promote ref and misreport this as equality.
+    comparison = tensor_comparison(ref, rounded)
+    assert not comparison["equal"]
+    assert not comparison["dtype_match"]
+    assert comparison["different_elements"] == 1
+    assert comparison["first_differences"] == [[0]]
+    assert "approximate float64" in comparison["numeric_metrics_note"]
+
+
+def test_tensor_comparison_same_dtype_large_integers_remain_exact():
+    comparison = tensor_comparison(torch.tensor([2**60 + 3]), torch.tensor([2**60 + 5]))
+    assert not comparison["equal"]
+    assert comparison["different_elements"] == 1
+    # Rounded float diagnostics cannot override the exact disagreement.
+    assert comparison["max_abs_diff"] == 0
+
+
+def test_tensor_comparison_equal_numeric_values_still_report_dtype_difference():
+    comparison = tensor_comparison(torch.tensor([8]), torch.tensor([8.], dtype=torch.bfloat16))
+    assert not comparison["equal"]
+    assert not comparison["dtype_match"]
+    assert comparison["different_elements"] == 0
+
+
 def test_pair_report_uses_full_hash_prefix_before_sampling(tmp_path):
     from accuracy_checker.qwen4_ple_diagnostics import diagnose_pair
     path, _ = _write_checkpoint(tmp_path / "checkpoint")
@@ -242,6 +274,71 @@ def test_pair_report_fails_fast_on_float_hash_metadata(tmp_path):
         assert report["status"] == "INVALID_METADATA"
         assert "sampled_lookup_outputs" not in report["checks"]
         assert any(finding["code"] == "INVALID_METADATA" for finding in report["findings"])
+    finally:
+        ref.close()
+        quant.close()
+
+
+def test_pair_recovers_bf16_hash_metadata_but_does_not_call_raw_buffers_aligned(tmp_path):
+    from accuracy_checker.qwen4_ple_diagnostics import diagnose_pair
+    ref_path, _ = _write_checkpoint(tmp_path / "ref")
+    quant_path, _ = _write_checkpoint(tmp_path / "quant", metadata_dtype=torch.bfloat16)
+    before = {path.name: path.read_bytes() for path in quant_path.iterdir()}
+    ref = inspect_checkpoint(str(ref_path), 1)
+    quant = inspect_checkpoint(str(quant_path), 1)
+    try:
+        assert not quant.issues
+        assert len(quant.recovered_names) == 3
+        report = diagnose_pair(ref, quant, torch.tensor([[1, 4, 2, 6, 7]]))
+        assert report["status"] == "RECOVERED_LOOKUP_ALIGNED"
+        for name in ref.buffers:
+            assert not report["checks"]["buffer_" + name]["equal"]
+            assert report["checks"]["effective_buffer_" + name]["equal"]
+        assert report["checks"]["ngram_ids"]["equal"]
+        assert report["checks"]["quant_runtime_hash_cpu"]["equal"]
+        assert report["checks"]["sampled_lookup_outputs"]["equal"]
+        assert report["checks"]["same_row_table_values"]["equal"]
+        assert all(item["severity"] == "info" for item in report["findings"])
+        assert before == {path.name: path.read_bytes() for path in quant_path.iterdir()}
+        json.dumps(report, allow_nan=False)
+    finally:
+        ref.close()
+        quant.close()
+
+
+def test_pair_config_omitted_defaults_do_not_invalidate_recovery(tmp_path):
+    from accuracy_checker.qwen4_ple_diagnostics import diagnose_pair
+    from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
+    ref_path, _ = _write_checkpoint(tmp_path / "ref")
+    quant_path, _ = _write_checkpoint(tmp_path / "quant", metadata_dtype=torch.bfloat16)
+    config_path = quant_path / "config.json"
+    config = json.loads(config_path.read_text())
+    config["seed"] = Qwen4ExpTextConfig().seed
+    config["eos_token_id"] = [config["eos_token_id"]]
+    config_path.write_text(json.dumps(config))
+    ref, quant = inspect_checkpoint(str(ref_path), 1), inspect_checkpoint(str(quant_path), 1)
+    try:
+        report = diagnose_pair(ref, quant, torch.tensor([[1, 4, 2, 6, 7]]))
+        assert report["checks"]["config_differences"]
+        assert report["checks"]["config_contract"]["compatible"]
+        assert report["status"] == "RECOVERED_LOOKUP_ALIGNED"
+    finally:
+        ref.close()
+        quant.close()
+
+
+def test_recovery_does_not_hide_failed_lookup_audit(tmp_path, monkeypatch):
+    from accuracy_checker.qwen4_ple_diagnostics import diagnose_pair
+    ref_path, _ = _write_checkpoint(tmp_path / "ref")
+    quant_path, _ = _write_checkpoint(tmp_path / "quant", metadata_dtype=torch.bfloat16)
+    ref, quant = inspect_checkpoint(str(ref_path), 1), inspect_checkpoint(str(quant_path), 1)
+    try:
+        original_forward = quant.table.forward
+        monkeypatch.setattr(quant.table, "forward", lambda ids: original_forward(ids) + 1)
+        report = diagnose_pair(ref, quant, torch.tensor([[1, 4, 2, 6, 7]]))
+        assert report["checks"]["ngram_ids"]["equal"]
+        assert not report["checks"]["quant_lookup_audit"]["comparison"]["equal"]
+        assert report["status"] == "NEEDS_REVIEW"
     finally:
         ref.close()
         quant.close()
@@ -327,6 +424,20 @@ def test_cli_same_checkpoint_cpu_replay_exits_zero_and_writes_json(tmp_path, cap
     assert report["input_source"]["retokenized"] is False
     assert report["checks"]["ref_runtime_hash_cpu"]["equal"]
     assert "Status: SAMPLED_LOOKUP_ALIGNED" in capsys.readouterr().out
+
+
+def test_cli_recovered_metadata_exits_zero_and_reports_raw_difference(tmp_path, capsys):
+    from diagnose_qwen4_ple import main
+    ref_path, _ = _write_checkpoint(tmp_path / "ref")
+    quant_path, _ = _write_checkpoint(tmp_path / "quant", metadata_dtype=torch.bfloat16)
+    argv, output = _cli_args(tmp_path, ref_path, quant_path)
+    assert main(argv) == 0
+    report = json.loads(output.read_text())
+    assert report["status"] == "RECOVERED_LOOKUP_ALIGNED"
+    console = capsys.readouterr().out
+    assert "DIFF buffer_layer_multipliers" in console
+    assert "PASS effective_buffer_layer_multipliers" in console
+    assert "HASH_METADATA_RECOVERED" in console
 
 
 def test_cli_invalid_hash_dtype_exits_two_and_writes_nan_safe_report(tmp_path):

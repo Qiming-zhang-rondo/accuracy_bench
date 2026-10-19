@@ -43,10 +43,26 @@ def get_report_dir() -> str:
 
 CACHE_FORMAT_VERSION = "4"  # v4 also stores token ids needed by hash-routed MoE replay
 INT4_UNPACK_VERSION = "2"  # bump when _decode_int4_packed changes
+QWEN4_PLE_RUNTIME_VERSION = "int64-config-v1"
+
+
+def _model_cache_identity(model_path: str) -> str:
+    # Old Qwen4 caches may contain hidden states from rounded PLE hash IDs.
+    # Version only this architecture; leave other models' cache keys intact.
+    model_path = os.fspath(model_path)
+    try:
+        with open(os.path.join(model_path, "config.json"), encoding="utf-8") as handle:
+            config = json.load(handle)
+        text = config.get("text_config", config)
+        if config.get("model_type") in {"qwen4_exp", "qwen4_exp_text"} or text.get("model_type") in {"qwen4_exp", "qwen4_exp_text"}:
+            return model_path + "|qwen4_ple:" + QWEN4_PLE_RUNTIME_VERSION
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return model_path
 
 
 def model_hash(model_path: str) -> str:
-    return hashlib.sha256(model_path.encode()).hexdigest()[:8]
+    return hashlib.sha256(_model_cache_identity(model_path).encode()).hexdigest()[:8]
 
 
 def prompt_hash(prompt: str) -> str:
@@ -60,7 +76,7 @@ def _cache_key(model_path, prompt, seqlen, target_layer, side, quant_mode):
 
 
 def _latest_manifest_path(ref_model_path, quant_model_path, prompt, quant_mode):
-    identity = "\0".join((ref_model_path, quant_model_path, prompt, quant_mode))
+    identity = "\0".join((_model_cache_identity(ref_model_path), _model_cache_identity(quant_model_path), prompt, quant_mode))
     digest = hashlib.sha256(identity.encode()).hexdigest()[:20]
     return os.path.join(get_cache_dir(), f"latest_l1_{digest}.json")
 

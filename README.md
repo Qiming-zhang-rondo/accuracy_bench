@@ -16,6 +16,7 @@ CLI 可使用 `--model_type qwen4_exp`（或 `qwen3_8_flash_next`），参数页
 
 - L1 推荐 `--compare_mode grouped_dual --prefill_parallel pp`，保留官方 GatedDeltaNet、QSA、PLE 和四路 hyper-connection 计算；最终 logits 先经过官方 `hyper_connection_mixer`。
 - PLE 大词表支持原始浮点及 `ngram_embedding.shard_N.weight` 分片，使用 safetensors mmap 按需读取行，不将整张词表复制到 NPU。表缺失、分片不全或不支持的 PLE 量化格式会报错。
+- PLE 的三个哈希 buffer 必须以精确 `int64` 参与计算。若导出存成 BF16 等浮点格式，工具根据当前 Transformers/config 重建整数，只有导出值逐项等于这些整数转换到同一导出 dtype 后的值时才在内存恢复；不使用浮点 `.long()` 近似恢复、不修改 checkpoint。原始 int64 与配置冲突、缺失、NaN/Inf 或无法验证的值会报错。L1/L2 同时校验 ref/quant 的 PLE 配置语义；Boundary 单模型也使用同一加载校验。日志会打印 `[Qwen4 PLE hash] ... restored exact int64 from config`。
 - L2 使用 L1 缓存中的原始 `input_ids`，重放 PLE/注意力/MoE；细粒度诊断包含 hyper-connection 的张量投影。不会将 QSA mask 当成 GLM indexer 的 top-k IDs 做 flip-rate 统计。
 - Boundary 支持同一文本结构的生成/KV cache 与 captured-input logits replay。普通权重按 PP 分配；routed expert 沿用按需加载/反量化的小算子路径，**不是全部 BF16 expert 常驻**，不能视为部署性能基准。
 - `--prefill_parallel tp` 支持 **QSA indexer Query Parallel**：L1/full 使用各自 Ref/Quant 组，Boundary 使用 `--devices`。`--qwen4_query_block 64` 控制 round-robin query 分块；`--qwen4_tp_min_tokens 1024` 控制最小启用长度，两项均可在 HTML 设置。短输入、单卡、decode 保持官方路径；无法压缩为 causal + padding 的特殊 mask 也回退官方路径。
@@ -58,14 +59,18 @@ python3 diagnose_qwen4_ple.py \
 - `--device cpu` 不需要 NPU；`npu:0` 额外比较**当前安装的 Transformers** 在 CPU/NPU 上计算的行号与独立 CPU 哈希结果。仅构造 meta 上的 NGram 模块并捕获行号，不分配大词表。运行时校验失败/缺失明确记为未完成，不当作 PASS。
 - 最严谨的输入是 `--l1_cache /path/to/某一层缓存.pt`（必须包含 `input_ids`），或 `--input_ids_json ids.json`（整数数组、`{"input_ids":[...]}`、`{"prompt":[...]}`）。这两种直接用记录的 IDs，不重新 tokenize。也支持与 L1 一致的 `--prompt_file` 原始文本和 `--chat_template_mode auto|always|never`；文本仅用 ref tokenizer 渲染一次，两边共用 IDs，报告记录 token hash。
 - 对**完整输入**计算哈希，不截断历史。查表默认均匀抽查最多 256 个位置，另加有上限的 EOS 邻近位置；`--max_positions` 可调整。另用独立单行切片校验生产 gather，覆盖所有分片的首尾行。报告明确记录抽查范围，不表示整个词表都校验过。
-- `HASH_METADATA_DIFFERENCE` / `HASH_ROW_DIFFERENCE`：核对哈希 buffer、EOS 和配置；浮点格式的哈希参数直接判无效，不尝试转整数修复。
+- 原始 `buffer_*` 与恢复后的 `effective_buffer_*` 分开展示；跨 dtype 的原始值不会误报 PASS。`HASH_METADATA_RECOVERED` 表示经过上述严格校验后在内存重建；`HASH_METADATA_DIFFERENCE` / `HASH_ROW_DIFFERENCE` 表示有效参数/行号仍不一致，需核对配置。无法证明是配置整数的浮点导出时仍判无效，不猜测或借用另一模型的数据。
 - `LOOKUP_IMPLEMENTATION_DIFFERENCE`：生产分片 gather 与独立逐行读取不同。两种读取都依赖连续行分片约定，不能靠此证明导出时的分片编号正确。
-- `TABLE_VALUE_DIFFERENCE`：同一行号的 ref/quant 内容不同，不等同于读取 bug，也可能来自导出或表变换。`SAMPLED_LOOKUP_ALIGNED` 仅说明本次哈希和抽查查表一致。
+- `TABLE_VALUE_DIFFERENCE`：同一行号的 ref/quant 内容不同，不等同于读取 bug，也可能来自导出或表变换。`SAMPLED_LOOKUP_ALIGNED` 仅说明本次哈希和抽查查表一致；经过整数参数恢复后所有检查通过则显示 `RECOVERED_LOOKUP_ALIGNED`，不表示原始 BF16 参数本身是精确整数。
 - 本脚本**不执行 PLE 投影、门控、卷积或 activation QDQ**。若查表通过而 L1 仍异常，下一步用相同 hidden 检查 PLE 内部，尤其是开启 `--activation_quant AUTO` 时的描述文件和激活量化路径。
 
 终端显示摘要，JSON 保存具体 buffer 值、分片映射、差异位置和下一步建议。默认输出时间戳报告，
 手动指定 `--output` 会覆盖该报告文件。退出码 0 表示抽查对齐，1 表示发现差异/校验未完成，
 2 表示输入、元数据或运行失败；三种情况均尝试保存 JSON。
+
+修复前的 Qwen4 L1 hidden cache 可能来自错误的 ngram 行号，新版本对 Qwen4 缓存和
+latest-layer manifest 使用独立运行时版本，**不再读取旧缓存**（不删除旧文件、不影响其他模型）。
+请先重跑 L1，再运行 L2；不要把旧缓存中的 hidden 手动作为新 replay 输入。
 
 ## TL;DR
 

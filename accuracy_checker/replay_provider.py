@@ -90,6 +90,8 @@ class ReplayProvider:
         self.quant_model = create_model_skeleton(quant_model_path, dtype, verbose)
         self.quant_model.eval()
         _initialize_rotary_modules(self.quant_model)
+        from .qwen4_exp import validate_ple_pair_configs
+        validate_ple_pair_configs(self.ref_model.config, self.quant_model.config)
 
         # --- weight index ---
         self.ref_weight_map = build_weight_index(ref_model_path)

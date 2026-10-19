@@ -13,6 +13,92 @@ from torch import nn
 
 logger = logging.getLogger(__name__)
 
+PLE_HASH_BUFFER_NAMES = ("layer_multipliers", "ngram_heads_vocab_sizes", "ngram_heads_offsets")
+
+
+def _ple_text_config(config):
+    """Use installed HF defaults (including seed), never guess missing fields."""
+    from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
+    if isinstance(config, dict):
+        return Qwen4ExpTextConfig(**config.get("text_config", config))
+    return getattr(config, "text_config", config)
+
+
+def rebuild_ple_hash_buffers(config, layer_idx):
+    """Reconstruct only deterministic integer metadata, not the embedding table.
+
+    The official meta constructor determines the head layout; its Python
+    attributes survive meta construction. Multipliers are generated on CPU by
+    the same official helper. No learned tensor or checkpoint file is changed.
+    """
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import (
+        Qwen4ExpTextNGramEmbedding, _build_layer_multipliers,
+    )
+    config = _ple_text_config(config)
+    if layer_idx + 1 not in config.ple_layer_ids:
+        raise ValueError(f"Qwen4 layer {layer_idx} has no PLE in config")
+    ple_index = config.ple_layer_ids.index(layer_idx + 1)
+    with torch.device("meta"):
+        module = Qwen4ExpTextNGramEmbedding(config, config.ple_embed_dim, layer_idx, ple_index)
+    with torch.device("cpu"):
+        return {
+            "layer_multipliers": _build_layer_multipliers(
+                module.unigram_vocab_size, module.ngram_size, module.ple_layer_index, module.seed),
+            "ngram_heads_vocab_sizes": torch.tensor(module.head_vocab_sizes, dtype=torch.int64),
+            "ngram_heads_offsets": torch.tensor(module.head_offsets, dtype=torch.int64),
+        }
+
+
+def resolve_ple_hash_buffers(config, layer_idx, raw_buffers):
+    """Validate exact metadata or recover a *verified* floating-point export.
+
+    Do not recover by casting floats back to int64. Recovery is allowed only
+    when all checkpoint values equal the official integers rounded to that
+    exact export dtype. Conflicting integers, arbitrary floats and missing
+    metadata fail closed rather than silently changing the model's contract.
+    """
+    expected = rebuild_ple_hash_buffers(config, layer_idx)
+    recovered = []
+    float_dtypes = (torch.bfloat16, torch.float16, torch.float32, torch.float64)
+    for name, canonical in expected.items():
+        raw = raw_buffers.get(name)
+        prefix = f"Qwen4 PLE hash layer {layer_idx} {name}"
+        if raw is None or raw.is_meta or raw.shape != canonical.shape:
+            raise ValueError(f"{prefix}: missing or wrong shape; cannot validate metadata")
+        raw = raw.detach().cpu()
+        if raw.dtype == torch.int64:
+            if not torch.equal(raw, canonical):
+                raise ValueError(f"{prefix}: int64 checkpoint conflicts with config-derived values; refusing to overwrite")
+        elif raw.dtype in float_dtypes:
+            rounded = canonical.to(raw.dtype)
+            # Both operands have the SAME dtype: no cross-dtype torch.equal
+            # promotion that could mistake a rounded integer for an exact one.
+            if not bool(torch.isfinite(raw).all() and torch.isfinite(rounded).all()) or not torch.equal(raw, rounded):
+                raise ValueError(f"{prefix}: {raw.dtype} checkpoint is not a validated rounded config export; cannot recover safely")
+            recovered.append(name)
+        else:
+            raise ValueError(f"{prefix}: unsupported metadata dtype {raw.dtype}; expected int64 or a validated floating export")
+    return expected, recovered
+
+
+def validate_ple_pair_configs(ref_config, quant_config):
+    """Paired L1/L2 runs must use the same ngram semantics; no ref-side copying."""
+    if not is_qwen4(ref_config) and not is_qwen4(quant_config):
+        return
+    if not is_qwen4(ref_config) or not is_qwen4(quant_config):
+        raise ValueError("Qwen4 PLE comparison requires matching ref/quant model types")
+    ref, quant = _ple_text_config(ref_config), _ple_text_config(quant_config)
+    keys = ("vocab_size", "ngram_size", "heads_per_ngram", "ngram_vocab_size_base",
+            "seed", "ple_layer_ids", "ple_embed_dim", "make_ngram_vocab_size_divisible_by")
+    differences = [key for key in keys if getattr(ref, key) != getattr(quant, key)]
+    def eos(config):
+        value = config.eos_token_id
+        return value[0] if isinstance(value, list) else value
+    if eos(ref) != eos(quant):
+        differences.append("eos_token_id")
+    if differences:
+        raise ValueError("Qwen4 PLE ref/quant config mismatch: " + ", ".join(differences))
+
 
 def is_qwen4(config):
     kind = config.get("model_type", "") if isinstance(config, dict) else getattr(config, "model_type", "")
